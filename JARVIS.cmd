@@ -1,6 +1,6 @@
 <# : JARVIS.cmd - fichier hybride batch + PowerShell. Ne pas modifier ce fichier.
 @echo off
-rem JARVIS-SHA256=aaeea8d9be0ce75f14ec217561ed80dca9ec7dc34929d72bdeed36be74c4f4ee
+rem JARVIS-SHA256=c0b2099244ca9e9fab5f87662d89a74487a847f6f22b0618b31b90332de62a49
 setlocal
 chcp 65001 >nul
 set "JARVIS_SELF=%~f0"
@@ -203,7 +203,8 @@ $script:NeedRestore = $false
 $script:DefenderScan = $false    # Defender est l'antivirus en service : analyse rapide proposable
 $script:ChkdskFix   = New-Object System.Collections.Generic.List[string]
 $script:DeepMode    = $false
-$script:SpinState   = ''         # fin du dernier Invoke-Spinner : DONE, TIMEOUT ou STOPPED
+$script:SpinState   = ''         # fin du dernier Invoke-Spinner : DONE, TIMEOUT, STOPPED ou FAILED
+$script:ConModeSaved = $null     # mode de la console au lancement (sélection à la souris remise en partant)
 $script:StoreItems  = @()        # applications du Microsoft Store à mettre à jour (Pfn, Name)
 
 # ------------------------------------------------------------------
@@ -965,6 +966,48 @@ function Set-ConsoleTall {
         if ($null -eq $pl) { return $false }
         # 0x14 : ordre d'empilement inchangé, fenêtre non activée
         return [JarvisNative.Win]::SetWindowPos($win, [IntPtr]::Zero, $wr.Left, $pl.Top, ($wr.Right - $wr.Left), $pl.Height, 0x14)
+    } catch { return $false }
+}
+
+function Get-NoQuickEditMode([uint32]$Mode) {
+    # Mode de la console sans sélection à la souris : ENABLE_QUICK_EDIT_MODE (0x40) retiré et
+    # ENABLE_EXTENDED_FLAGS (0x80) ajouté, sans quoi Windows ignore le changement. Fonction pure, testée en T1.
+    return [uint32](([int64]$Mode -band 0xFFFFFFBFL) -bor 0x80)
+}
+
+function Get-QuickEditRestoreMode([uint32]$Current, [uint32]$Saved) {
+    # Mode à remettre en partant : le mode actuel (Ctrl+C a pu être réglé entre-temps), avec la sélection à
+    # la souris seulement si elle était active au départ. Fonction pure, testée en T1.
+    if (([int64]$Saved -band 0x40) -eq 0) { return $Current }
+    return [uint32]([int64]$Current -bor 0xC0)
+}
+
+function Set-QuickEdit([bool]$Off) {
+    # Ancienne console de Windows (celle de la relance en administrateur) : un clic dans la fenêtre la met en
+    # mode « Sélection », qui gèle l'affichage et JARVIS avec lui (constaté le 19/11/2026 pendant une mise à
+    # jour du Store : compteur figé, titre « Sélection J.A.R.V.I.S. »). Ce mode est coupé pendant que JARVIS
+    # tourne ($Off = $true), puis remis s'il était actif ($Off = $false). Sans effet dans Windows Terminal.
+    try {
+        if (-not ('JarvisNative.ConMode' -as [type])) {
+            Add-Type -Namespace JarvisNative -Name ConMode -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int n);
+[DllImport("kernel32.dll")] public static extern bool GetConsoleMode(IntPtr h, out uint m);
+[DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr h, uint m);
+'@
+        }
+        $h = [JarvisNative.ConMode]::GetStdHandle(-10)
+        $m = [uint32]0
+        if (-not [JarvisNative.ConMode]::GetConsoleMode($h, [ref]$m)) { return $false }
+        if ($Off) {
+            $script:ConModeSaved = $m
+            $new = Get-NoQuickEditMode $m
+            if ($new -eq $m) { return $true }
+            return [JarvisNative.ConMode]::SetConsoleMode($h, $new)
+        }
+        if ($null -eq $script:ConModeSaved) { return $false }
+        $back = Get-QuickEditRestoreMode $m ([uint32]$script:ConModeSaved)
+        if ($back -eq $m) { return $true }
+        return [JarvisNative.ConMode]::SetConsoleMode($h, $back)
     } catch { return $false }
 }
 
@@ -3632,6 +3675,15 @@ function Invoke-SelfTestAnalyzers {
         Assert-True ($null -eq (Get-RestoredPlacement $null 0 0 2560 1400)) 'texte illisible accepté'
         '9/9 cas'
     }
+    Test-Case 'Console : sélection à la souris coupée puis remise' {
+        # Mode réel de l'ancienne console de Windows : 0x1F7 (sélection à la souris active)
+        Assert-True ((Get-NoQuickEditMode 0x1F7) -eq 0x1B7) ('mode sans sélection mal calculé : 0x{0:X}' -f (Get-NoQuickEditMode 0x1F7))
+        Assert-True ((Get-NoQuickEditMode 0x1B7) -eq 0x1B7) 'mode déjà sans sélection modifié'
+        Assert-True ((Get-NoQuickEditMode 0x7) -eq 0x87) 'drapeau 0x80 non ajouté'
+        Assert-True ((Get-QuickEditRestoreMode 0x1B6 0x1F7) -eq 0x1F6) 'sélection non remise, ou réglage de Ctrl+C écrasé'
+        Assert-True ((Get-QuickEditRestoreMode 0x1B7 0x1B7) -eq 0x1B7) 'sélection remise alors qu''elle était coupée au départ'
+        '5/5 cas'
+    }
     Test-Case 'Mode ASCII : conversion des glyphes' {
         $got = Convert-Glyph '█░┌─┐…'
         Assert-True ($got -eq '#.+-+...') "obtenu $got"
@@ -4232,6 +4284,7 @@ if ($ResetChoices) {
     }
 }
 
+$null = Set-QuickEdit $true   # un clic dans l'ancienne console ne gèle plus JARVIS
 try { [Console]::TreatControlCAsInput = $true } catch {}   # Ctrl+C = annuler la question, jamais couper brutalement
 
 # Instance unique : une seule fenêtre J.A.R.V.I.S. à la fois
@@ -5800,6 +5853,7 @@ Type-Line '   >> Fin de session. J.A.R.V.I.S. se met en veille.' 'DarkCyan'
 Read-Answer '   [Entrée pour fermer]' | Out-Null
 } finally {
     try { [Console]::TreatControlCAsInput = $false } catch {}
+    $null = Set-QuickEdit $false
     $null = Set-NoSleep $false
     if ($script:JarvisMutex) { try { $script:JarvisMutex.ReleaseMutex() } catch {} }
 }
