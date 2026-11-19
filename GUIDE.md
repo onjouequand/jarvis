@@ -34,7 +34,8 @@ C'est fait. La prochaine fois, ouvre JARVIS depuis le **menu Démarrer** (tape �
 3. Laisse-le travailler. Ne tape rien pendant le scan.
 4. À la fin, JARVIS te pose des questions, une par une (installer les mises à jour, faire le ménage…). Lis la question, puis :
    - tape **o** puis **Entrée** pour accepter ;
-   - appuie sur **Échap** pour refuser (Échap veut toujours dire « non »).
+   - appuie sur **Échap** pour refuser (Échap veut toujours dire « non ») ;
+   - si tu tapes autre chose, JARVIS ne devine pas : il repose la question.
 5. En cas de doute, refuse : rien n'est grave si tu ne fais rien.
 
 Le **scan complet** (touche **2**) dure 20 à 60 minutes : lance-le quand tu n'as pas besoin du PC, avec le chargeur branché si c'est un portable.
@@ -51,6 +52,9 @@ Quand une nouvelle version existe, la ligne **[U] Mise à jour** apparaît en ve
 | « PowerShell est en mode restreint » | Ton PC bloque ce genre d'outil (souvent un PC d'entreprise ou le « Contrôle intelligent des applications ») : JARVIS ne peut pas fonctionner dessus. |
 | « J.A.R.V.I.S. est déjà en cours d'exécution » | Une autre fenêtre JARVIS est ouverte : ferme-la d'abord. |
 | Une question à laquelle tu ne sais pas répondre | Appuie sur **Échap** : c'est toujours « non ». |
+| « Choix non reconnu » ou « Réponse non comprise » | Tape une des touches affichées entre crochets, puis **Entrée**. |
+| « Dossier refusé : dossier modifiable sans droits administrateur » | Appuie sur **Entrée** pour accepter le dossier proposé (`C:\Program Files\JARVIS`). |
+| La mise à jour **[U]** est refusée à cause du dossier d'installation | Ton JARVIS est installé hors de `Program Files`. Retélécharge-le avec le lien de l'étape 1, lance-le, choisis **1** (Mettre à jour), puis appuie sur **Entrée** au dossier proposé : il se réinstalle au bon endroit, sans rien perdre. |
 | Le navigateur refuse le téléchargement | Appuie sur les touches **Windows + R**, colle la ligne ci-dessous, puis **Entrée**. Elle télécharge JARVIS dans tes Téléchargements et le lance. |
 
 ```

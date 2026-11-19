@@ -47,8 +47,10 @@ Windows 10 ou 11, PC fixe ou portable, Windows PowerShell 5.1 (déjà présent d
 ## Sécurité et confidentialité
 
 - **Aucune donnée personnelle n'est envoyée.** Les seules connexions sont celles des outils de Windows (Windows Update, winget), un test de latence vers `1.1.1.1`, une résolution DNS de `www.microsoft.com`, et la question à GitHub sur la dernière version publiée (GitHub voit alors l'adresse IP, comme pour toute visite).
-- **Fichier protégé contre la modification** : `JARVIS.cmd` contient l'empreinte SHA-256 de son propre code. S'il a été modifié ou tronqué, il refuse de démarrer.
-- **Mises à jour contrôlées** : un fichier téléchargé n'est installé que si sa taille, l'empreinte publiée par GitHub, son empreinte interne et son numéro de version sont tous conformes.
+- **Fichier abîmé ou incomplet détecté** : `JARVIS.cmd` contient l'empreinte SHA-256 de son propre code. S'il a été abîmé ou tronqué (téléchargement interrompu, par exemple), il refuse de démarrer. Ce contrôle détecte un accident, il ne protège pas contre une modification volontaire du fichier.
+- **Installation réservée aux administrateurs** : JARVIS refuse de s'installer dans un dossier que n'importe quel programme peut modifier. Le dossier proposé, `C:\Program Files\JARVIS`, convient toujours.
+- **Mises à jour contrôlées** : un fichier téléchargé n'est installé que si sa taille, l'empreinte publiée par GitHub, son empreinte interne et son numéro de version sont tous conformes. Si l'installation échoue en cours de route, l'ancienne version est remise en place.
+- **Pas de « OK » sans preuve** : un contrôle n'est affiché en vert que si la donnée a vraiment été lue. Quand une lecture échoue, JARVIS écrit « lecture impossible » au lieu de conclure.
 - Le fichier n'est pas signé numériquement : Windows affiche donc « Éditeur inconnu » au premier lancement. C'est normal pour un outil distribué par un particulier ; le code complet est lisible ici.
 
 ## Pour les curieux et les développeurs

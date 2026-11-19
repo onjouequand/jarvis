@@ -1,5 +1,5 @@
 ﻿<#
-    J.A.R.V.I.S. // Check-up système v3.12
+    J.A.R.V.I.S. // Check-up système v3.13
     -----------------------------------------------------------------
     Modules :
       [01] Système        : version Windows, uptime, redémarrage en attente
@@ -94,7 +94,7 @@ param(
 # ------------------------------------------------------------------
 # Identité du programme et emplacement
 # ------------------------------------------------------------------
-$JarvisVersion = '3.12'
+$JarvisVersion = '3.13'
 $JarvisSelf = $env:JARVIS_SELF                     # défini par JARVIS.cmd
 if (-not $JarvisSelf) { $JarvisSelf = $PSCommandPath }  # lancement direct du .ps1
 $JarvisHome = $null
@@ -215,7 +215,7 @@ function Show-Banner {
         foreach ($l in $plain) { Write-Host $l -ForegroundColor Cyan; Pause-Ms 70 }
         Write-Host ''
         Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-        Write-Host '      module check-up v3.12' -ForegroundColor DarkGray
+        Write-Host '      module check-up v3.13' -ForegroundColor DarkGray
         Write-Host ''
         return
     }
@@ -235,7 +235,7 @@ function Show-Banner {
     }
     Write-Host ''
     Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-    Write-Host '      module check-up v3.12' -ForegroundColor DarkGray
+    Write-Host '      module check-up v3.13' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -279,12 +279,21 @@ function Cut([string]$s, [int]$n) {
     return $s.Substring(0, $n - 1) + '…'
 }
 
+function Remove-ControlChars([string]$Text) {
+    # Texte venu de l'extérieur (winget, Windows Update, GitHub, noms de périphériques ou de volumes) :
+    # caractères de contrôle retirés avant affichage, aucune séquence d'échappement n'atteint la console
+    if ($null -eq $Text) { return '' }
+    return ($Text -replace '[\x00-\x1F\x7F-\x9F]', '')
+}
+
 function Write-Status {
     param(
         [string]$Label,
         [string]$Value,
         [ValidateSet('OK', 'WARN', 'FAIL', 'INFO')][string]$State = 'INFO'
     )
+    $Label = Remove-ControlChars $Label
+    $Value = Remove-ControlChars $Value
     $tags   = @{ OK = '[ OK ]'; WARN = '[WARN]'; FAIL = '[FAIL]'; INFO = '[INFO]' }
     $colors = @{ OK = 'Green';  WARN = 'Yellow'; FAIL = 'Red';    INFO = 'DarkCyan' }
     $lbl = Cut $Label 32
@@ -302,8 +311,19 @@ function Write-Status {
 
 function Write-Sub {
     param([string]$Text, [ConsoleColor]$Color = 'DarkGray')
+    $Text = Remove-ControlChars $Text
     Write-Host ('          > ' + $Text) -ForegroundColor $Color
     $script:Report.Add('          > ' + $Text)
+}
+
+function Write-Action {
+    # Résultat d'une action lancée après le scan : affiché et ajouté au rapport
+    param([ValidateSet('OK', 'WARN', 'FAIL', 'INFO')][string]$State, [string]$Text)
+    $tags   = @{ OK = '[ OK ]'; WARN = '[WARN]'; FAIL = '[FAIL]'; INFO = '[INFO]' }
+    $colors = @{ OK = 'Green';  WARN = 'Yellow'; FAIL = 'Red';    INFO = 'Cyan' }
+    $Text = Remove-ControlChars $Text
+    Write-Host ('   ' + $tags[$State] + ' ' + $Text) -ForegroundColor $colors[$State]
+    $script:Report.Add($tags[$State] + ' ' + $Text)
 }
 
 function Get-MiniBar([double]$Pct, [int]$Width = 20) {
@@ -341,55 +361,89 @@ function Invoke-Spinner {
     return $res
 }
 
+function ConvertFrom-ToolBytes([byte[]]$Bytes) {
+    # Sortie d'un outil Windows redirigée vers un fichier : UTF-16 (SFC) si au moins un quart des octets
+    # sont nuls, sinon UTF-8 quand la suite d'octets est valide, sinon page de code OEM (DISM).
+    # Fonction pure, testée en T1.
+    if ($null -eq $Bytes -or $Bytes.Length -eq 0) { return '' }
+    $zeros = 0
+    foreach ($b in $Bytes) { if ($b -eq 0) { $zeros++ } }
+    if ($zeros -gt ($Bytes.Length / 4)) { return [Text.Encoding]::Unicode.GetString($Bytes) }
+    try {
+        return (New-Object System.Text.UTF8Encoding($false, $true)).GetString($Bytes)
+    } catch {
+        $oem = [Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage
+        return [Text.Encoding]::GetEncoding($oem).GetString($Bytes)
+    }
+}
+
 function Invoke-ProcessSpinner {
     # Lance un exécutable attaché à la console (requis par SFC), sortie
     # redirigée vers un fichier, avec indicateur d'attente.
+    # Retour : code et texte, ou $null. $script:ProcState dit alors pourquoi : NOSTART (lancement
+    # impossible), TIMEOUT (délai dépassé, processus arrêté) ou STOPPED (arrêté à la demande).
     param(
         [string]$Label,
         [string]$FilePath,
         [string]$Arguments,
         [int]$TimeoutSec = 3600,
-        [string]$Encoding = 'Oem'
+        [string]$Encoding = 'Oem',
+        # Outil qui répare Windows (SFC, DISM /RestoreHealth) : au délai, jamais d'arrêt d'office.
+        # La question est posée, et la réponse par défaut est d'attendre encore.
+        [switch]$AskOnTimeout
     )
+    $script:ProcState = 'NOSTART'
     $out = Join-Path $env:TEMP ('jarvis_{0}.txt' -f [guid]::NewGuid().ToString('N'))
     $err = $out + '.err'
-    $p = Start-Process -FilePath $FilePath -ArgumentList $Arguments -NoNewWindow -PassThru `
-         -RedirectStandardOutput $out -RedirectStandardError $err
-    if ($null -eq $p) { return $null }
+    $p = $null
+    try {
+        $p = Start-Process -FilePath $FilePath -ArgumentList $Arguments -NoNewWindow -PassThru `
+             -RedirectStandardOutput $out -RedirectStandardError $err -ErrorAction Stop
+    } catch { $p = $null }
+    if ($null -eq $p) {
+        Remove-Item $out, $err -Force
+        return $null
+    }
     $null = $p.Handle
     $frames = @('|', '/', '-', '\')
+    $blank = "`r" + (' ' * ($Label.Length + 30)) + "`r"
     $sw = [Diagnostics.Stopwatch]::StartNew()
+    $limit = [double]$TimeoutSec
+    $stopped = $false
     $k = 0
-    while (-not $p.HasExited -and $sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+    while (-not $p.HasExited) {
+        if ($sw.Elapsed.TotalSeconds -ge $limit) {
+            if (-not $AskOnTimeout) { break }
+            Write-Host $blank -NoNewline
+            $short = $Label -replace '\s*\(.*\)\s*$', ''
+            Write-Host ("   [!] {0} tourne depuis {1:N0} min, plus longtemps que prévu." -f $short, $sw.Elapsed.TotalMinutes) -ForegroundColor Yellow
+            Write-Host '       L''arrêter en cours de route peut abîmer Windows : le plus sûr est d''attendre.' -ForegroundColor Yellow
+            if (Read-YesNo '   >> L''arrêter quand même ?') { $stopped = $true; break }
+            Write-Host '   >> J''attends encore 30 minutes.' -ForegroundColor DarkGray
+            $limit = $sw.Elapsed.TotalSeconds + 1800
+            continue
+        }
         $f = $frames[$k % $frames.Count]; $k++
         $el = $sw.Elapsed
         Write-Host ("`r   [{0}] {1} ... {2:00}:{3:00}   " -f $f, $Label, [math]::Floor($el.TotalMinutes), $el.Seconds) -NoNewline -ForegroundColor DarkCyan
         Start-Sleep -Milliseconds 150
     }
-    Write-Host ("`r" + (' ' * ($Label.Length + 30)) + "`r") -NoNewline
+    Write-Host $blank -NoNewline
     if (-not $p.HasExited) {
         try { $p.Kill() } catch {}
         Remove-Item $out, $err -Force
+        $script:ProcState = 'TIMEOUT'
+        if ($stopped) { $script:ProcState = 'STOPPED' }
         return $null
     }
     $p.WaitForExit()
     $txt = ''
-    if (Test-Path $out) {
-        if ($Encoding -eq 'Auto') {
-            # UTF-16 si au moins un quart des octets sont nuls, sinon page de code OEM
-            $bytes = [IO.File]::ReadAllBytes($out)
-            $zeros = @($bytes | Where-Object { $_ -eq 0 }).Count
-            if ($bytes.Length -gt 0 -and $zeros -gt ($bytes.Length / 4)) {
-                $txt = [Text.Encoding]::Unicode.GetString($bytes)
-            } else {
-                $oem = [Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage
-                $txt = [Text.Encoding]::GetEncoding($oem).GetString($bytes)
-            }
-        } else {
-            $txt = Get-Content -Path $out -Encoding $Encoding -Raw
-        }
+    if (Test-Path -LiteralPath $out) {
+        if ($Encoding -eq 'Auto') { $txt = ConvertFrom-ToolBytes ([IO.File]::ReadAllBytes($out)) }
+        else { $txt = Get-Content -LiteralPath $out -Encoding $Encoding -Raw }
     }
     Remove-Item $out, $err -Force
+    $script:ProcState = 'DONE'
     return [pscustomobject]@{ Code = $p.ExitCode; Text = [string]$txt }
 }
 
@@ -425,9 +479,54 @@ function Read-Answer([string]$Prompt) {
     }
 }
 
-function Test-No($Answer) {
-    # Question à réponse par défaut OUI : annulation ou « n » valent NON
-    return ($null -eq $Answer -or $Answer -match '^[nN]')
+function Get-YesNo($Answer, [bool]$DefaultYes = $false) {
+    # Lecture stricte d'une réponse oui/non. Fonction pure, testée en T1.
+    # 'YES' : o, oui, y, yes. 'NO' : n, non, no, ou annulation ($null : Échap, Ctrl+C).
+    # Réponse vide (Entrée) : la réponse par défaut de la question. Tout le reste : 'UNKNOWN'.
+    if ($null -eq $Answer) { return 'NO' }
+    $t = ([string]$Answer).Trim().ToLowerInvariant()
+    if ($t -eq '') { if ($DefaultYes) { return 'YES' } else { return 'NO' } }
+    if (@('o', 'oui', 'y', 'yes') -contains $t) { return 'YES' }
+    if (@('n', 'non', 'no') -contains $t) { return 'NO' }
+    return 'UNKNOWN'
+}
+
+function Read-YesNo([string]$Prompt, [switch]$DefaultYes) {
+    # Toute question oui/non passe par ici : $true = oui, $false = non ou annulation.
+    # Une réponse qui n'est ni oui ni non ne vaut jamais accord : la question est reposée.
+    $suffix = ' [o/N]'
+    if ($DefaultYes) { $suffix = ' [O/n]' }
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+        $v = Get-YesNo (Read-Answer ($Prompt + $suffix)) ([bool]$DefaultYes)
+        if ($v -eq 'YES') { return $true }
+        if ($v -eq 'NO') { return $false }
+        Write-Host '   [!] Réponse non comprise : tape o (oui) ou n (non), puis Entrée.' -ForegroundColor Yellow
+    }
+    Write-Host '   >> Trop de réponses non comprises : je considère que c''est non.' -ForegroundColor DarkGray
+    return $false
+}
+
+function Get-MenuChoice($Answer, [string[]]$Keys, [string]$Default = '') {
+    # Lecture stricte d'un choix de menu. Fonction pure, testée en T1.
+    # $null : annulation. Touche en majuscule : choix affiché, ou choix par défaut sur Entrée.
+    # Chaîne vide : réponse qui n'est pas une touche affichée.
+    if ($null -eq $Answer) { return $null }
+    $t = ([string]$Answer).Trim().ToUpperInvariant()
+    if ($t -eq '') { return $Default.ToUpperInvariant() }
+    foreach ($k in $Keys) { if ($t -eq $k.ToUpperInvariant()) { return $k.ToUpperInvariant() } }
+    return ''
+}
+
+function Read-Choice([string]$Prompt, [string[]]$Keys, [string]$Default = '') {
+    # Menu : seules les touches affichées sont acceptées. $null = annulation (Échap).
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+        $c = Get-MenuChoice (Read-Answer $Prompt) $Keys $Default
+        if ($null -eq $c) { return $null }
+        if ($c -ne '') { return $c }
+        Write-Host ('   [!] Choix non reconnu : tape ' + ($Keys -join ', ') + ' puis Entrée (Échap pour annuler).') -ForegroundColor Yellow
+    }
+    Write-Host '   >> Trop de réponses non reconnues : question annulée.' -ForegroundColor DarkGray
+    return $null
 }
 
 function Start-Elevated([string]$File, [string]$Arguments) {
@@ -489,25 +588,114 @@ function Get-FilesNoJunction([string]$Path, [switch]$WithDirs) {
     }
 }
 
+function Test-NoLinkInChain([string]$Root, [string]$Path) {
+    # Vrai si aucun dossier, du parent de $Path jusqu'à $Root compris, n'est une jonction ou un lien.
+    # Contrôlé juste avant chaque suppression : entre la liste et la suppression, un dossier listé peut
+    # avoir été remplacé par une jonction, et la suppression irait alors détruire des fichiers ailleurs.
+    # Les deux chemins sont d'abord dépliés : %TEMP% peut être au format court (C:\Users\MARIED~1\...)
+    # alors que les fichiers listés arrivent au format long.
+    $rootFull = $null
+    $cur = $null
+    try {
+        $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+        $cur = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
+    } catch { return $false }
+    while ($cur) {
+        if (-not $cur.StartsWith($rootFull, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+        $at = $null
+        try { $at = [IO.File]::GetAttributes($cur) } catch { return $false }
+        if ($at -band [IO.FileAttributes]::ReparsePoint) { return $false }
+        if ($cur.Length -le $rootFull.Length) { return $true }
+        $cur = Split-Path -Parent $cur
+    }
+    return $false
+}
+
+function Get-TempCandidates([string]$Path, [int]$MinAgeHours = 24) {
+    # Ce que le nettoyage peut retirer : fichiers de plus de $MinAgeHours (un fichier récent est peut-être
+    # en cours d'utilisation) et sous-dossiers anciens. Les jonctions ne sont jamais suivies.
+    $limit = (Get-Date).AddHours(-$MinAgeHours)
+    $files = [System.Collections.Generic.List[object]]::new()
+    $dirs = [System.Collections.Generic.List[string]]::new()
+    foreach ($it in @(Get-FilesNoJunction $Path -WithDirs)) {
+        if ($it.PSIsContainer) {
+            if ($it.CreationTime -lt $limit) { $dirs.Add($it.FullName) }
+            continue
+        }
+        if ($it.LastWriteTime -ge $limit) { continue }
+        $files.Add([pscustomobject]@{ Path = $it.FullName; Length = [int64]$it.Length })
+    }
+    # Tableaux simples en sortie : sous PowerShell 5.1, « @(...) » autour d'une liste générique échoue
+    return [pscustomobject]@{ Files = $files.ToArray(); Dirs = $dirs.ToArray() }
+}
+
+function Remove-TempCandidates([string]$Root, $Candidates) {
+    # Supprime la liste préparée par Get-TempCandidates, chaque chemin étant recontrôlé juste avant
+    $freed = [int64]0
+    $skipped = 0
+    foreach ($f in @($Candidates.Files)) {
+        if (-not (Test-NoLinkInChain $Root $f.Path)) { $skipped++; continue }
+        try { [IO.File]::Delete($f.Path); $freed += $f.Length } catch {}
+    }
+    # Dossiers anciens devenus vides, du plus profond au moins profond, jamais de suppression récursive
+    foreach ($d in (@($Candidates.Dirs) | Sort-Object { $_.Length } -Descending)) {
+        if (-not (Test-NoLinkInChain $Root $d)) { $skipped++; continue }
+        try { [IO.Directory]::Delete($d, $false) } catch {}
+    }
+    return [pscustomobject]@{ FreedBytes = $freed; Skipped = $skipped }
+}
+
 function Clear-TempFolder([string]$Path, [int]$MinAgeHours = 24) {
     $res = [pscustomobject]@{ Ok = $false; FreedMB = 0; Reason = '' }
     if (-not (Test-SafeTempPath $Path)) { $res.Reason = 'nettoyage refusé, chemin anormal : ' + $Path; return $res }
-    $limit = (Get-Date).AddHours(-$MinAgeHours)
-    $freed = 0
-    $dirs = @()
-    foreach ($it in @(Get-FilesNoJunction $Path -WithDirs)) {
-        if ($it.PSIsContainer) { $dirs += $it; continue }
-        if ($it.LastWriteTime -ge $limit) { continue }      # fichier récent : peut-être en cours d'utilisation
-        $len = $it.Length
-        try { [IO.File]::Delete($it.FullName); $freed += $len } catch {}
-    }
-    # Dossiers anciens devenus vides, du plus profond au moins profond, jamais de suppression récursive
-    foreach ($d in ($dirs | Where-Object { $_.CreationTime -lt $limit } | Sort-Object { $_.FullName.Length } -Descending)) {
-        try { [IO.Directory]::Delete($d.FullName, $false) } catch {}
-    }
+    $Path = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $done = Remove-TempCandidates $Path (Get-TempCandidates $Path $MinAgeHours)
     $res.Ok = $true
-    $res.FreedMB = [math]::Round($freed / 1MB)
+    $res.FreedMB = [math]::Round($done.FreedBytes / 1MB)
     return $res
+}
+
+function Remove-EmptyDir([string]$Path) {
+    # Retire un dossier seulement s'il est vide (jamais de suppression récursive) ; $true s'il n'existe plus
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    try { [IO.Directory]::Delete($Path, $false) } catch { return (-not (Test-Path -LiteralPath $Path)) }
+    return (-not (Test-Path -LiteralPath $Path))
+}
+
+function Remove-TreeNoJunction([string]$Path) {
+    # Supprime un dossier créé par JARVIS et tout son contenu sans jamais suivre une jonction ni un lien :
+    # le lien lui-même est retiré, sa cible n'est pas touchée. $true si le dossier n'existe plus à la fin.
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $true }
+    $full = $null
+    try { $full = [IO.Path]::GetFullPath($Path).TrimEnd('\') } catch { return $false }
+    if ($full -match '^[A-Za-z]:$' -or $full -match '^\\\\[^\\]+\\[^\\]+$') { return $false }   # jamais une racine
+    if (-not (Test-Path -LiteralPath $full)) { return $true }
+    $isLink = { param($Item) [bool]($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) }
+    $top = Get-Item -LiteralPath $full -Force
+    if ($null -eq $top) { return $false }
+    if (& $isLink $top) { return (Remove-EmptyDir $full) }
+    $dirs = New-Object System.Collections.Generic.List[string]
+    $stack = New-Object System.Collections.Stack
+    $stack.Push($full)
+    while ($stack.Count -gt 0) {
+        $cur = $stack.Pop()
+        $dirs.Add($cur)
+        foreach ($it in @(Get-ChildItem -LiteralPath $cur -Force)) {
+            # Dossier remplacé par une jonction pendant le parcours : on n'y touche plus
+            if (-not (Test-NoLinkInChain $full $it.FullName)) { continue }
+            if ($it.PSIsContainer) {
+                # Directory.Delete non récursif sur un lien retire le lien, pas le contenu de sa cible
+                if (& $isLink $it) { $null = Remove-EmptyDir $it.FullName } else { $stack.Push($it.FullName) }
+                continue
+            }
+            try {
+                if ($it.Attributes -band [IO.FileAttributes]::ReadOnly) { [IO.File]::SetAttributes($it.FullName, [IO.FileAttributes]::Normal) }
+                [IO.File]::Delete($it.FullName)
+            } catch { continue }
+        }
+    }
+    foreach ($d in ($dirs | Sort-Object { $_.Length } -Descending)) { $null = Remove-EmptyDir $d }
+    return (-not (Test-Path -LiteralPath $full))
 }
 
 function Resolve-InstallDir([string]$Dir) {
@@ -539,7 +727,8 @@ function Resolve-InstallDir([string]$Dir) {
         }
     }
     if (Test-Path -LiteralPath $d) {
-        $allowed = @('JARVIS.cmd', '.jarvis-install', 'jarvis-checkup.ps1', 'Rapports', '.jarvis-update.cmd')
+        $allowed = @('JARVIS.cmd', '.jarvis-install', 'jarvis-checkup.ps1', 'Rapports', '.jarvis-update.cmd',
+                     'JARVIS.cmd.new', 'JARVIS.cmd.old')
         $other = @(Get-ChildItem -LiteralPath $d -Force | Where-Object { $allowed -notcontains $_.Name })
         if ($other.Count -gt 0) { $r.Reason = 'le dossier existe déjà et contient d''autres fichiers'; return $r }
     }
@@ -548,14 +737,43 @@ function Resolve-InstallDir([string]$Dir) {
     return $r
 }
 
+function Confirm-InstallDir([string]$Dir) {
+    # Dossier d'installation prêt à recevoir JARVIS : chemin valide (Resolve-InstallDir), dossier créé, et
+    # modifiable par les seuls administrateurs. Contrôlé AVANT toute copie : un dossier que n'importe quel
+    # programme peut modifier est refusé (JARVIS s'y lance en administrateur). Un dossier créé pour l'essai
+    # puis refusé est retiré.
+    $r = [pscustomobject]@{ Ok = $false; Path = $null; Reason = ''; Created = $false }
+    $rv = Resolve-InstallDir $Dir
+    if (-not $rv.Ok) { $r.Reason = $rv.Reason; return $r }
+    $made = @()
+    $p = $rv.Path
+    while ($p -and -not (Test-Path -LiteralPath $p)) { $made += $p; $p = Split-Path -Parent $p }
+    try { New-Item -ItemType Directory -Path $rv.Path -Force -ErrorAction Stop | Out-Null }
+    catch { $r.Reason = 'création du dossier impossible : ' + $_.Exception.Message; return $r }
+    $weak = @(Get-WeakWriters @($rv.Path))
+    if ($weak.Count -gt 0) {
+        foreach ($m in $made) { $null = Remove-EmptyDir $m }      # du plus profond au moins profond
+        $r.Reason = 'dossier modifiable sans droits administrateur (' + (Cut ($weak -join ', ') 60) + ')'
+        return $r
+    }
+    $r.Ok = $true
+    $r.Path = $rv.Path
+    $r.Created = ($made.Count -gt 0)
+    return $r
+}
+
 function Get-WeakWriters([string[]]$Paths) {
-    # Comptes non administrateurs ayant le droit de modifier ces chemins
+    # Comptes non administrateurs ayant le droit de modifier ces chemins. Des droits illisibles comptent
+    # comme un défaut : sans preuve, le chemin n'est pas déclaré protégé.
     $weak = @('S-1-5-32-545', 'S-1-5-11', 'S-1-1-0', ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value))
     $writeMask = 0x2 -bor 0x4 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
     $bad = @()
     foreach ($t in $Paths) {
         if (-not (Test-Path -LiteralPath $t)) { continue }
-        foreach ($ace in (Get-Acl -LiteralPath $t).Access) {
+        $acl = $null
+        try { $acl = Get-Acl -LiteralPath $t -ErrorAction Stop } catch { $acl = $null }
+        if ($null -eq $acl) { $bad += 'droits illisibles'; continue }
+        foreach ($ace in $acl.Access) {
             if ([string]$ace.AccessControlType -ne 'Allow') { continue }
             $sid = $null
             try { $sid = $ace.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch {}
@@ -618,8 +836,7 @@ function Confirm-DeepScan {
     if ($reasons.Count -gt 0) {
         Write-Host ('   [!] ' + ($reasons -join ' et ') + '.') -ForegroundColor Yellow
         Write-Host '       SFC et DISM risquent d''échouer ou de donner un résultat faux. Redémarrer d''abord est conseillé.' -ForegroundColor Yellow
-        $a = Read-Answer '   >> Continuer quand même le scan complet ? [o/N]'
-        if ($a -notmatch '^[oOyY]') { return $false }
+        if (-not (Read-YesNo '   >> Continuer quand même le scan complet ?')) { return $false }
     }
     Write-Host ''
     Write-Host ('  ╔' + ('═' * 64) + '╗') -ForegroundColor Yellow
@@ -631,33 +848,48 @@ function Confirm-DeepScan {
         Write-Host '║' -ForegroundColor Yellow
     }
     Write-Host ('  ╚' + ('═' * 64) + '╝') -ForegroundColor Yellow
-    $a = Read-Answer '   >> Lancer le scan complet ? [O/n]'
-    if (Test-No $a) { return $false }
-    return $true
+    return (Read-YesNo '   >> Lancer le scan complet ?' -DefaultYes)
 }
 
 # ------------------------------------------------------------------
 # Préférences mémorisées (%APPDATA%\JARVIS\config.json)
 # ------------------------------------------------------------------
-function Get-JarvisConfig {
+function ConvertFrom-JarvisConfigText([string]$Json) {
+    # Lecture de config.json. Fonction pure, testée en T1. Seules les valeurs simples sont gardées (texte de
+    # 200 caractères au plus, nombre, vrai/faux) ; un fichier illisible ou d'une autre forme ne donne rien.
     $h = @{}
-    if (Test-Path -LiteralPath $CfgFile) {
-        try {
-            $o = Get-Content -LiteralPath $CfgFile -Raw -Encoding UTF8 | ConvertFrom-Json
-            foreach ($pr in $o.PSObject.Properties) { $h[$pr.Name] = $pr.Value }
-        } catch {}
+    $o = $null
+    try { $o = $Json | ConvertFrom-Json -ErrorAction Stop } catch { return $h }
+    if ($null -eq $o -or $o -is [string] -or $o -is [array] -or $o -is [ValueType]) { return $h }
+    foreach ($pr in $o.PSObject.Properties) {
+        $v = $pr.Value
+        if ($v -is [string]) { if ($v.Length -le 200) { $h[$pr.Name] = $v } }
+        elseif ($v -is [bool] -or $v -is [int] -or $v -is [long] -or $v -is [double] -or $v -is [decimal]) { $h[$pr.Name] = $v }
     }
     return $h
 }
 
+function Get-JarvisConfig {
+    if (-not (Test-Path -LiteralPath $CfgFile)) { return @{} }
+    $txt = $null
+    try { $txt = Get-Content -LiteralPath $CfgFile -Raw -Encoding UTF8 -ErrorAction Stop } catch { return @{} }
+    return (ConvertFrom-JarvisConfigText $txt)
+}
+
 function Set-JarvisConfigValue([string]$Key, $Value) {
-    # Modifie une seule clé en conservant les autres ; $null supprime la clé
+    # Modifie une seule clé en conservant les autres ; $null supprime la clé.
+    # Écriture dans un fichier voisin puis remplacement (jamais de config.json à moitié écrit),
+    # et $true seulement si la valeur est relue.
     try {
         $h = Get-JarvisConfig
         if ($null -eq $Value) { $h.Remove($Key) } else { $h[$Key] = $Value }
         if (-not (Test-Path -LiteralPath $CfgDir)) { New-Item -ItemType Directory -Path $CfgDir -Force -ErrorAction Stop | Out-Null }
-        ([pscustomobject]$h) | ConvertTo-Json | Set-Content -LiteralPath $CfgFile -Encoding UTF8 -ErrorAction Stop
-        return $true
+        $tmp = $CfgFile + '.tmp'
+        ([pscustomobject]$h) | ConvertTo-Json | Set-Content -LiteralPath $tmp -Encoding UTF8 -ErrorAction Stop
+        Move-Item -LiteralPath $tmp -Destination $CfgFile -Force -ErrorAction Stop
+        $back = Get-JarvisConfig
+        if ($null -eq $Value) { return (-not $back.ContainsKey($Key)) }
+        return ($back.ContainsKey($Key) -and [string]$back[$Key] -eq [string]$Value)
     } catch { return $false }
 }
 
@@ -716,15 +948,15 @@ function Invoke-WingetModuleOffer {
     Write-Host '   [O] Installer maintenant (Internet requis)' -ForegroundColor Gray
     Write-Host '   [N] Non, pas maintenant' -ForegroundColor Gray
     Write-Host '   [J] Non, et ne plus jamais me le proposer' -ForegroundColor Gray
-    $a = Read-Answer '   >> Choix [O/N/J]'
-    if ($a -match '^[jJ]') {
+    $a = Read-Choice '   >> Choix [O/N/J] (Entrée = N)' @('O', 'N', 'J') 'N'
+    if ($a -eq 'J') {
         if (Set-JarvisConfigValue 'WingetModule' 'never') {
             Write-Host '   >> Compris, cette proposition ne réapparaîtra plus.' -ForegroundColor DarkGray
             Write-Host '      Pour changer d''avis : JARVIS.cmd -ResetChoices' -ForegroundColor DarkGray
         } else {
             Write-Host '   [!] Choix non enregistré (profil inaccessible en écriture).' -ForegroundColor Yellow
         }
-    } elseif ($a -match '^[oOyY]') {
+    } elseif ($a -eq 'O') {
         $null = Install-WingetModule
     } else {
         Write-Host '   >> Pas de souci, l''option reste disponible dans le menu.' -ForegroundColor DarkGray
@@ -786,14 +1018,17 @@ function Install-WindowsUpdates {
                 [void]$coll.Add($u)
             }
             $code = 2
+            $ready = 0
             if ($coll.Count -gt 0) {
                 $d = $s.CreateUpdateDownloader()
                 $d.Updates = $coll
                 $code = [int]$d.Download().ResultCode
+                # Preuve du téléchargement : ce que Windows Update déclare lui-même prêt à installer
+                foreach ($u in $coll) { if ($u.IsDownloaded) { $ready++ } }
             }
-            [pscustomobject]@{ Ok = $true; Count = $coll.Count; Skipped = $skipped; Code = $code; Error = $null }
+            [pscustomobject]@{ Ok = $true; Count = $coll.Count; Ready = $ready; Skipped = $skipped; Code = $code; Error = $null }
         } catch {
-            [pscustomobject]@{ Ok = $false; Count = 0; Skipped = @(); Code = 0; Error = $_.Exception.Message }
+            [pscustomobject]@{ Ok = $false; Count = 0; Ready = 0; Skipped = @(); Code = 0; Error = $_.Exception.Message }
         }
     } 3600 -ArgumentList $filter
 
@@ -803,11 +1038,22 @@ function Install-WindowsUpdates {
     if ($dl.Count -eq 0) {
         Write-Host '   >> Aucune mise à jour installable automatiquement : celles qui restent sont facultatives' -ForegroundColor Yellow
         Write-Host '      ou demandent une action à l''écran.' -ForegroundColor Yellow
-        $a = Read-Answer '   >> Ouvrir Windows Update pour les traiter toi-même ? [o/N]'
-        if ($a -match '^[oOyY]') { Open-WindowsUpdateGuided }
+        if (Read-YesNo '   >> Ouvrir Windows Update pour les traiter toi-même ?') { Open-WindowsUpdateGuided }
         return
     }
-    Write-Status 'Téléchargement' ("{0} mise(s) à jour prête(s)" -f $dl.Count) 'OK'
+    $dlState = Get-WuDownloadState $dl.Code $dl.Count $dl.Ready
+    if ($dlState -eq 'FAILED') {
+        Write-Status 'Téléchargement' ("échec, aucune mise à jour téléchargée (code de résultat {0})" -f $dl.Code) 'WARN'
+        Write-Sub 'Vérifie la connexion Internet, puis réessaie ou passe par Windows Update'
+        Open-WindowsUpdateGuided
+        return
+    }
+    if ($dlState -eq 'PARTIAL') {
+        Write-Status 'Téléchargement' ("{0} mise(s) à jour prête(s) sur {1}" -f $dl.Ready, $dl.Count) 'WARN'
+        Write-Sub 'Les autres n''ont pas pu être téléchargées : elles resteront à faire dans Windows Update'
+    } else {
+        Write-Status 'Téléchargement' ("{0} mise(s) à jour prête(s)" -f $dl.Ready) 'OK'
+    }
 
     # Étape 2 : installation de ce qui est téléchargé
     $ins = Invoke-Spinner 'Installation des mises à jour' {
@@ -836,22 +1082,32 @@ function Install-WindowsUpdates {
 
     if ($null -eq $ins) { Write-Status 'Installation' 'délai dépassé (60 min)' 'WARN'; return }
     if (-not $ins.Ok) { Write-Status 'Installation' ('échec : ' + (Cut $ins.Error 60)) 'WARN'; Open-WindowsUpdateGuided; return }
-    $okN = 0; $failN = 0
     foreach ($x in @($ins.Results)) {
-        if ($x.Code -in @(2, 3)) { $okN++; Write-Sub ('Installée : ' + (Cut $x.Title 80)) 'Green' }
-        else { $failN++; Write-Sub ('Échec    : ' + (Cut $x.Title 80)) 'Red' }
+        if ($x.Code -eq 2) { Write-Sub ('Installée : ' + (Cut $x.Title 80)) 'Green' }
+        elseif ($x.Code -eq 3) { Write-Sub ('Installée avec avertissement : ' + (Cut $x.Title 62)) 'Yellow' }
+        else { Write-Sub ('Échec    : ' + (Cut $x.Title 80)) 'Red' }
     }
-    if ($failN -eq 0) { Write-Status 'Installation' ("{0} mise(s) à jour installée(s)" -f $okN) 'OK' }
-    else {
-        Write-Status 'Installation' ("{0} réussie(s), {1} échec(s)" -f $okN, $failN) 'WARN'
-        Write-Sub 'Les échecs se règlent souvent après un redémarrage puis un nouveau passage dans Windows Update'
+    $sum = Get-WuInstallSummary ([int[]]@(@($ins.Results) | ForEach-Object { [int]$_.Code }))
+    switch ($sum.State) {
+        'OK' { Write-Status 'Installation' ("{0} mise(s) à jour installée(s)" -f $sum.Ok) 'OK' }
+        'WARN' {
+            Write-Status 'Installation' ("{0} installée(s), dont {1} avec avertissement" -f ($sum.Ok + $sum.Warn), $sum.Warn) 'WARN'
+            Write-Sub 'Avertissement de Windows Update : redémarre, puis vérifie dans Windows Update qu''il ne reste rien'
+        }
+        'FAIL' {
+            Write-Status 'Installation' ("{0} réussie(s), {1} échec(s)" -f ($sum.Ok + $sum.Warn), $sum.Fail) 'WARN'
+            Write-Sub 'Les échecs se règlent souvent après un redémarrage puis un nouveau passage dans Windows Update'
+        }
+        default {
+            Write-Status 'Installation' 'rien n''a été installé : aucune mise à jour n''était prête' 'WARN'
+            Write-Sub 'Passe par Windows Update pour les installer'
+        }
     }
     if ($ins.Reboot) {
         Write-Host ''
         Write-Host '   [!] Un redémarrage est nécessaire pour terminer l''installation.' -ForegroundColor Yellow
-        $a = Read-Answer '   >> Redémarrer dans 1 minute ? (enregistre ton travail) [o/N]'
-        if ($a -match '^[oOyY]') {
-            & (Join-Path $env:windir 'System32\shutdown.exe') /r /t 60 /c 'J.A.R.V.I.S. : redémarrage pour terminer les mises à jour Windows.'
+        if (Read-YesNo '   >> Redémarrer dans 1 minute ? (enregistre ton travail)') {
+            & (Get-SystemToolPath 'shutdown.exe') /r /t 60 /c 'J.A.R.V.I.S. : redémarrage pour terminer les mises à jour Windows.'
             Write-Host '   >> Redémarrage dans 60 s. Pour l''annuler : Windows + R, puis « shutdown /a ».' -ForegroundColor Cyan
         } else {
             Write-Host '   >> Pense à redémarrer aujourd''hui : les mises à jour ne sont actives qu''après.' -ForegroundColor DarkGray
@@ -934,16 +1190,23 @@ function New-JarvisShortcut([string]$Path, [string]$Target, [string]$WorkDir) {
     [IO.File]::WriteAllBytes($Path, $bytes)
 }
 
-function Invoke-LegacyCleanup([string]$NewCmd) {
-    # Anciennes installations (avant v3.1) : rapports déplacés, fichiers JARVIS supprimés
+function Start-DelayedDelete([string]$File, [string]$Dir) {
+    # Fichier en cours d'exécution : effacé 3 s après la fermeture, puis son dossier s'il est vide.
+    # Outils appelés par chemin complet ; la ligne est entourée de guillemets car elle en contient plusieurs.
+    $line = '/c ""{0}" /t 3 /nobreak >nul & del /f /q "{1}" & rmdir "{2}""' -f (Get-SystemToolPath 'timeout.exe'), $File, $Dir
+    Start-Process -FilePath (Get-SystemToolPath 'cmd.exe') -ArgumentList $line -WindowStyle Hidden
+}
+
+function Invoke-LegacyCleanup([string]$NewCmd, [string[]]$ExtraDirs) {
+    # Anciennes installations (avant v3.1, ou dossier précédent refusé depuis la v3.13) :
+    # rapports déplacés, fichiers JARVIS supprimés
     $newDir = Split-Path -Parent $NewCmd
-    foreach ($old in $LegacyDirs) {
+    foreach ($old in (@($LegacyDirs) + @($ExtraDirs) | Where-Object { $_ } | Select-Object -Unique)) {
         if (-not (Test-Path -LiteralPath $old)) { continue }
         if ((Resolve-Path -LiteralPath $old).Path -eq (Resolve-Path -LiteralPath $newDir).Path) { continue }
         $files = @('JARVIS.cmd', 'jarvis-checkup.ps1', '.jarvis-install') | Where-Object { Test-Path -LiteralPath (Join-Path $old $_) }
         if ($files.Count -eq 0) { continue }
-        $a = Read-Answer ("   >> Ancienne installation trouvée dans {0}. La nettoyer (rapports conservés) ? [O/n]" -f $old)
-        if (Test-No $a) { continue }
+        if (-not (Read-YesNo ("   >> Ancienne installation trouvée dans {0}. La nettoyer (rapports conservés) ?" -f $old) -DefaultYes)) { continue }
         $oldRep = Join-Path $old 'Rapports'
         if (Test-Path -LiteralPath $oldRep) {
             New-Item -ItemType Directory -Path $ReportRoot -Force | Out-Null
@@ -959,9 +1222,7 @@ function Invoke-LegacyCleanup([string]$NewCmd) {
             if ($fp -eq $running) { $delayed += $fp } else { Remove-Item -LiteralPath $fp -Force }
         }
         if ($delayed.Count -gt 0) {
-            # Fichier en cours d'exécution : suppression 3 s après la fermeture
-            $cmdLine = '/c timeout /t 3 /nobreak >nul & del /f /q "{0}" & rmdir "{1}"' -f $delayed[0], $old
-            Start-Process -FilePath 'cmd.exe' -ArgumentList $cmdLine -WindowStyle Hidden
+            Start-DelayedDelete $delayed[0] $old
         } elseif (-not (Get-ChildItem -LiteralPath $old -Force)) {
             Remove-Item -LiteralPath $old -Force
         }
@@ -984,7 +1245,8 @@ function Get-InstalledJarvis {
 }
 
 function Compare-JarvisVersion([string]$A, [string]$B) {
-    try { return ([version]$A).CompareTo([version]$B) } catch { return 0 }
+    # -1, 0 ou 1 ; $null si l'une des deux versions est illisible (jamais traitée comme « égale »)
+    try { return ([version]$A).CompareTo([version]$B) } catch { return $null }
 }
 
 function Register-Jarvis([string]$Dir, [string]$Cmd, [string]$Version = $JarvisVersion) {
@@ -1007,66 +1269,123 @@ function Register-Jarvis([string]$Dir, [string]$Cmd, [string]$Version = $JarvisV
 }
 
 function Install-Jarvis {
-    # Par défaut installe cette copie ; la mise à jour en ligne passe le fichier téléchargé
-    # (-Source), sa version (-Version) et -Quiet (aucune question, raccourcis existants conservés)
-    param([string]$TargetDir, [string]$Source = $JarvisSelf, [string]$Version = $JarvisVersion, [switch]$Quiet)
+    # Par défaut installe cette copie ; la mise à jour en ligne passe le fichier téléchargé (-Source), sa
+    # version (-Version), son empreinte contrôlée (-ExpectedSha256) et -Quiet (aucune question, raccourcis
+    # existants conservés). -OldDir : dossier de l'installation précédente, proposé au nettoyage si JARVIS
+    # s'installe ailleurs.
+    param([string]$TargetDir, [string]$Source = $JarvisSelf, [string]$Version = $JarvisVersion, [switch]$Quiet,
+          [string]$ExpectedSha256 = '', [string]$OldDir = '')
     if ($Source -notlike '*.cmd') {
         Write-Host '   [!] Installation possible uniquement depuis JARVIS.cmd.' -ForegroundColor Yellow
         return $null
     }
-    $dir = $null
-    if ($TargetDir) {
-        $rv = Resolve-InstallDir $TargetDir
-        if ($rv.Ok) { $dir = $rv.Path } else { Write-Host ("   [!] Dossier refusé : {0}" -f $rv.Reason) -ForegroundColor Yellow }
+    # Dossier : contrôlé (chemin, puis droits d'écriture) AVANT toute copie
+    $chk = $null
+    $asked = @()
+    if ($TargetDir) { $asked += $TargetDir }
+    if (-not $Quiet -and $InstallDir) { $asked += $InstallDir }
+    foreach ($cand in $asked) {
+        $chk = Confirm-InstallDir $cand
+        if ($chk.Ok) { break }
+        Write-Host ("   [!] Dossier refusé ({0}) : {1}" -f (Cut $cand 50), $chk.Reason) -ForegroundColor Yellow
+        $chk = $null
     }
-    if (-not $dir -and $InstallDir) {
-        $rv = Resolve-InstallDir $InstallDir
-        if ($rv.Ok) { $dir = $rv.Path } else { Write-Host ("   [!] Dossier refusé : {0}" -f $rv.Reason) -ForegroundColor Yellow }
+    if (-not $chk -and $Quiet) {
+        # Mise à jour sans question : jamais de saisie de dossier
+        Write-Host ("       Pour mettre à jour : télécharge la dernière version ({0})," -f $JarvisReleasePage) -ForegroundColor Yellow
+        Write-Host ("       lance-la et choisis « Mettre à jour » : elle s'installera dans {0}." -f $DefaultInstallDir) -ForegroundColor Yellow
+        return $null
     }
-    while (-not $dir) {
+    while (-not $chk) {
         Write-Host ("   Dossier d'installation proposé : {0}" -f $DefaultInstallDir) -ForegroundColor Gray
         $ans = Read-Answer '   >> Entrée pour accepter, ou tape un autre chemin (Échap pour annuler)'
         if ($null -eq $ans) { Write-Host '   >> Installation annulée.' -ForegroundColor DarkGray; return $null }
         if ([string]::IsNullOrWhiteSpace($ans)) { $ans = $DefaultInstallDir }
-        $rv = Resolve-InstallDir $ans
-        if ($rv.Ok) { $dir = $rv.Path } else { Write-Host ("   [!] Dossier refusé : {0}" -f $rv.Reason) -ForegroundColor Yellow }
+        $chk = Confirm-InstallDir $ans
+        if (-not $chk.Ok) {
+            Write-Host ("   [!] Dossier refusé : {0}" -f $chk.Reason) -ForegroundColor Yellow
+            $chk = $null
+        }
     }
+    $dir = $chk.Path
     $marker = Join-Path $dir '.jarvis-install'
+    $oldVer = ''
     if (Test-Path -LiteralPath $marker) {
-        $old = (Get-Content -LiteralPath $marker | Where-Object { $_ -like 'version=*' }) -replace '^version=', ''
-        Write-Host ("   >> Version {0} trouvée : mise à jour vers {1}." -f $old, $Version) -ForegroundColor Cyan
+        $oldVer = [string]((Get-Content -LiteralPath $marker | Where-Object { $_ -like 'version=*' }) -replace '^version=', '')
+        Write-Host ("   >> Version {0} trouvée : mise à jour vers {1}." -f $oldVer, $Version) -ForegroundColor Cyan
     }
     $dest = Join-Path $dir 'JARVIS.cmd'
+    $tmp = $dest + '.new'
+    $bak = $dest + '.old'
+    $swapped = $false
+    $hadOld = $false
+    $prevReg = Get-ItemProperty -LiteralPath $RegKey       # inscription d'avant, pour pouvoir la remettre
+    $same = $false
     try {
-        New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null
         Show-Bar 'Dossier d''installation'
         $same = $false
         try { $same = ((Resolve-Path -LiteralPath $Source).Path -eq (Join-Path (Resolve-Path -LiteralPath $dir).Path 'JARVIS.cmd')) } catch {}
         if (-not $same) {
-            # Copie dans un fichier temporaire, vérification, puis remplacement : jamais de fichier à moitié écrit.
-            # Remplacer le JARVIS.cmd en cours d'exécution est sans risque : l'en-tête batch, que cmd.exe relit
-            # après la fin de PowerShell, a toujours la même longueur (seule l'empreinte change).
-            $tmp = $dest + '.new'
+            # 1. Copie dans un fichier voisin, contrôlée avant de toucher au programme en place : identique à
+            #    l'original, empreinte attendue (mise à jour en ligne), empreinte interne du fichier JARVIS.
             Copy-Item -LiteralPath $Source -Destination $tmp -Force -ErrorAction Stop
-            $h1 = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash
-            $h2 = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash
-            if ($h1 -ne $h2) { Remove-Item -LiteralPath $tmp -Force; throw 'copie corrompue' }
+            $newBytes = [IO.File]::ReadAllBytes($tmp)
+            $newHash = Get-Sha256Hex $newBytes
+            if ($newHash -ne (Get-Sha256Hex ([IO.File]::ReadAllBytes($Source)))) { throw 'copie différente de l''original' }
+            if ($ExpectedSha256 -and $newHash -ne $ExpectedSha256.ToLowerInvariant()) { throw 'empreinte différente de celle du fichier contrôlé' }
+            if ((Get-JarvisCmdState ([Text.Encoding]::UTF8.GetString($newBytes))) -ne 'OK') { throw 'fichier JARVIS abîmé ou incomplet (empreinte interne fausse)' }
+            # 2. L'ancien programme est gardé de côté jusqu'au contrôle final, pour pouvoir revenir en arrière.
+            #    Remplacer le JARVIS.cmd en cours d'exécution est sans risque : l'en-tête batch, que cmd.exe relit
+            #    après la fin de PowerShell, a toujours la même longueur (seule l'empreinte change).
+            if (Test-Path -LiteralPath $dest) {
+                Copy-Item -LiteralPath $dest -Destination $bak -Force -ErrorAction Stop
+                $hadOld = $true
+            }
             Move-Item -LiteralPath $tmp -Destination $dest -Force -ErrorAction Stop
+            $swapped = $true
+            if ((Get-Sha256Hex ([IO.File]::ReadAllBytes($dest))) -ne $newHash) { throw 'fichier installé différent du fichier contrôlé' }
         }
-        Unblock-File -LiteralPath $dest
-        Set-Content -LiteralPath $marker -Value @("version=$Version", ("date={0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm'))) -ErrorAction Stop
         if (-not (Test-Path -LiteralPath $dest)) { throw 'copie absente après installation' }
+        Unblock-File -LiteralPath $dest
+        $weakW = @(Get-WeakWriters @($dir, $dest))
+        if ($weakW.Count -gt 0) { throw ('programme modifiable sans droits administrateur (' + (Cut ($weakW -join ', ') 60) + ')') }
         Show-Bar 'Copie de J.A.R.V.I.S.'
         Register-Jarvis $dir $dest $Version
+        if ([string](Get-ItemProperty -LiteralPath $RegKey -ErrorAction Stop).DisplayVersion -ne $Version) { throw 'inscription dans Windows non relue' }
         Show-Bar 'Inscription dans Windows'
-        $weakW = @(Get-WeakWriters @($dir, $dest))
-        if ($weakW.Count -gt 0) {
-            Write-Host ("   [!] Ce dossier est modifiable sans droits admin ({0})." -f ($weakW -join ', ')) -ForegroundColor Yellow
-            Write-Host ("       Un programme malveillant pourrait modifier JARVIS. Emplacement conseillé : {0}" -f $DefaultInstallDir) -ForegroundColor Yellow
-        }
+        Set-Content -LiteralPath $marker -Value @("version=$Version", ("date={0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm'))) -ErrorAction Stop
     } catch {
         Write-Host ("   [!] Installation impossible : {0}" -f $_.Exception.Message) -ForegroundColor Red
+        if ($swapped -and $hadOld) {
+            # Retour à l'ancien programme, gardé de côté
+            $back = $false
+            try {
+                Move-Item -LiteralPath $bak -Destination $dest -Force -ErrorAction Stop
+                if ($oldVer) { Register-Jarvis $dir $dest $oldVer }
+                $back = $true
+            } catch { $back = $false }
+            if ($back) { Write-Host '       L''ancienne version a été remise en place.' -ForegroundColor Yellow }
+            else { Write-Host '       [!] Retour à l''ancienne version impossible : relance l''installation depuis le fichier JARVIS.cmd téléchargé.' -ForegroundColor Red }
+        } elseif (-not $hadOld -and -not $same) {
+            # Première installation dans ce dossier, interrompue : rien n'est laissé derrière
+            if ($swapped) { Remove-Item -LiteralPath $dest -Force }
+            if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
+            if ($chk.Created) { $null = Remove-EmptyDir $dir }
+            # Inscription dans Windows : remise comme avant (autre dossier), ou retirée si elle vise ce fichier absent
+            $nowReg = Get-ItemProperty -LiteralPath $RegKey
+            if ($nowReg -and ([string]$nowReg.InstallLocation).TrimEnd('\') -eq $dir -and -not (Test-Path -LiteralPath $dest)) {
+                $prevCmd = $null
+                if ($prevReg -and $prevReg.InstallLocation) { $prevCmd = Join-Path ([string]$prevReg.InstallLocation) 'JARVIS.cmd' }
+                $restored = $false
+                if ($prevCmd -and (Test-Path -LiteralPath $prevCmd)) {
+                    try { Register-Jarvis ([string]$prevReg.InstallLocation) $prevCmd ([string]$prevReg.DisplayVersion); $restored = $true } catch { $restored = $false }
+                }
+                if (-not $restored) { Remove-Item -LiteralPath $RegKey -Force }
+            }
+        }
         return $null
+    } finally {
+        foreach ($f in @($tmp, $bak)) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }
     }
     try {
         New-JarvisShortcut $StartLnk $dest $dir
@@ -1076,7 +1395,7 @@ function Install-Jarvis {
     }
     $wantDesk = $false
     if ($Quiet) { $wantDesk = (Test-Path -LiteralPath $DeskLnk) }
-    else { $wantDesk = -not (Test-No (Read-Answer '   >> Ajouter aussi un raccourci sur le Bureau ? [O/n]')) }
+    else { $wantDesk = Read-YesNo '   >> Ajouter aussi un raccourci sur le Bureau ?' -DefaultYes }
     if ($wantDesk) {
         try {
             New-JarvisShortcut $DeskLnk $dest $dir
@@ -1086,7 +1405,7 @@ function Install-Jarvis {
         }
     }
     if (-not $Quiet) {
-        Invoke-LegacyCleanup $dest
+        Invoke-LegacyCleanup $dest @($OldDir)
         Write-Host ''
         Type-Line ("   >> Installation terminée : {0}" -f $dir) 'Green'
         Type-Line '   >> Pour le relancer : menu Démarrer, tape « JARVIS ».' 'Cyan'
@@ -1123,23 +1442,40 @@ function Uninstall-Jarvis {
     if (Test-WingetModule) { Write-Host '     (le module winget de Microsoft est conservé : d''autres outils peuvent s''en servir)' -ForegroundColor DarkGray }
     Write-Host '   Pour annuler : appuie sur Entrée ou Échap.' -ForegroundColor DarkGray
     $a = Read-Answer '   >> Pour confirmer, tape DESINSTALLER'
-    if (("$a").Trim().ToUpper() -ne 'DESINSTALLER') { Write-Host '   >> Désinstallation annulée.' -ForegroundColor DarkGray; return }
+    if (("$a").Trim().ToUpperInvariant() -ne 'DESINSTALLER') { Write-Host '   >> Désinstallation annulée.' -ForegroundColor DarkGray; return }
 
-    foreach ($l in @($StartLnk, $DeskLnk)) { if (Test-Path -LiteralPath $l) { Remove-Item -LiteralPath $l -Force } }
+    # Chaque suppression est contrôlée : ce qui reste est listé, rien n'est annoncé sans preuve
+    $left = @()
+    foreach ($l in @($StartLnk, $DeskLnk)) {
+        if (Test-Path -LiteralPath $l) { Remove-Item -LiteralPath $l -Force }
+        if (Test-Path -LiteralPath $l) { $left += $l }
+    }
     foreach ($d in @((Join-Path $env:APPDATA 'JARVIS'), (Join-Path $env:LOCALAPPDATA 'JARVIS'))) {
-        if (Test-Path -LiteralPath $d) { Remove-Item -LiteralPath $d -Recurse -Force }
+        # Dossiers du profil, modifiables par n'importe quel programme : suppression qui ne suit aucune jonction
+        if (-not $d -or (Split-Path -Leaf $d) -ne 'JARVIS') { continue }
+        if (-not (Remove-TreeNoJunction $d)) { $left += $d }
     }
     # Uniquement les fichiers créés par JARVIS : un dossier partagé avec d'autres fichiers est conservé
     $rep = Join-Path $JarvisHome 'Rapports'
     Get-ChildItem -LiteralPath $rep -File | Where-Object { $_.Name -match '^(checkup|selftest)_\d{8}_\d{4}\.txt$' } | Remove-Item -Force
     if (Test-Path -LiteralPath $rep) { if (-not (Get-ChildItem -LiteralPath $rep -Force)) { Remove-Item -LiteralPath $rep -Force } }
-    Remove-Item -LiteralPath (Join-Path $JarvisHome '.jarvis-install') -Force
+    $mk = Join-Path $JarvisHome '.jarvis-install'
+    Remove-Item -LiteralPath $mk -Force
+    if (Test-Path -LiteralPath $mk) { $left += $mk }
     if (Test-Path -LiteralPath $RegKey) { Remove-Item -LiteralPath $RegKey -Recurse -Force }
+    if (Test-Path -LiteralPath $RegKey) { $left += 'inscription dans « Applications installées » de Windows' }
     # JARVIS.cmd est en cours d'exécution : suppression différée de 3 s, puis du dossier s'il est vide
-    $cmdLine = '/c timeout /t 3 /nobreak >nul & del /f /q "{0}" & rmdir "{1}"' -f (Join-Path $JarvisHome 'JARVIS.cmd'), $JarvisHome
-    Start-Process -FilePath 'cmd.exe' -ArgumentList $cmdLine -WindowStyle Hidden
+    Start-DelayedDelete (Join-Path $JarvisHome 'JARVIS.cmd') $JarvisHome
     Write-Host ''
-    Type-Line '   >> J.A.R.V.I.S. a été désinstallé. Fin de transmission.' 'Cyan'
+    if ($left.Count -eq 0) {
+        Write-Host '   [ OK ] Raccourcis, profil, rapports et inscription dans Windows supprimés (vérifié).' -ForegroundColor Green
+        Write-Host '          Le fichier du programme s''efface 3 secondes après la fermeture de cette fenêtre.' -ForegroundColor DarkGray
+        Type-Line '   >> J.A.R.V.I.S. a été désinstallé. Fin de transmission.' 'Cyan'
+    } else {
+        Write-Host '   [!] Désinstallation incomplète. Il reste, à supprimer à la main :' -ForegroundColor Yellow
+        foreach ($x in $left) { Write-Host ('       - ' + $x) -ForegroundColor Yellow }
+        Write-Host '       Le fichier du programme, lui, s''efface 3 secondes après la fermeture de cette fenêtre.' -ForegroundColor DarkGray
+    }
     Start-Sleep -Seconds 2
     exit
 }
@@ -1164,12 +1500,13 @@ function Get-JarvisReleaseInfo([string]$Json, [string]$Repo) {
     if (-not $url.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or $url -match '\s|\.\.') {
         $r.Reason = 'adresse de téléchargement inattendue'; return $r
     }
+    # Empreinte publiée par GitHub : obligatoire. Sans elle, rien ne prouve que le fichier téléchargé
+    # est celui qui a été publié.
     $d = ''
     if ($asset.PSObject.Properties['digest']) { $d = [string]$asset.digest }
-    if ($d) {
-        if ($d -notmatch '^sha256:([0-9a-fA-F]{64})$') { $r.Reason = 'empreinte publiée illisible'; return $r }
-        $r.Sha256 = $Matches[1].ToLower()
-    }
+    if (-not $d) { $r.Reason = 'empreinte absente de la version publiée'; return $r }
+    if ($d -notmatch '^sha256:([0-9a-fA-F]{64})$') { $r.Reason = 'empreinte publiée illisible'; return $r }
+    $r.Sha256 = $Matches[1].ToLowerInvariant()
     $r.Size = [int64]$asset.size
     $r.Notes = [string]$o.body
     $r.Url = $url
@@ -1182,14 +1519,17 @@ function Test-JarvisPackage([byte[]]$Bytes, $Info, [string]$CurrentVersion) {
     if ($null -eq $Bytes -or $Bytes.Length -lt 1000) { return 'fichier vide ou incomplet' }
     if ($Bytes.Length -gt 5MB) { return 'fichier anormalement gros' }
     if ($Info.Size -gt 0 -and $Bytes.Length -ne $Info.Size) { return 'taille différente de celle annoncée par GitHub' }
-    if ($Info.Sha256 -and (Get-Sha256Hex $Bytes) -ne $Info.Sha256) { return 'empreinte différente de celle publiée sur GitHub' }
+    if (-not $Info.Sha256) { return 'empreinte publiée par GitHub absente' }
+    if ((Get-Sha256Hex $Bytes) -ne $Info.Sha256) { return 'empreinte différente de celle publiée sur GitHub' }
     $t = [Text.Encoding]::UTF8.GetString($Bytes)
     if (-not $t.StartsWith('<# : JARVIS.cmd')) { return 'ce n''est pas un fichier JARVIS' }
     if ((Get-JarvisCmdState $t) -ne 'OK') { return 'fichier modifié ou incomplet (empreinte interne fausse)' }
     if ($t -notmatch '\$JarvisVersion = ''([0-9.]+)''') { return 'version introuvable dans le fichier' }
     $v = $Matches[1]
     if ($v -ne $Info.Version) { return ('version du fichier (v{0}) différente de la version publiée (v{1})' -f $v, $Info.Version) }
-    if ((Compare-JarvisVersion $v $CurrentVersion) -le 0) { return ('v{0} n''est pas plus récente que v{1}' -f $v, $CurrentVersion) }
+    $cmp = Compare-JarvisVersion $v $CurrentVersion
+    if ($null -eq $cmp) { return ('numéro de version illisible (v{0} ou v{1})' -f $v, $CurrentVersion) }
+    if ($cmp -le 0) { return ('v{0} n''est pas plus récente que v{1}' -f $v, $CurrentVersion) }
     return $null
 }
 
@@ -1197,7 +1537,7 @@ function Get-ReleaseNotesLines([string]$Body, [int]$Max = 6) {
     # Nouveautés affichables : caractères de contrôle retirés (aucune séquence d'échappement console), lignes coupées
     $out = @()
     foreach ($l in ("$Body" -split "`n")) {
-        $t = ($l -replace '[\x00-\x1F\x7F-\x9F]', '').Trim()
+        $t = (Remove-ControlChars $l).Trim()
         $t = ($t -replace '^[#*>\-\s]+', '').Trim()
         if (-not $t) { continue }
         $out += (Cut $t 88)
@@ -1246,8 +1586,10 @@ function Get-JarvisUpdateResult($Check, [int]$MaxMs) {
     try { $json = $resp.Content.ReadAsStringAsync().Result } catch {}
     $info = Get-JarvisReleaseInfo $json $JarvisRepo
     if (-not $info.Ok) { $r.Detail = $info.Reason; return $r }
+    $cmp = Compare-JarvisVersion $info.Version $JarvisVersion
+    if ($null -eq $cmp) { $r.Detail = 'numéro de version publié illisible'; return $r }
     $r.Info = $info
-    if ((Compare-JarvisVersion $info.Version $JarvisVersion) -gt 0) { $r.Status = 'NEW' } else { $r.Status = 'UPTODATE' }
+    if ($cmp -gt 0) { $r.Status = 'NEW' } else { $r.Status = 'UPTODATE' }
     return $r
 }
 
@@ -1288,8 +1630,10 @@ function Invoke-JarvisSelfUpdate($Info) {
         if (Start-Elevated $JarvisSelf '-Update') { exit }
         return
     }
-    $a = Read-Answer ("   >> Installer la v{0} maintenant ? [O/n]" -f $Info.Version)
-    if (Test-No $a) { Write-Host '   >> Mise à jour reportée. Elle reste proposée au menu.' -ForegroundColor DarkGray; return }
+    if (-not (Read-YesNo ("   >> Installer la v{0} maintenant ?" -f $Info.Version) -DefaultYes)) {
+        Write-Host '   >> Mise à jour reportée. Elle reste proposée au menu.' -ForegroundColor DarkGray
+        return
+    }
 
     $bytes = Get-JarvisDownload $Info.Url
     if ($null -eq $bytes) {
@@ -1303,9 +1647,7 @@ function Invoke-JarvisSelfUpdate($Info) {
         return
     }
     $hash = Get-Sha256Hex $bytes
-    $src = 'empreinte interne'
-    if ($Info.Sha256) { $src = 'empreinte publiée sur GitHub et empreinte interne' }
-    Write-Host ('   [ OK ] Fichier contrôlé : ' + $src + ' conformes.') -ForegroundColor Green
+    Write-Host '   [ OK ] Fichier contrôlé : empreinte publiée sur GitHub et empreinte interne conformes.' -ForegroundColor Green
 
     # Fichier posé dans le dossier d'installation (modifiable par les seuls administrateurs), revérifié, puis installé
     $stage = Join-Path $JarvisHome '.jarvis-update.cmd'
@@ -1313,7 +1655,7 @@ function Invoke-JarvisSelfUpdate($Info) {
     try {
         [IO.File]::WriteAllBytes($stage, $bytes)
         if ((Get-FileHash -LiteralPath $stage -Algorithm SHA256).Hash.ToLower() -ne $hash) { throw 'fichier altéré après écriture' }
-        $dest = Install-Jarvis -TargetDir $JarvisHome -Source $stage -Version $Info.Version -Quiet
+        $dest = Install-Jarvis -TargetDir $JarvisHome -Source $stage -Version $Info.Version -Quiet -ExpectedSha256 $hash
     } catch {
         Write-Host ('   [!] Mise à jour impossible : ' + $_.Exception.Message) -ForegroundColor Red
     } finally {
@@ -1341,20 +1683,41 @@ function Invoke-JarvisSelfUpdate($Info) {
 # Analyseurs de résultats (testés par l'auto-test)
 # ------------------------------------------------------------------
 function Get-SfcVerdict([string]$Text) {
+    # Messages de SFC en anglais et en français (Windows 10 et 11, relevés dans sfc.exe.mui le 19/11/2026).
+    # Les lettres accentuées et les apostrophes sont remplacées par des jokers : la sortie de l'outil peut
+    # arriver mal décodée, et l'apostrophe est typographique sous Windows 11.
     $t = ($Text -replace "`0", '') -replace '\s+', ' '
+    # « Aucune violation détectée, mais intégrité non garantie : métadonnées des composants endommagées »
+    if ($t -match 'cannot guarantee|ne peut pas garantir') { return 'STOREDAMAGED' }
     if ($t -match 'did not find any integrity violations|aucune violation') { return 'CLEAN' }
-    if ($t -match 'could not perform|pas pu effectuer') { return 'NORUN' }
-    if ($t -match 'unable to fix|pas pu en r') { return 'UNFIXED' }
-    if ($t -match 'successfully repaired|les a r.par') { return 'REPAIRED' }
+    if ($t -match 'could not perform|could not start the repair|must be an administrator|pas pu effectuer|pas r.{1,3}ussi .{1,3} (effectuer|d.{1,3}marrer)|devez .{1,3}tre un administrateur') { return 'NORUN' }
+    if ($t -match 'unable to fix|pas pu en r|pas pu r.{1,3}parer') { return 'UNFIXED' }
+    if ($t -match 'successfully repaired|les a r.{1,3}par') { return 'REPAIRED' }
+    # /verifyonly : violations trouvées, rien n'a été réparé
+    if ($t -match 'found integrity violations|d.{1,3}tect.{1,3} des violations') { return 'UNFIXED' }
     return 'UNKNOWN'
 }
 
 function Get-DismVerdict([string]$Text, $Code) {
-    if ($Text -match 'No component store corruption|Aucune alt') { return 'CLEAN' }
-    if ($Text -match 'cannot be repaired|ne peut pas .tre r') { return 'UNREPAIRABLE' }
-    if ($Text -match 'repairable|r.parable|peut .tre r.par') { return 'REPAIRABLE' }
+    # DISM /ScanHealth ou /CheckHealth (messages relevés dans CbsProvider.dll.mui le 19/11/2026).
+    # « irréparable » est cherché avant « réparable », qu'il contient. Un texte qui n'est reconnu ni en
+    # français ni en anglais donne UNKNOWN, jamais CLEAN : pas de « sain » sans preuve.
+    $t = ($Text -replace "`0", '') -replace '\s+', ' '
+    if ($t -match 'cannot be repaired|not repairable|irr.{1,3}parable|ne peut pas .{1,3}tre r.{1,3}par') { return 'UNREPAIRABLE' }
+    if ($t -match 'is repairable|r.{1,3}parable|peut .{1,3}tre r.{1,3}par') { return 'REPAIRABLE' }
     if ($null -ne $Code -and [int]$Code -ne 0) { return 'ERROR' }
-    return 'CLEAN'
+    if ($t -match 'No component store corruption|Aucun endommagement|Aucune alt') { return 'CLEAN' }
+    return 'UNKNOWN'
+}
+
+function Get-DismRepairVerdict([string]$Text, $Code) {
+    # DISM /RestoreHealth : REPAIRED (réparation annoncée par DISM, code 0), NOSOURCE (fichiers de réparation
+    # introuvables ou image irréparable), FAILED (autre échec), UNKNOWN (code 0 mais message non reconnu)
+    $t = ($Text -replace "`0", '') -replace '\s+', ' '
+    if ($t -match 'restore operation failed|chec de la restauration|source files could not be|introuvable') { return 'NOSOURCE' }
+    if ($null -eq $Code -or [int]$Code -ne 0) { return 'FAILED' }
+    if ($t -match 'restore operation completed successfully|restauration a .{1,3}t.{1,3} effectu') { return 'REPAIRED' }
+    return 'UNKNOWN'
 }
 
 function Get-ChkdskVerdict($Code) {
@@ -1370,7 +1733,9 @@ function ConvertFrom-WingetText {
     param([string]$Raw)
     # Fin de ligne Windows retirée d'abord, puis seul le texte après le dernier retour chariot est gardé
     # (animation de progression). Sans le TrimEnd, chaque ligne CRLF devenait vide : liste toujours vide.
-    $lines = $Raw -split "`n" | ForEach-Object { ($_.TrimEnd("`r") -split "`r")[-1].TrimEnd() }
+    # Caractères de contrôle retirés ici même (regex en ligne : cette fonction est aussi exécutée dans un job,
+    # où les autres fonctions de JARVIS n'existent pas).
+    $lines = $Raw -split "`n" | ForEach-Object { ((($_.TrimEnd("`r") -split "`r")[-1]) -replace '[\x00-\x1F\x7F-\x9F]', '').TrimEnd() }
     $start = -1
     for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^\s*-{10,}\s*$') { $start = $i; break } }
     if ($start -lt 1) { return }
@@ -1410,6 +1775,42 @@ function Test-WingetNoUpgrade([string]$Raw) {
     return ($Raw -notmatch '(?m)^\s*-{10,}\s*$' -and (Get-WingetUnknownCount $Raw) -gt 0)
 }
 
+function Get-WingetScanState([string]$Raw, [int]$Parsed) {
+    # Que prouve la réponse de « winget upgrade » ? LIST : un tableau a été lu ($Parsed lignes).
+    # NONE : winget dit lui-même qu'il n'y a rien à mettre à jour. UNREADABLE : ni l'un ni l'autre,
+    # on ne conclut pas (jamais « aucune mise à jour » par défaut).
+    if ($Parsed -gt 0) { return 'LIST' }
+    if (Test-WingetNoUpgrade $Raw) { return 'NONE' }
+    return 'UNREADABLE'
+}
+
+function Test-NoEventError([string]$ErrorId) {
+    # Get-WinEvent signale « aucun événement trouvé » par une erreur : c'est une lecture réussie (0 événement).
+    # Toute autre erreur (journal ou fournisseur absent, accès refusé) est une lecture en échec.
+    return ($ErrorId -like 'NoMatchingEventsFound*')
+}
+
+function Get-WuDownloadState($Code, $Count, $Ready) {
+    # Téléchargement Windows Update : $Code = code de résultat (2 = réussi, 3 = réussi avec erreurs),
+    # $Count = mises à jour demandées, $Ready = celles que Windows Update déclare téléchargées.
+    if ([int]$Ready -le 0) { return 'FAILED' }
+    if ([int]$Code -eq 2 -and [int]$Ready -ge [int]$Count) { return 'READY' }
+    return 'PARTIAL'
+}
+
+function Get-WuInstallSummary([int[]]$Codes) {
+    # Codes de résultat par mise à jour : 2 = installée, 3 = installée avec avertissement, autre = échec.
+    # State : OK, WARN (au moins un avertissement), FAIL (au moins un échec), NONE (rien n'a été installé)
+    $r = [pscustomobject]@{ Ok = 0; Warn = 0; Fail = 0; State = 'NONE' }
+    foreach ($c in @($Codes)) {
+        if ($c -eq 2) { $r.Ok++ } elseif ($c -eq 3) { $r.Warn++ } else { $r.Fail++ }
+    }
+    if ($r.Fail -gt 0) { $r.State = 'FAIL' }
+    elseif ($r.Warn -gt 0) { $r.State = 'WARN' }
+    elseif ($r.Ok -gt 0) { $r.State = 'OK' }
+    return $r
+}
+
 function Get-AvState($ProductState) {
     $hex = '{0:X6}' -f [int]$ProductState
     return [pscustomobject]@{
@@ -1436,13 +1837,109 @@ function Get-FirstNameFromFull([string]$Full) {
     return (Get-Culture).TextInfo.ToTitleCase($first.ToLower())
 }
 
-function Get-SfcPath {
-    # sfc.exe est un binaire 64 bits : passage par Sysnative si la console est en 32 bits
-    $p = Join-Path $env:windir 'System32\sfc.exe'
-    if (-not [Environment]::Is64BitProcess -and (Test-Path (Join-Path $env:windir 'Sysnative\sfc.exe'))) {
-        $p = Join-Path $env:windir 'Sysnative\sfc.exe'
+function Get-SystemToolPath([string]$Name) {
+    # Chemin complet d'un outil de Windows (dism.exe, sfc.exe, cmd.exe...) : jamais de recherche dans le
+    # PATH, où un programme du même nom pourrait être lancé à sa place avec les droits administrateur.
+    # Ces outils sont en 64 bits : passage par Sysnative si la console est en 32 bits.
+    $win = [Environment]::GetFolderPath('Windows')
+    if (-not $win) { $win = $env:windir }
+    $p = Join-Path $win ('System32\' + $Name)
+    if (-not [Environment]::Is64BitProcess) {
+        $native = Join-Path $win ('Sysnative\' + $Name)
+        if (Test-Path -LiteralPath $native) { $p = $native }
     }
     return $p
+}
+
+function Get-SfcPath { return (Get-SystemToolPath 'sfc.exe') }
+
+function Get-EventsSafe([hashtable]$Filter) {
+    # Lecture d'un journal Windows qui distingue « aucun événement » (Ok, liste vide) d'une lecture en échec
+    $r = [pscustomobject]@{ Ok = $false; Events = @(); Error = '' }
+    try {
+        $r.Events = @(Get-WinEvent -FilterHashtable $Filter -ErrorAction Stop)
+        $r.Ok = $true
+    } catch {
+        if (Test-NoEventError ([string]$_.FullyQualifiedErrorId)) { $r.Ok = $true }
+        else { $r.Error = [string]$_.Exception.Message }
+    }
+    return $r
+}
+
+function Write-EventCount([string]$Label, [bool]$ReadOk, [int]$Count, [string]$BadState) {
+    # Un compteur d'événements à 0 n'est « OK » que si le journal a vraiment été lu
+    if (-not $ReadOk) { Write-Status $Label 'lecture du journal impossible' 'INFO' }
+    elseif ($Count -gt 0) { Write-Status $Label ([string]$Count) $BadState }
+    else { Write-Status $Label '0' 'OK' }
+}
+
+function Update-Report([string]$File, [string[]]$Lines) {
+    # Réécrit le rapport déjà enregistré pour y ajouter le résultat des actions ; $true seulement si relu
+    try {
+        $Lines | Set-Content -LiteralPath $File -Encoding UTF8 -ErrorAction Stop
+        return ((Get-Item -LiteralPath $File -ErrorAction Stop).Length -gt 0)
+    } catch { return $false }
+}
+
+function Invoke-WindowsRepair {
+    # Réparation de Windows : DISM /RestoreHealth puis SFC /scannow. Chaque outil est lancé par son chemin
+    # complet, son code et son texte sont lus, et le résultat affiché vient d'un analyseur testé (T1).
+    Write-Host '   NE FERME PAS CETTE FENÊTRE pendant la réparation.' -ForegroundColor Yellow
+    Write-Host ''
+    $dism = Invoke-ProcessSpinner -Label 'DISM /RestoreHealth (10-30 min)' -FilePath (Get-SystemToolPath 'dism.exe') `
+            -Arguments '/Online /Cleanup-Image /RestoreHealth' -TimeoutSec 3600 -Encoding 'Auto' -AskOnTimeout
+    if ($null -eq $dism) {
+        if ($script:ProcState -eq 'STOPPED') { Write-Status 'DISM RestoreHealth' 'arrêté à ta demande avant la fin' 'WARN' }
+        else { Write-Status 'DISM RestoreHealth' 'lancement impossible' 'WARN' }
+        Write-Sub 'Réparation non faite : relance un scan complet pour recommencer'
+        return
+    }
+    switch (Get-DismRepairVerdict $dism.Text $dism.Code) {
+        'REPAIRED' { Write-Status 'DISM RestoreHealth' 'image Windows réparée' 'OK' }
+        'NOSOURCE' {
+            Write-Status 'DISM RestoreHealth' 'échec : fichiers de réparation introuvables ou image irréparable' 'FAIL'
+            Write-Sub 'Vérifie la connexion Internet puis relance un scan complet'
+            Write-Sub 'Si l''échec persiste : réparation de Windows conseillée (réinstallation sur place)'
+        }
+        'FAILED' {
+            Write-Status 'DISM RestoreHealth' ("échec, code 0x{0:X8}" -f [int]$dism.Code) 'FAIL'
+            Write-Sub 'Détails : C:\Windows\Logs\DISM\dism.log'
+        }
+        default {
+            Write-Status 'DISM RestoreHealth' 'terminé, mais résultat non reconnu' 'INFO'
+            Write-Sub 'Détails : C:\Windows\Logs\DISM\dism.log'
+        }
+    }
+    $sfc = Invoke-ProcessSpinner -Label 'SFC /scannow (5-20 min)' -FilePath (Get-SfcPath) `
+           -Arguments '/scannow' -TimeoutSec 3600 -Encoding 'Auto' -AskOnTimeout
+    if ($null -eq $sfc) {
+        if ($script:ProcState -eq 'STOPPED') { Write-Status 'SFC /scannow' 'arrêté à ta demande avant la fin' 'WARN' }
+        else { Write-Status 'SFC /scannow' 'lancement impossible' 'WARN' }
+        return
+    }
+    switch (Get-SfcVerdict $sfc.Text) {
+        'CLEAN' { Write-Status 'SFC /scannow' 'aucune violation d''intégrité' 'OK' }
+        'REPAIRED' {
+            Write-Status 'SFC /scannow' 'fichiers système corrompus réparés' 'OK'
+            Write-Sub 'Redémarre le PC pour terminer la réparation'
+        }
+        'UNFIXED' {
+            Write-Status 'SFC /scannow' 'des fichiers corrompus n''ont pas pu être réparés' 'FAIL'
+            Write-Sub 'Détails : C:\Windows\Logs\CBS\CBS.log. Réparation de Windows conseillée (réinstallation sur place)'
+        }
+        'STOREDAMAGED' {
+            Write-Status 'SFC /scannow' 'intégrité non garantie : magasin de composants encore endommagé' 'FAIL'
+            Write-Sub 'Réparation de Windows conseillée (réinstallation sur place)'
+        }
+        'NORUN' {
+            Write-Status 'SFC /scannow' 'n''a pas pu s''exécuter' 'WARN'
+            Write-Sub 'Redémarre le PC puis relance un scan complet'
+        }
+        default {
+            Write-Status 'SFC /scannow' 'résultat non reconnu' 'INFO'
+            Write-Sub 'Détails : C:\Windows\Logs\CBS\CBS.log'
+        }
+    }
 }
 
 # ------------------------------------------------------------------
@@ -1454,6 +1951,7 @@ function Invoke-SelfTestAnalyzers {
     # Test-Case, Assert-True et Write-Section sont fournis par l'appelant.
     Write-Section 'T1' 'Analyseurs de résultats (cas de référence)'
 
+    $ap = [string][char]0x2019      # apostrophe typographique des messages de Windows 11
     $sfcCases = @(
         @('Windows Resource Protection did not find any integrity violations.', 'CLEAN'),
         @("La protection des ressources Windows n'a trouvé aucune violation d'intégrité.", 'CLEAN'),
@@ -1463,6 +1961,16 @@ function Invoke-SelfTestAnalyzers {
         @("La protection des ressources Windows a trouvé des fichiers endommagés, mais n'a pas pu en réparer certains.", 'UNFIXED'),
         @('Windows Resource Protection could not perform the requested operation.', 'NORUN'),
         @("La protection des ressources Windows n'a pas pu effectuer l'opération demandée.", 'NORUN'),
+        # Messages de Windows 11 en français, relevés dans sfc.exe.mui le 19/11/2026
+        @(('Le programme de protection des ressources Windows n' + $ap + 'a trouvé aucune violation d' + $ap + 'intégrité.'), 'CLEAN'),
+        @(('La protection des ressources Windows n' + $ap + 'a pas réussi à effectuer l' + $ap + 'opération demandée.'), 'NORUN'),
+        @(('La protection des ressources Windows n' + $ap + 'a pas réussi à démarrer le service de réparation.'), 'NORUN'),
+        @(('Pour pouvoir utiliser l' + $ap + 'utilitaire sfc, vous devez être un administrateur exécutant une session de console.'), 'NORUN'),
+        @('La Protection des ressources Windows a détecté des fichiers corrompus et les a réparés. Pour les réparations en ligne, les détails sont inclus dans le fichier journal de CBS.', 'REPAIRED'),
+        @("La Protection des ressources Windows a détecté des fichiers corrompus, mais n'a pas pu réparer certains d'entre eux.", 'UNFIXED'),
+        @("La Protection des ressources Windows a détecté des violations de l'intégrité.", 'UNFIXED'),
+        @("La Protection des ressources Windows n'a pas détecté de violations de l'intégrité, mais ne peut pas garantir l'intégrité du système, car les métadonnées des composants sont endommagées.", 'STOREDAMAGED'),
+        @('Windows Resource Protection did not find any integrity violations, but cannot guarantee system integrity.', 'STOREDAMAGED'),
         @('texte inattendu', 'UNKNOWN')
     )
     Test-Case 'SFC : messages EN/FR' {
@@ -1478,15 +1986,39 @@ function Invoke-SelfTestAnalyzers {
         Assert-True ($got -eq 'CLEAN') "obtenu $got"
         'octets nuls ignorés'
     }
+    Test-Case 'SFC : sortie réelle (UTF-16, fins de ligne Windows)' {
+        $txt = "`r`n`r`nDébut de l'analyse du système. Cette opération peut nécessiter un certain temps.`r`n`r`n" +
+               "Démarrage de la phase de vérification de l'analyse du système.`r`nLa vérification est à 100 % terminée.`r`n`r`n" +
+               'La Protection des ressources Windows a détecté des fichiers corrompus, mais n' + $ap + "a pas pu réparer certains d'entre eux.`r`n"
+        $got = Get-SfcVerdict (ConvertFrom-ToolBytes ([Text.Encoding]::Unicode.GetBytes($txt)))
+        Assert-True ($got -eq 'UNFIXED') "obtenu $got"
+        'fichiers non réparés reconnus'
+    }
+    Test-Case 'Sortie d''outil : décodage UTF-16, UTF-8, OEM' {
+        $txt = "Le magasin de composants est réparable.`r`nL'opération a réussi.`r`n"
+        Assert-True ((ConvertFrom-ToolBytes ([Text.Encoding]::Unicode.GetBytes($txt))) -eq $txt) 'UTF-16 mal décodé'
+        Assert-True ((ConvertFrom-ToolBytes ([Text.Encoding]::UTF8.GetBytes($txt))) -eq $txt) 'UTF-8 mal décodé'
+        # Octet 0x82 isolé (« é » dans les pages de code OEM 850 et 437) : invalide en UTF-8, donc lu en OEM
+        $oem = ConvertFrom-ToolBytes ([byte[]](0x72, 0x82, 0x70, 0x61, 0x72, 0x61, 0x62, 0x6C, 0x65, 0x0D, 0x0A))
+        Assert-True ($oem.EndsWith("arable`r`n") -and $oem.Length -ge 9) ('page de code OEM mal décodée : ' + $oem.Trim())
+        Assert-True ((ConvertFrom-ToolBytes $null) -eq '') 'sortie absente'
+        '4/4 cas'
+    }
 
     $dismCases = @(
         @('No component store corruption detected.', 0, 'CLEAN'),
-        @("Aucune altération du magasin des composants n'a été détectée.", 0, 'CLEAN'),
+        @(('Aucun endommagement du magasin de composants n' + $ap + 'a été détecté.'), 0, 'CLEAN'),
         @('The component store is repairable.', 0, 'REPAIRABLE'),
-        @('Le magasin des composants est réparable.', 0, 'REPAIRABLE'),
+        @('Le magasin de composants est réparable.', 0, 'REPAIRABLE'),
         @('The component store cannot be repaired.', 0, 'UNREPAIRABLE'),
+        @('Le magasin de composants est irréparable.', 0, 'UNREPAIRABLE'),
+        # Accents mal décodés (UTF-8 lu comme page de code 850) : le verdict doit rester le bon
+        @(([Text.Encoding]::GetEncoding(850).GetString([Text.Encoding]::UTF8.GetBytes('Le magasin de composants est réparable.'))), 0, 'REPAIRABLE'),
+        @(([Text.Encoding]::GetEncoding(850).GetString([Text.Encoding]::UTF8.GetBytes('Le magasin de composants est irréparable.'))), 0, 'UNREPAIRABLE'),
         @('Error: 87 The parameter is incorrect.', 87, 'ERROR'),
-        @('The operation completed successfully.', 0, 'CLEAN')
+        # Aucun message reconnu : jamais « sain » par défaut
+        @('The operation completed successfully.', 0, 'UNKNOWN'),
+        @('', 0, 'UNKNOWN')
     )
     Test-Case 'DISM : messages et codes' {
         foreach ($c in $dismCases) {
@@ -1494,6 +2026,35 @@ function Invoke-SelfTestAnalyzers {
             Assert-True ($got -eq $c[2]) ("« {0} » -> {1}, attendu {2}" -f (Cut $c[0] 30), $got, $c[2])
         }
         '{0}/{0} cas' -f $dismCases.Count
+    }
+    Test-Case 'DISM : sortie réelle avec fins de ligne Windows' {
+        $head = "`r`nOutil Gestion et maintenance des images de déploiement`r`nVersion : 10.0.26100.1`r`n`r`nVersion de l'image : 10.0.26300.1`r`n`r`n"
+        $bar = '[==========================100.0%==========================] '
+        $clean = $head + $bar + 'Aucun endommagement du magasin de composants n' + $ap + "a été détecté.`r`nL" + $ap + "opération a réussi.`r`n"
+        Assert-True ((Get-DismVerdict $clean 0) -eq 'CLEAN') 'magasin sain non reconnu'
+        $rep = $head + $bar + "Le magasin de composants est réparable.`r`nL" + $ap + "opération a réussi.`r`n"
+        Assert-True ((Get-DismVerdict $rep 0) -eq 'REPAIRABLE') 'magasin réparable non reconnu'
+        # Octets dans la page de code OEM de ce PC, comme DISM les écrit
+        $oemPage = [Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage
+        $oemBytes = [Text.Encoding]::GetEncoding($oemPage).GetBytes($head + $bar + "Le magasin de composants est irréparable.`r`n")
+        Assert-True ((Get-DismVerdict (ConvertFrom-ToolBytes $oemBytes) 0) -eq 'UNREPAIRABLE') 'magasin irréparable non reconnu (octets OEM)'
+        '3/3 cas'
+    }
+    Test-Case 'DISM : résultat de la réparation' {
+        $cases = @(
+            @("The restore operation completed successfully.`r`nThe operation completed successfully.`r`n", 0, 'REPAIRED'),
+            @(("La restauration a été effectuée.`r`nL" + $ap + "opération a réussi.`r`n"), 0, 'REPAIRED'),
+            @('The restore operation failed. Either the repair source was not found or the component store cannot be repaired.', -2146498529, 'NOSOURCE'),
+            @('Échec de la restauration. La source de réparation est introuvable ou le magasin de composants est irréparable.', -2146498529, 'NOSOURCE'),
+            @('Error: 1726 The remote procedure call failed.', 1726, 'FAILED'),
+            @('The operation completed successfully.', 0, 'UNKNOWN'),
+            @('', $null, 'FAILED')
+        )
+        foreach ($c in $cases) {
+            $got = Get-DismRepairVerdict $c[0] $c[1]
+            Assert-True ($got -eq $c[2]) ("« {0} » -> {1}, attendu {2}" -f (Cut $c[0] 30), $got, $c[2])
+        }
+        '{0}/{0} cas' -f $cases.Count
     }
 
     Test-Case 'CHKDSK : codes de sortie 0-3' {
@@ -1566,6 +2127,96 @@ function Invoke-SelfTestAnalyzers {
         Assert-True ($n -eq 1) "$n paquet(s), attendu 1"
         '1 paquet lu'
     }
+    Test-Case 'winget : « aucune » seulement si winget le dit' {
+        Assert-True ((Get-WingetScanState "Aucune mise à niveau disponible.`r`n" 0) -eq 'NONE') 'message FR (fin de ligne Windows) non reconnu'
+        Assert-True ((Get-WingetScanState 'No available upgrade found.' 0) -eq 'NONE') 'message EN non reconnu'
+        Assert-True ((Get-WingetScanState 'tableau lu' 3) -eq 'LIST') 'liste lue non reconnue'
+        Assert-True ((Get-WingetScanState '' 0) -eq 'UNREADABLE') 'réponse vide prise pour « aucune »'
+        Assert-True ((Get-WingetScanState "Échec lors de la recherche dans la source : winget`r`n" 0) -eq 'UNREADABLE') 'erreur de winget prise pour « aucune »'
+        '5/5 cas'
+    }
+    Test-Case 'winget : caractères de contrôle retirés' {
+        $esc = [string][char]27
+        $fmt = '{0,-16}{1,-22}{2,-19}{3,-19}{4}'
+        $raw = ($fmt -f 'Nom', 'ID', 'Version', 'Disponible', 'Source') + "`r`n" + ('-' * 82) + "`r`n" +
+               ($fmt -f ('Outil' + $esc + '[2J'), 'Editeur.Outil', '1.0', ('2.0' + [char]7), 'winget') + "`r`n"
+        $r = @(ConvertFrom-WingetText $raw)
+        Assert-True ($r.Count -eq 1) ("{0} paquet(s), attendu 1" -f $r.Count)
+        $all = $r[0].Name + $r[0].Id + $r[0].Installed + $r[0].Available
+        Assert-True ($all -notmatch '[\x00-\x1F\x7F-\x9F]') 'caractère de contrôle conservé'
+        'séquence d''échappement neutralisée'
+    }
+    Test-Case 'Affichage : caractères de contrôle retirés' {
+        $esc = [string][char]27
+        $got = Remove-ControlChars ('Mise' + $esc + '[2J à jour' + [char]7 + [char]0x9B + "`r`n")
+        Assert-True ($got -eq 'Mise[2J à jour') ('obtenu : ' + $got)
+        Assert-True ((Remove-ControlChars $null) -eq '') 'valeur nulle'
+        '2/2 cas'
+    }
+    Test-Case 'Réponses oui/non : lecture stricte' {
+        foreach ($y in @('o', 'O', 'oui', 'OUI', 'y', 'yes', ' o ', "oui`r`n")) {
+            Assert-True ((Get-YesNo $y $false) -eq 'YES') ('non lu comme oui : ' + $y.Trim())
+        }
+        foreach ($n in @('n', 'N', 'non', 'no', ' NON ', "n`r`n")) {
+            Assert-True ((Get-YesNo $n $true) -eq 'NO') ('non lu comme non : ' + $n.Trim())
+        }
+        Assert-True ((Get-YesNo $null $true) -eq 'NO') 'annulation acceptée comme oui'
+        Assert-True ((Get-YesNo '' $true) -eq 'YES') 'Entrée : réponse par défaut « oui » non appliquée'
+        Assert-True ((Get-YesNo '' $false) -eq 'NO') 'Entrée : réponse par défaut « non » non appliquée'
+        foreach ($u in @('ok', 'ouais', 'x', '1', 'on', 'nope', 'oo', 'o n')) {
+            Assert-True ((Get-YesNo $u $true) -eq 'UNKNOWN') ('réponse floue acceptée : ' + $u)
+            Assert-True ((Get-YesNo $u $false) -eq 'UNKNOWN') ('réponse floue acceptée : ' + $u)
+        }
+        '33/33 cas'
+    }
+    Test-Case 'Menus : seules les touches affichées' {
+        $keys = @('1', '2', 'U', 'R')
+        Assert-True ((Get-MenuChoice '2' $keys '1') -eq '2') 'touche affichée refusée'
+        Assert-True ((Get-MenuChoice ' u ' $keys '1') -eq 'U') 'minuscule ou espaces refusés'
+        Assert-True ((Get-MenuChoice "r`r`n" $keys '1') -eq 'R') 'fin de ligne Windows non retirée'
+        Assert-True ((Get-MenuChoice '' $keys '1') -eq '1') 'Entrée : choix par défaut non appliqué'
+        Assert-True ((Get-MenuChoice '' $keys '') -eq '') 'Entrée acceptée alors qu''aucun choix par défaut n''existe'
+        Assert-True ($null -eq (Get-MenuChoice $null $keys '1')) 'annulation non transmise'
+        foreach ($bad in @('3', 'M', '12', 'oui', '?')) {
+            Assert-True ((Get-MenuChoice $bad $keys '1') -eq '') ('touche non affichée acceptée : ' + $bad)
+        }
+        '11/11 cas'
+    }
+    Test-Case 'Journaux : « aucun événement » ou lecture en échec' {
+        Assert-True (Test-NoEventError 'NoMatchingEventsFound,Microsoft.PowerShell.Commands.GetWinEventCommand') 'aucun événement pris pour un échec'
+        Assert-True (-not (Test-NoEventError 'NoMatchingLogsFound,Microsoft.PowerShell.Commands.GetWinEventCommand')) 'journal absent pris pour « aucun événement »'
+        Assert-True (-not (Test-NoEventError 'NoMatchingProvidersFound,Microsoft.PowerShell.Commands.GetWinEventCommand')) 'fournisseur absent pris pour « aucun événement »'
+        Assert-True (-not (Test-NoEventError '')) 'erreur inconnue prise pour « aucun événement »'
+        '4/4 cas'
+    }
+    Test-Case 'Windows Update : téléchargement et installation prouvés' {
+        Assert-True ((Get-WuDownloadState 2 3 3) -eq 'READY') 'téléchargement complet non reconnu'
+        Assert-True ((Get-WuDownloadState 3 3 2) -eq 'PARTIAL') 'téléchargement partiel non reconnu'
+        Assert-True ((Get-WuDownloadState 2 3 2) -eq 'PARTIAL') 'mise à jour manquante non vue'
+        Assert-True ((Get-WuDownloadState 4 3 0) -eq 'FAILED') 'échec non reconnu'
+        Assert-True ((Get-WuDownloadState 2 3 0) -eq 'FAILED') 'code « réussi » accepté alors que rien n''est téléchargé'
+        $s1 = Get-WuInstallSummary ([int[]]@(2, 2))
+        Assert-True ($s1.State -eq 'OK' -and $s1.Ok -eq 2) 'installation réussie mal lue'
+        $s2 = Get-WuInstallSummary ([int[]]@(2, 3))
+        Assert-True ($s2.State -eq 'WARN' -and $s2.Warn -eq 1) 'avertissement compté comme réussite simple'
+        $s3 = Get-WuInstallSummary ([int[]]@(2, 3, 4))
+        Assert-True ($s3.State -eq 'FAIL' -and $s3.Fail -eq 1) 'échec mal lu'
+        $s4 = Get-WuInstallSummary ([int[]]@())
+        Assert-True ($s4.State -eq 'NONE') 'aucune installation prise pour une réussite'
+        '9/9 cas'
+    }
+    Test-Case 'Préférences : lecture de config.json' {
+        $c = ConvertFrom-JarvisConfigText "{`r`n  `"Name`": `"Camille`",`r`n  `"WingetModule`": `"never`"`r`n}`r`n"
+        Assert-True ($c['Name'] -eq 'Camille' -and $c['WingetModule'] -eq 'never') 'valeurs simples mal lues (fins de ligne Windows)'
+        Assert-True ((ConvertFrom-JarvisConfigText 'pas du JSON').Count -eq 0) 'texte illisible accepté'
+        Assert-True ((ConvertFrom-JarvisConfigText '').Count -eq 0) 'fichier vide accepté'
+        Assert-True ((ConvertFrom-JarvisConfigText '[1,2]').Count -eq 0) 'tableau accepté'
+        Assert-True ((ConvertFrom-JarvisConfigText '"texte"').Count -eq 0) 'texte seul accepté'
+        $d = ConvertFrom-JarvisConfigText ('{"Name":{"a":1},"Liste":[1,2],"Long":"' + ('x' * 201) + '","Ok":true,"N":3}')
+        Assert-True (-not $d.ContainsKey('Name') -and -not $d.ContainsKey('Liste') -and -not $d.ContainsKey('Long')) 'valeur complexe ou trop longue gardée'
+        Assert-True ($d['Ok'] -eq $true -and $d['N'] -eq 3) 'booléen ou nombre perdu'
+        '7/7 cas'
+    }
 
     Test-Case 'Antivirus : décodage productState' {
         $a = Get-AvState 266240; Assert-True ($a.On -and $a.UpToDate) '266240 : attendu actif + à jour'
@@ -1603,15 +2254,18 @@ function Invoke-SelfTestAnalyzers {
             if ($Digest) { $a.digest = $Digest }
             (@{ tag_name = $Tag; draft = $false; prerelease = $false; body = 'notes'; assets = @($a) } | ConvertTo-Json -Depth 4)
         }
-        $ok = Get-JarvisReleaseInfo (& $mk 'v9.1' 'JARVIS.cmd' $base ('sha256:' + ('AB' * 32))) $JarvisRepo
+        $dg = 'sha256:' + ('AB' * 32)
+        $ok = Get-JarvisReleaseInfo (& $mk 'v9.1' 'JARVIS.cmd' $base $dg) $JarvisRepo
         Assert-True ($ok.Ok -and $ok.Version -eq '9.1' -and $ok.Sha256 -eq ('ab' * 32) -and $ok.Size -eq 1234) ('version valide refusée : ' + $ok.Reason)
-        Assert-True ((Get-JarvisReleaseInfo (& $mk '9.1' 'JARVIS.cmd' $base $null) $JarvisRepo).Ok) 'numéro sans « v » ou sans empreinte refusé'
-        Assert-True (-not (Get-JarvisReleaseInfo (& $mk 'latest' 'JARVIS.cmd' $base $null) $JarvisRepo).Ok) 'numéro invalide accepté'
-        Assert-True (-not (Get-JarvisReleaseInfo (& $mk 'v9.1' 'autre.exe' $base $null) $JarvisRepo).Ok) 'fichier absent accepté'
-        Assert-True (-not (Get-JarvisReleaseInfo (& $mk 'v9.1' 'JARVIS.cmd' 'https://exemple.com/JARVIS.cmd' $null) $JarvisRepo).Ok) 'adresse étrangère acceptée'
+        Assert-True ((Get-JarvisReleaseInfo (& $mk '9.1' 'JARVIS.cmd' $base $dg) $JarvisRepo).Ok) 'numéro sans « v » refusé'
+        $noDg = Get-JarvisReleaseInfo (& $mk 'v9.1' 'JARVIS.cmd' $base $null) $JarvisRepo
+        Assert-True (-not $noDg.Ok -and $noDg.Reason -match 'empreinte') 'version publiée sans empreinte acceptée'
+        Assert-True (-not (Get-JarvisReleaseInfo (& $mk 'latest' 'JARVIS.cmd' $base $dg) $JarvisRepo).Ok) 'numéro invalide accepté'
+        Assert-True (-not (Get-JarvisReleaseInfo (& $mk 'v9.1' 'autre.exe' $base $dg) $JarvisRepo).Ok) 'fichier absent accepté'
+        Assert-True (-not (Get-JarvisReleaseInfo (& $mk 'v9.1' 'JARVIS.cmd' 'https://exemple.com/JARVIS.cmd' $dg) $JarvisRepo).Ok) 'adresse étrangère acceptée'
         Assert-True (-not (Get-JarvisReleaseInfo (& $mk 'v9.1' 'JARVIS.cmd' $base 'md5:1234') $JarvisRepo).Ok) 'empreinte illisible acceptée'
         Assert-True (-not (Get-JarvisReleaseInfo 'pas du JSON' $JarvisRepo).Ok) 'réponse illisible acceptée'
-        '7/7 cas'
+        '8/8 cas'
     }
     Test-Case 'Mise à jour : contrôle du fichier téléchargé' {
         # Faux JARVIS.cmd fabriqué comme build.py : en-tête avec empreinte du code qui suit la ligne de fermeture
@@ -1629,17 +2283,23 @@ function Invoke-SelfTestAnalyzers {
         Assert-True ($null -eq $why) ('fichier valide refusé : ' + $why)
         Assert-True ((Get-JarvisCmdState ([Text.Encoding]::UTF8.GetString($b))) -eq 'OK') 'empreinte interne mal calculée'
         $t = & $mkPkg '9.1' -Tamper
-        $infoT = [pscustomobject]@{ Version = '9.1'; Size = [int64]$t.Length; Sha256 = $null }
-        Assert-True ($null -ne (Test-JarvisPackage $t $infoT '3.11')) 'fichier modifié accepté'
+        # Empreinte publiée conforme mais empreinte interne fausse : c'est le contrôle interne qui doit refuser
+        $infoT = [pscustomobject]@{ Version = '9.1'; Size = [int64]$t.Length; Sha256 = (Get-Sha256Hex $t) }
+        $whyT = [string](Test-JarvisPackage $t $infoT '3.11')
+        Assert-True ($whyT -match 'interne') ('fichier modifié accepté, ou refusé pour une autre raison : ' + $whyT)
         $infoBad = [pscustomobject]@{ Version = '9.1'; Size = [int64]$b.Length; Sha256 = ('0' * 64) }
         Assert-True ($null -ne (Test-JarvisPackage $b $infoBad '3.11')) 'empreinte publiée différente acceptée'
-        $infoV = [pscustomobject]@{ Version = '9.2'; Size = [int64]$b.Length; Sha256 = $null }
+        $infoNo = [pscustomobject]@{ Version = '9.1'; Size = [int64]$b.Length; Sha256 = $null }
+        Assert-True ($null -ne (Test-JarvisPackage $b $infoNo '3.11')) 'fichier sans empreinte publiée accepté'
+        $infoV = [pscustomobject]@{ Version = '9.2'; Size = [int64]$b.Length; Sha256 = (Get-Sha256Hex $b) }
         Assert-True ($null -ne (Test-JarvisPackage $b $infoV '3.11')) 'version différente de la version publiée acceptée'
         Assert-True ($null -ne (Test-JarvisPackage $b $info '9.1')) 'version identique acceptée'
         Assert-True ($null -ne (Test-JarvisPackage $b $info '10.0')) 'rétrogradation acceptée'
+        Assert-True ($null -ne (Test-JarvisPackage $b $info 'illisible')) 'version installée illisible acceptée'
         $short = [byte[]]$b[0..($b.Length - 50)]
-        Assert-True ($null -ne (Test-JarvisPackage $short ([pscustomobject]@{ Version = '9.1'; Size = 0; Sha256 = $null }) '3.11')) 'fichier tronqué accepté'
-        '8/8 cas'
+        $infoS = [pscustomobject]@{ Version = '9.1'; Size = 0; Sha256 = (Get-Sha256Hex $short) }
+        Assert-True ($null -ne (Test-JarvisPackage $short $infoS '3.11')) 'fichier tronqué accepté'
+        '10/10 cas'
     }
     Test-Case 'Mise à jour : nouveautés affichées sans danger' {
         $esc = [string][char]27
@@ -1701,7 +2361,7 @@ function Invoke-SelfTest {
         'valeur reçue'
     }
     Test-Case 'Processus console + capture' {
-        $r = Invoke-ProcessSpinner -Label 'cmd de test' -FilePath (Join-Path $env:windir 'System32\cmd.exe') `
+        $r = Invoke-ProcessSpinner -Label 'cmd de test' -FilePath (Get-SystemToolPath 'cmd.exe') `
              -Arguments '/c echo JARVIS_OK' -TimeoutSec 30 -Encoding 'Oem'
         Assert-True ($null -ne $r) 'pas de retour'
         Assert-True ($r.Code -eq 0) "code $($r.Code)"
@@ -1709,11 +2369,19 @@ function Invoke-SelfTest {
         'code 0, sortie lue'
     }
     Test-Case 'Délai dépassé : arrêt du processus' {
-        $r = Invoke-ProcessSpinner -Label 'arrêt forcé' -FilePath (Join-Path $env:windir 'System32\PING.EXE') `
+        $r = Invoke-ProcessSpinner -Label 'arrêt forcé' -FilePath (Get-SystemToolPath 'PING.EXE') `
              -Arguments '-n 30 127.0.0.1' -TimeoutSec 2 -Encoding 'Oem'
         Assert-True ($null -eq $r) 'le délai n''a pas interrompu le processus'
+        Assert-True ($script:ProcState -eq 'TIMEOUT') ('motif de l''arrêt mal noté : ' + $script:ProcState)
         Start-Sleep -Milliseconds 300
         'interrompu à 2 s'
+    }
+    Test-Case 'Outil introuvable : pas de plantage' {
+        $r = Invoke-ProcessSpinner -Label 'outil absent' -FilePath (Get-SystemToolPath 'outil-absent-jarvis.exe') `
+             -Arguments '/x' -TimeoutSec 5 -Encoding 'Auto'
+        Assert-True ($null -eq $r) 'un résultat a été renvoyé pour un outil absent'
+        Assert-True ($script:ProcState -eq 'NOSTART') ('motif mal noté : ' + $script:ProcState)
+        'lancement impossible signalé, JARVIS continue'
     }
     Test-Case 'SFC : lancement et décodage de la sortie' {
         $sfcExe = Get-SfcPath
@@ -1725,14 +2393,16 @@ function Invoke-SelfTest {
         'aide lue correctement'
     } -NeedAdmin
     Test-Case 'DISM : /CheckHealth (rapide)' {
-        $r = Invoke-ProcessSpinner -Label 'DISM /CheckHealth' -FilePath (Join-Path $env:windir 'System32\dism.exe') `
-             -Arguments '/Online /Cleanup-Image /CheckHealth' -TimeoutSec 300 -Encoding 'Oem'
+        $r = Invoke-ProcessSpinner -Label 'DISM /CheckHealth' -FilePath (Get-SystemToolPath 'dism.exe') `
+             -Arguments '/Online /Cleanup-Image /CheckHealth' -TimeoutSec 300 -Encoding 'Auto'
         Assert-True ($null -ne $r) 'délai dépassé'
         Assert-True ($r.Code -eq 0) "code de sortie $($r.Code)"
-        'verdict : ' + (Get-DismVerdict $r.Text $r.Code)
+        $dv = Get-DismVerdict $r.Text $r.Code
+        Assert-True ($dv -ne 'UNKNOWN') 'message de DISM non reconnu (langue de Windows autre que français ou anglais ?)'
+        'verdict : ' + $dv
     } -NeedAdmin
     Test-Case 'CHKDSK : lancement' {
-        $r = Invoke-ProcessSpinner -Label 'chkdsk /?' -FilePath (Join-Path $env:windir 'System32\chkdsk.exe') `
+        $r = Invoke-ProcessSpinner -Label 'chkdsk /?' -FilePath (Get-SystemToolPath 'chkdsk.exe') `
              -Arguments '/?' -TimeoutSec 60 -Encoding 'Oem'
         Assert-True ($null -ne $r) 'pas de retour'
         Assert-True ($r.Text -match '/scan') 'option /scan absente de l''aide'
@@ -1807,9 +2477,11 @@ function Invoke-SelfTest {
         'lisibles'
     } -NeedAdmin
     Test-Case 'Journal Système' {
-        $e = Get-WinEvent -LogName System -MaxEvents 1 -ErrorAction Stop
-        Assert-True ($null -ne $e) 'journal vide'
-        'lisible'
+        $r = Get-EventsSafe @{ LogName = 'System'; Level = 1, 2; StartTime = (Get-Date).AddDays(-7) }
+        Assert-True $r.Ok ('lecture impossible : ' + $r.Error)
+        $none = Get-EventsSafe @{ LogName = 'Journal-Inexistant-JARVIS' }
+        Assert-True (-not $none.Ok) 'journal absent lu comme « aucun événement »'
+        ('lisible, {0} erreur(s) en 7 jours' -f @($r.Events).Count)
     }
     Test-Case 'Antivirus (Defender / Centre de sécurité)' {
         $mp2 = Get-MpComputerStatus
@@ -1926,7 +2598,7 @@ function Invoke-SelfTest {
         Set-Content -Path $old -Value 'x'; Set-Content -Path $new -Value 'x'; Set-Content -Path $keep -Value 'x'
         (Get-Item -LiteralPath $old).LastWriteTime = (Get-Date).AddDays(-3)
         $j = Join-Path $sand 'lien'
-        cmd /c ('mklink /J "{0}" "{1}"' -f $j, $outside) | Out-Null
+        & (Get-SystemToolPath 'cmd.exe') /c ('mklink /J "{0}" "{1}"' -f $j, $outside) | Out-Null
         try {
             Assert-True (Test-Path -LiteralPath $j) 'jonction de test non créée'
             $r = Clear-TempFolder $sand 24
@@ -1936,9 +2608,93 @@ function Invoke-SelfTest {
             Assert-True (Test-Path -LiteralPath $keep) 'jonction suivie : fichier extérieur supprimé'
         } finally {
             if (Test-Path -LiteralPath $j) { [IO.Directory]::Delete($j, $false) }
-            if (-not (Test-Path -LiteralPath $j)) { Remove-Item -LiteralPath $root -Recurse -Force }
+            if (-not (Test-Path -LiteralPath $j)) { $null = Remove-TreeNoJunction $root }
         }
         'ancien supprimé, récent et jonction préservés'
+    }
+    Test-Case 'Temp : nettoyage par un chemin au format court' {
+        # %TEMP% vaut parfois C:\Users\MARIED~1\AppData\Local\Temp (nom de compte long ou avec espace)
+        $root = Join-Path $env:TEMP ('jarvis dossier long ' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $sand = Join-Path $root 'Temp'
+        New-Item -ItemType Directory -Path $sand -Force -ErrorAction Stop | Out-Null
+        try {
+            $short = [string](New-Object -ComObject Scripting.FileSystemObject).GetFolder($root).ShortPath
+            if (-not $short -or $short -eq $root) { return 'SKIP:noms courts désactivés sur ce disque' }
+            $old = Join-Path $sand 'ancien.tmp'
+            Set-Content -Path $old -Value 'x'
+            (Get-Item -LiteralPath $old).LastWriteTime = (Get-Date).AddDays(-3)
+            $r = Clear-TempFolder (Join-Path $short 'Temp') 24
+            Assert-True $r.Ok ('nettoyage refusé : ' + $r.Reason)
+            Assert-True (-not (Test-Path -LiteralPath $old)) 'fichier ancien non supprimé par le chemin court'
+        } finally {
+            $null = Remove-TreeNoJunction $root
+        }
+        'fichier ancien supprimé'
+    }
+    Test-Case 'Temp : dossier remplacé par une jonction' {
+        # Entre la liste et la suppression, un sous-dossier listé devient une jonction vers un dossier à protéger :
+        # sans contrôle juste avant la suppression, le fichier du même nom serait détruit de l'autre côté
+        $root = Join-Path $env:TEMP ('jarvis_course_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $sand = Join-Path $root 'Temp'
+        $sub = Join-Path $sand 'sous-dossier'
+        $outside = Join-Path $root 'Protege'
+        New-Item -ItemType Directory -Path $sub -Force -ErrorAction Stop | Out-Null
+        New-Item -ItemType Directory -Path $outside -Force -ErrorAction Stop | Out-Null
+        $victim = Join-Path $sub 'vieux.tmp'
+        $keep = Join-Path $outside 'vieux.tmp'
+        Set-Content -Path $victim -Value 'x'; Set-Content -Path $keep -Value 'precieux'
+        (Get-Item -LiteralPath $victim).LastWriteTime = (Get-Date).AddDays(-3)
+        try {
+            $cand = Get-TempCandidates $sand 24
+            Assert-True (@($cand.Files).Count -eq 1) 'fichier ancien non listé'
+            [IO.File]::Delete($victim)
+            [IO.Directory]::Delete($sub, $false)
+            & (Get-SystemToolPath 'cmd.exe') /c ('mklink /J "{0}" "{1}"' -f $sub, $outside) | Out-Null
+            Assert-True (Test-Path -LiteralPath $victim) 'jonction de test non créée'
+            $done = Remove-TempCandidates $sand $cand
+            Assert-True (Test-Path -LiteralPath $keep) 'fichier extérieur supprimé à travers la jonction'
+            Assert-True ($done.Skipped -ge 1) 'chemin détourné non écarté'
+        } finally {
+            $null = Remove-TreeNoJunction $root
+        }
+        'chemin détourné écarté, fichier extérieur intact'
+    }
+    Test-Case 'Désinstallation : suppression sans suivre les jonctions' {
+        $root = Join-Path $env:TEMP ('jarvis_arbre_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $tree = Join-Path $root 'JARVIS'
+        $outside = Join-Path $root 'Protege'
+        New-Item -ItemType Directory -Path (Join-Path $tree 'Rapports') -Force -ErrorAction Stop | Out-Null
+        New-Item -ItemType Directory -Path $outside -Force -ErrorAction Stop | Out-Null
+        $keep = Join-Path $outside 'precieux.txt'
+        $ro = Join-Path $tree 'lecture-seule.txt'
+        Set-Content -Path (Join-Path $tree 'config.json') -Value 'x'
+        Set-Content -Path (Join-Path $tree 'Rapports\checkup_20260101_1200.txt') -Value 'x'
+        Set-Content -Path $ro -Value 'x'; Set-Content -Path $keep -Value 'x'
+        (Get-Item -LiteralPath $ro).IsReadOnly = $true
+        $j = Join-Path $tree 'lien'
+        & (Get-SystemToolPath 'cmd.exe') /c ('mklink /J "{0}" "{1}"' -f $j, $outside) | Out-Null
+        try {
+            Assert-True (Test-Path -LiteralPath (Join-Path $j 'precieux.txt')) 'jonction de test non créée'
+            Assert-True (Remove-TreeNoJunction $tree) 'dossier non supprimé en entier'
+            Assert-True (Test-Path -LiteralPath $keep) 'jonction suivie : fichier extérieur supprimé'
+        } finally {
+            $null = Remove-TreeNoJunction $root
+        }
+        'dossier supprimé, cible de la jonction intacte'
+    }
+    Test-Case 'Installation : dossier modifiable refusé' {
+        # Dossier du profil : n'importe quel programme peut y écrire, JARVIS (lancé en administrateur) n'y va pas
+        $base = Join-Path $env:LOCALAPPDATA ('jarvis_garde_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        try {
+            $r = Confirm-InstallDir $base
+            Assert-True (-not $r.Ok) 'dossier du profil accepté'
+            Assert-True ($r.Reason -match 'modifiable') ('refusé pour une autre raison : ' + $r.Reason)
+            Assert-True (-not (Test-Path -LiteralPath $base)) 'dossier d''essai laissé en place'
+        } finally {
+            if (Test-Path -LiteralPath $base) { $null = Remove-TreeNoJunction $base }
+        }
+        Assert-True (@(Get-WeakWriters @($env:ProgramFiles)).Count -eq 0) 'Program Files vu comme modifiable sans droits admin'
+        'refusé avant toute copie, dossier d''essai retiré'
     }
     Test-Case 'Installation : chemins interdits refusés' {
         $badPaths = @($env:SystemRoot, [Environment]::GetFolderPath('Desktop'), (Join-Path $env:USERPROFILE 'Downloads'),
@@ -1964,13 +2720,15 @@ function Invoke-SelfTest {
         Assert-True ((Compare-JarvisVersion '3.10' '3.9') -gt 0) '3.10 > 3.9 (pas un tri alphabétique)'
         Assert-True ((Compare-JarvisVersion '3.2' '3.3') -lt 0) '3.2 < 3.3'
         Assert-True ((Compare-JarvisVersion '3.3' '3.3') -eq 0) 'égalité'
-        '4/4 cas'
+        Assert-True ($null -eq (Compare-JarvisVersion 'abc' '3.3')) 'version illisible traitée comme une version'
+        Assert-True ($null -eq (Compare-JarvisVersion '3.3' '')) 'version absente traitée comme « égale »'
+        '6/6 cas'
     }
     Test-Case 'Réponses annulées = non' {
-        Assert-True (Test-No $null) 'annulation acceptée comme oui'
-        Assert-True (Test-No 'n') '« n » accepté comme oui'
-        Assert-True (-not (Test-No '')) 'Entrée refusée pour une question à réponse oui par défaut'
-        Assert-True (-not (Test-No 'o')) '« o » refusé'
+        Assert-True ((Get-YesNo $null $true) -eq 'NO') 'annulation acceptée comme oui'
+        Assert-True ((Get-YesNo 'peut-être' $true) -ne 'YES') 'réponse floue acceptée comme oui'
+        Assert-True ($null -eq (Get-MenuChoice $null @('1', '2') '1')) 'annulation d''un menu prise pour le choix par défaut'
+        Assert-True ((Get-MenuChoice 'x' @('1', '2') '1') -eq '') 'touche non affichée prise pour le choix par défaut'
         '4/4 cas'
     }
     Test-Case 'Windows Update : mises à jour exclues' {
@@ -2134,13 +2892,20 @@ if (-not $JarvisInstalled -and $JarvisSelf -like '*.cmd') {
     if (-not $Install) {
         if ($inst) {
             $cmpV = Compare-JarvisVersion $JarvisVersion $inst.Version
-            if ($cmpV -gt 0) {
+            if ($null -eq $cmpV) {
+                Write-Host ("   [!] Une installation de J.A.R.V.I.S. existe dans {0}, mais sa version est illisible." -f $inst.Dir) -ForegroundColor Yellow
+                Write-Host ("   [1] Réinstaller la v{0} par-dessus (recommandé)   prénom, rapports et raccourcis conservés" -f $JarvisVersion) -ForegroundColor Gray
+                Write-Host '   [2] Lancer cette copie sans installer' -ForegroundColor Gray
+                Write-Host '   [Échap] Quitter' -ForegroundColor DarkGray
+                $c = Read-Choice '   >> Choix [1/2] (Entrée = 1)' @('1', '2') '1'
+                if ($null -eq $c) { $choice = 'quit' } elseif ($c -eq '2') { $choice = 'run' } else { $choice = 'install' }
+            } elseif ($cmpV -gt 0) {
                 Write-Host ("   MISE À JOUR DISPONIBLE : v{0} installée, cette copie est la v{1}." -f $inst.Version, $JarvisVersion) -ForegroundColor Cyan
                 Write-Host '   [1] Mettre à jour (recommandé)   prénom, rapports et raccourcis conservés' -ForegroundColor Gray
                 Write-Host ("   [2] Lancer la version installée (v{0})" -f $inst.Version) -ForegroundColor Gray
                 Write-Host '   [3] Lancer cette copie sans installer' -ForegroundColor Gray
                 Write-Host '   [Échap] Quitter' -ForegroundColor DarkGray
-                $c = Read-Answer '   >> Choix [1/2/3]'
+                $c = Read-Choice '   >> Choix [1/2/3] (Entrée = 1)' @('1', '2', '3') '1'
                 if ($null -eq $c) { $choice = 'quit' } elseif ($c -eq '2') { $choice = 'launch' } elseif ($c -eq '3') { $choice = 'run' } else { $choice = 'install' }
             } elseif ($cmpV -eq 0) {
                 Write-Host ("   Cette version (v{0}) est déjà installée dans {1}." -f $JarvisVersion, $inst.Dir) -ForegroundColor Cyan
@@ -2148,7 +2913,7 @@ if (-not $JarvisInstalled -and $JarvisSelf -like '*.cmd') {
                 Write-Host '   [2] Réinstaller (répare l''installation et les raccourcis)' -ForegroundColor Gray
                 Write-Host '   [3] Lancer cette copie sans installer' -ForegroundColor Gray
                 Write-Host '   [Échap] Quitter' -ForegroundColor DarkGray
-                $c = Read-Answer '   >> Choix [1/2/3]'
+                $c = Read-Choice '   >> Choix [1/2/3] (Entrée = 1)' @('1', '2', '3') '1'
                 if ($null -eq $c) { $choice = 'quit' } elseif ($c -eq '2') { $choice = 'install' } elseif ($c -eq '3') { $choice = 'run' } else { $choice = 'launch' }
             } else {
                 Write-Host ("   [!] Cette copie (v{0}) est PLUS ANCIENNE que la version installée (v{1})." -f $JarvisVersion, $inst.Version) -ForegroundColor Yellow
@@ -2156,7 +2921,7 @@ if (-not $JarvisInstalled -and $JarvisSelf -like '*.cmd') {
                 Write-Host ("   [1] Lancer la version installée v{0} (recommandé)" -f $inst.Version) -ForegroundColor Gray
                 Write-Host '   [2] Lancer quand même cette ancienne copie, sans installer' -ForegroundColor Gray
                 Write-Host '   [Échap] Quitter' -ForegroundColor DarkGray
-                $c = Read-Answer '   >> Choix [1/2]'
+                $c = Read-Choice '   >> Choix [1/2] (Entrée = 1)' @('1', '2') '1'
                 if ($null -eq $c) { $choice = 'quit' } elseif ($c -eq '2') { $choice = 'run' } else { $choice = 'launch' }
             }
         } else {
@@ -2164,10 +2929,10 @@ if (-not $JarvisInstalled -and $JarvisSelf -like '*.cmd') {
             Write-Host '   [1] Installer (recommandé)   C:\Program Files\JARVIS + raccourci menu Démarrer' -ForegroundColor Gray
             Write-Host '   [2] Lancer sans installer' -ForegroundColor Gray
             Write-Host '   [Échap] Quitter' -ForegroundColor DarkGray
-            $c = Read-Answer '   >> Choix [1/2]'
+            $c = Read-Choice '   >> Choix [1/2] (Entrée = 1)' @('1', '2') '1'
             if ($null -eq $c) { $choice = 'quit' } elseif ($c -eq '2') { $choice = 'run' } else { $choice = 'install' }
         }
-    } elseif ($inst -and (Compare-JarvisVersion $JarvisVersion $inst.Version) -lt 0) {
+    } elseif ($inst -and (Compare-JarvisVersion $JarvisVersion $inst.Version) -eq -1) {
         Write-Host ("   [!] Installation refusée : la version installée (v{0}) est plus récente que cette copie (v{1})." -f $inst.Version, $JarvisVersion) -ForegroundColor Yellow
         $choice = 'launch'
     }
@@ -2191,11 +2956,10 @@ if (-not $JarvisInstalled -and $JarvisSelf -like '*.cmd') {
         Write-Host ''
         $target = $null
         if ($inst) { $target = $inst.Dir }
-        $dest = Install-Jarvis $target
+        $dest = Install-Jarvis -TargetDir $target -OldDir $target
         if ($dest) {
             Write-Host ''
-            $a = Read-Answer '   >> Lancer J.A.R.V.I.S. maintenant ? [O/n]'
-            if (-not (Test-No $a)) {
+            if (Read-YesNo '   >> Lancer J.A.R.V.I.S. maintenant ?' -DefaultYes) {
                 if (-not (Start-Elevated $dest '')) {
                     Write-Host '   >> Lance J.A.R.V.I.S. plus tard depuis le menu Démarrer.' -ForegroundColor DarkGray
                     Start-Sleep -Seconds 3
@@ -2210,8 +2974,7 @@ if (-not $JarvisInstalled -and $JarvisSelf -like '*.cmd') {
 
 if (-not $isAdmin -and -not $NoElevate) {
     Write-Host '   [!] Droits administrateur absents : contrôles partiels, mode complet indisponible.' -ForegroundColor Yellow
-    $a = Read-Answer '   >> Relancer en mode administrateur ? [O/n]'
-    if (-not (Test-No $a)) {
+    if (Read-YesNo '   >> Relancer en mode administrateur ?' -DefaultYes) {
         $argList = ''
         if ($Name)      { $argList += " -Name `"$Name`"" }
         if ($ResetName) { $argList += ' -ResetName' }
@@ -2260,25 +3023,26 @@ if ($SelfTest) {
         if ($showM) { $k += 'M' }
         if ($JarvisInstalled) { $k += '4' }
         $k += 'R'
-        '   >> Protocole [' + ($k -join '/') + ']'
+        $k
     }
-    $prompt = & $buildKeys
-    $m = Read-Answer $prompt
+    # Seules les touches affichées sont acceptées ; Entrée lance le scan rapide
+    $keys = @(& $buildKeys)
+    $m = Read-Choice ('   >> Protocole [' + ($keys -join '/') + '] (Entrée = 1)') $keys '1'
     if ($null -eq $m) { exit }
-    while ($m -match '^[rR]$' -or ($showM -and $m -match '^[mM]$') -or ($showU -and $m -match '^[uU]$')) {
-        if ($m -match '^[rR]$') {
+    while ($m -eq 'R' -or $m -eq 'M' -or $m -eq 'U') {
+        if ($m -eq 'R') {
             $rd = Get-ReportDir
             if ($rd) { Start-Process -FilePath 'explorer.exe' -ArgumentList ('"{0}"' -f $rd) }
             else { Write-Host '   [!] Aucun dossier de rapports accessible.' -ForegroundColor Yellow }
-        } elseif ($m -match '^[uU]$') {
+        } elseif ($m -eq 'U') {
             Invoke-JarvisSelfUpdate $upd.Info      # ne revient ici qu'en cas d'annulation ou d'échec
             Write-Host ''
         } else {
             Invoke-WingetModuleOffer
             $showM = Test-ShowWingetOffer
-            $prompt = & $buildKeys
+            $keys = @(& $buildKeys)
         }
-        $m = Read-Answer $prompt
+        $m = Read-Choice ('   >> Protocole [' + ($keys -join '/') + '] (Entrée = 1)') $keys '1'
         if ($null -eq $m) { exit }
     }
     if ($m -eq '2') { $script:DeepMode = $true }
@@ -2392,7 +3156,7 @@ $os = Get-CimInstance Win32_OperatingSystem
 $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 Write-Status 'Système' ('{0} {1}' -f $os.Caption, $cv.DisplayVersion) 'INFO'
 Write-Status 'Build' ('{0}.{1}' -f $cv.CurrentBuild, $cv.UBR) 'INFO'
-if ([int]$cv.CurrentBuild -lt 22000) {
+if ($cv -and $cv.CurrentBuild -and [int]$cv.CurrentBuild -lt 22000) {
     Write-Status 'Support Windows 10' 'terminé le 14/10/2025 (sauf abonnement ESU)' 'WARN'
     Write-Sub 'Passage à Windows 11 conseillé si le matériel est compatible'
 }
@@ -2402,10 +3166,14 @@ if ($isLaptop) { $typeTxt = 'PC portable' }
 $cs = Get-CimInstance Win32_ComputerSystem
 Write-Status 'Machine' ('{0}  //  {1} {2}' -f $typeTxt, $cs.Manufacturer, $cs.Model) 'INFO'
 
-$up = (Get-Date) - $os.LastBootUpTime
-$upTxt = '{0} j {1} h {2} min' -f $up.Days, $up.Hours, $up.Minutes
-if ($up.TotalDays -gt 7) { Write-Status 'Uptime' "$upTxt (redémarrage conseillé)" 'WARN' }
-else { Write-Status 'Uptime' $upTxt 'OK' }
+if ($os -and $os.LastBootUpTime) {
+    $up = (Get-Date) - $os.LastBootUpTime
+    $upTxt = '{0} j {1} h {2} min' -f $up.Days, $up.Hours, $up.Minutes
+    if ($up.TotalDays -gt 7) { Write-Status 'Uptime' "$upTxt (redémarrage conseillé)" 'WARN' }
+    else { Write-Status 'Uptime' $upTxt 'OK' }
+} else {
+    Write-Status 'Uptime' 'lecture impossible' 'INFO'
+}
 
 $pending = @()
 if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $pending += 'composants Windows' }
@@ -2498,14 +3266,19 @@ if ($NoWinget) {
         # Constaté le 19/11/2026 : Epson Scan 2 (version « Unknown ») et Hytale Launcher (installé pour
         # tous les utilisateurs, winget ne propose qu'une installation par utilisateur) étaient proposés
         # puis refusés par winget ; le module, lui, savait que Hytale n'était pas applicable.
-        $out = [pscustomobject]@{ Mode = 'text'; Items = @(); Unknown = 0; UnknownNames = @(); NotApplicable = @(); Error = $null }
+        $out = [pscustomobject]@{ Mode = 'text'; Items = @(); Unknown = 0; UnknownNames = @(); NotApplicable = @(); Error = $null
+                                  Raw = ''; Code = $null; Parsed = 0 }
         if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
             $out.Error = 'NOWINGET'
             return $out
         }
         try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
         $raw = & winget upgrade --accept-source-agreements --disable-interactivity 2>&1 | Out-String
+        # Texte brut et code de retour renvoyés aussi : « aucune mise à jour » ne s'affiche que si winget le dit
+        $out.Code = $LASTEXITCODE
+        $out.Raw = [string]$raw
         $out.Items = @(& ([scriptblock]::Create($ParserText)) $raw)
+        $out.Parsed = @($out.Items).Count
         $out.Unknown = [int](& ([scriptblock]::Create($UnknownText)) $raw)
         try {
             if (Get-Module -ListAvailable -Name Microsoft.WinGet.Client) {
@@ -2553,9 +3326,23 @@ if ($NoWinget) {
         Write-Status 'winget' $wg.Error 'WARN'
     } else {
         $items = @($wg.Items)
+        foreach ($it in $items) {
+            $it.Name = Remove-ControlChars $it.Name
+            $it.Installed = Remove-ControlChars $it.Installed
+            $it.Available = Remove-ControlChars $it.Available
+        }
         $script:WGCount = $items.Count
         $script:WGItems = $items
-        if ($items.Count -eq 0) {
+        $wgState = Get-WingetScanState ([string]$wg.Raw) ([int]$wg.Parsed)
+        if ($items.Count -eq 0 -and $wgState -eq 'UNREADABLE') {
+            # Ni tableau, ni message « aucune mise à niveau » : on ne conclut pas
+            Write-Status 'Applications à mettre à jour' 'réponse de winget illisible' 'WARN'
+            $first = @(([string]$wg.Raw -split "`n") | ForEach-Object { (Remove-ControlChars $_).Trim() } |
+                       Where-Object { $_ -and $_ -notmatch '^[\\|/\-\s]+$' } | Select-Object -First 1)
+            if ($first.Count -gt 0) { Write-Sub ('winget a répondu : ' + (Cut $first[0] 70)) }
+            if ($null -ne $wg.Code -and [int]$wg.Code -ne 0) { Write-Sub ('Code de retour de winget : 0x{0:X8}' -f [int]$wg.Code) }
+            Write-Sub 'Vérifie la connexion Internet puis relance le scan'
+        } elseif ($items.Count -eq 0) {
             Write-Status 'Applications à mettre à jour' 'aucune' 'OK'
         } else {
             Write-Status 'Applications à mettre à jour' ([string]$items.Count) 'WARN'
@@ -2592,6 +3379,7 @@ if ($NoWinget) {
 Write-Section '04' 'Pilotes'
 
 $drv = @(Get-CimInstance Win32_PnPSignedDriver | Where-Object { $_.DeviceName })
+if ($drv.Count -eq 0) { Write-Status 'Liste des pilotes' 'lecture impossible' 'INFO' }
 
 # Wi-Fi
 $phys = @(Get-NetAdapter -Physical)
@@ -2616,10 +3404,10 @@ if ($bt) {
     $btVal = "v{0}  ({1})" -f $bt.DriverVersion, (Format-Date $bt.DriverDate)
     if ($wifiModel -and $Ref.ContainsKey($wifiModel) -and $bt.Manufacturer -match 'Intel') {
         $refBT = $Ref[$wifiModel].BT
-        $cmp = 0
         $c2 = Compare-DriverVersion $bt.DriverVersion $refBT
-        if ($null -ne $c2) { $cmp = $c2 }
-        if ($cmp -ge 0) {
+        if ($null -eq $c2) {
+            Write-Status (Cut $bt.DeviceName 32) ("$btVal  (version illisible, non comparée à la référence $refBT)") 'INFO'
+        } elseif ($c2 -ge 0) {
             Write-Status (Cut $bt.DeviceName 32) $btVal 'OK'
             Write-Sub $Ref[$wifiModel].BTNote
         } else {
@@ -2651,14 +3439,19 @@ foreach ($g in $gpus) {
         continue
     }
     if ($g.Manufacturer -match 'AMD|Advanced Micro') { $v += '  (version Adrenalin : logiciel AMD)' }
-    $gAge = 0
-    try { $gAge = ((Get-Date) - [datetime]$g.DriverDate).Days } catch {}
-    if ($gAge -gt 180) { Write-Status (Cut $g.DeviceName 32) ("$v  (> 6 mois)") 'WARN' }
+    $gAge = $null
+    try { $gAge = ((Get-Date) - [datetime]$g.DriverDate).Days } catch { $gAge = $null }
+    if ($null -eq $gAge) { Write-Status (Cut $g.DeviceName 32) ("$v  (date du pilote illisible)") 'INFO' }
+    elseif ($gAge -gt 180) { Write-Status (Cut $g.DeviceName 32) ("$v  (> 6 mois)") 'WARN' }
     else { Write-Status (Cut $g.DeviceName 32) $v 'OK' }
 }
 
 # Périphériques en erreur
-$bad = @(Get-CimInstance Win32_PnPEntity | Where-Object { $null -ne $_.ConfigManagerErrorCode -and $_.ConfigManagerErrorCode -ne 0 })
+$pnpRead = $true
+$bad = @()
+try {
+    $bad = @(Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object { $null -ne $_.ConfigManagerErrorCode -and $_.ConfigManagerErrorCode -ne 0 })
+} catch { $pnpRead = $false }
 $realBad = 0
 foreach ($d in $bad) {
     $n = $d.DeviceID
@@ -2673,7 +3466,8 @@ foreach ($d in $bad) {
         Write-Status (Cut $n 32) ("code {0} : {1}" -f $code, (Get-CMErrorText $code)) 'WARN'
     }
 }
-if ($realBad -eq 0) { Write-Status 'Périphériques en erreur' 'aucun' 'OK' }
+if (-not $pnpRead) { Write-Status 'Périphériques en erreur' 'lecture impossible' 'INFO' }
+elseif ($realBad -eq 0) { Write-Status 'Périphériques en erreur' 'aucun' 'OK' }
 
 # ==================================================================
 # [05] BLUETOOTH
@@ -2739,11 +3533,16 @@ if ($mp -and -not $mp.RealTimeProtectionEnabled -and $avOther.Count -gt 0) {
 } elseif ($mp) {
     if ($mp.RealTimeProtectionEnabled) { Write-Status 'Defender temps réel' 'actif' 'OK' }
     else { Write-Status 'Defender temps réel' 'inactif' 'FAIL' }
-    $sig = [int]$mp.AntivirusSignatureAge
-    $sigTxt = "v{0}  (âge {1} j)" -f $mp.AntivirusSignatureVersion, $sig
-    if ($sig -gt 7) { Write-Status 'Signatures antivirus' $sigTxt 'FAIL' }
-    elseif ($sig -gt 1) { Write-Status 'Signatures antivirus' $sigTxt 'WARN' }
-    else { Write-Status 'Signatures antivirus' $sigTxt 'OK' }
+    $sig = $null
+    if ($null -ne $mp.AntivirusSignatureAge -and [double]$mp.AntivirusSignatureAge -lt 4294967295) { $sig = [int]$mp.AntivirusSignatureAge }
+    if ($null -eq $sig) {
+        Write-Status 'Signatures antivirus' 'âge illisible' 'INFO'
+    } else {
+        $sigTxt = "v{0}  (âge {1} j)" -f $mp.AntivirusSignatureVersion, $sig
+        if ($sig -gt 7) { Write-Status 'Signatures antivirus' $sigTxt 'FAIL' }
+        elseif ($sig -gt 1) { Write-Status 'Signatures antivirus' $sigTxt 'WARN' }
+        else { Write-Status 'Signatures antivirus' $sigTxt 'OK' }
+    }
     if ($null -ne $mp.QuickScanAge -and $mp.QuickScanAge -lt 4294967295) {
         $qs = [int]$mp.QuickScanAge
         if ($qs -gt 14) { Write-Status 'Dernière analyse rapide' "il y a $qs j" 'WARN' }
@@ -2762,6 +3561,8 @@ if ($fw.Count -gt 0) {
     $off = @($fw | Where-Object { -not $_.Enabled } | ForEach-Object { $_.Name })
     if ($off.Count -eq 0) { Write-Status 'Pare-feu' 'actif sur tous les profils' 'OK' }
     else { Write-Status 'Pare-feu' ('désactivé : ' + ($off -join ', ')) 'FAIL' }
+} else {
+    Write-Status 'Pare-feu' 'lecture impossible' 'INFO'
 }
 
 if ($isAdmin) {
@@ -2776,17 +3577,22 @@ if ($isAdmin) {
         if ($tpm.TpmPresent -and $tpm.TpmReady) { Write-Status 'TPM' 'présent et prêt' 'OK' }
         elseif ($tpm.TpmPresent) { Write-Status 'TPM' 'présent mais non prêt' 'WARN' }
         else { Write-Status 'TPM' 'absent ou désactivé dans le BIOS' 'WARN' }
+    } else {
+        Write-Status 'TPM' 'lecture impossible' 'INFO'
     }
 
     $rp = Get-ComputerRestorePoint | Sort-Object SequenceNumber -Descending | Select-Object -First 1
     if ($rp) {
         $rpDate = $null
         try { $rpDate = [Management.ManagementDateTimeConverter]::ToDateTime($rp.CreationTime) } catch {}
-        $rpAge = 0
-        if ($rpDate) { $rpAge = ((Get-Date) - $rpDate).Days }
-        $rpTxt = "{0} (il y a {1} j)" -f (Format-Date $rpDate), $rpAge
-        if ($rpAge -gt 30) { Write-Status 'Dernier point de restauration' $rpTxt 'WARN' }
-        else { Write-Status 'Dernier point de restauration' $rpTxt 'OK' }
+        if (-not $rpDate) {
+            Write-Status 'Dernier point de restauration' 'date illisible' 'INFO'
+        } else {
+            $rpAge = ((Get-Date) - $rpDate).Days
+            $rpTxt = "{0} (il y a {1} j)" -f (Format-Date $rpDate), $rpAge
+            if ($rpAge -gt 30) { Write-Status 'Dernier point de restauration' $rpTxt 'WARN' }
+            else { Write-Status 'Dernier point de restauration' $rpTxt 'OK' }
+        }
     } else {
         Write-Status 'Point de restauration' 'aucun' 'INFO'
         Write-Sub 'Protection système désactivée ou jamais utilisée (sysdm.cpl > Protection du système)'
@@ -2810,7 +3616,10 @@ foreach ($v in $vols) {
     else { Write-Status $label $txt 'OK' }
 }
 
+if ($vols.Count -eq 0) { Write-Status 'Volumes' 'lecture impossible' 'INFO' }
+
 $disks = @(Get-PhysicalDisk)
+if ($disks.Count -eq 0) { Write-Status 'Disques' 'lecture impossible' 'INFO' }
 foreach ($d in $disks) {
     $txt = "{0}  {1:N0} Go  santé : {2}" -f $d.MediaType, ($d.Size / 1GB), $d.HealthStatus
     $state = 'FAIL'
@@ -2857,24 +3666,33 @@ Write-Section '08' 'Ressources'
 $cpus = @(Get-CimInstance Win32_Processor)
 if ($cpus.Count -gt 0) {
     Write-Status 'Processeur' (Cut ($cpus[0].Name.Trim()) 45) 'INFO'
-    $load = [math]::Round(($cpus | Measure-Object -Property LoadPercentage -Average).Average)
-    $txt = "{0}  {1}%" -f (Get-MiniBar $load), $load
-    if ($load -gt 85) { Write-Status 'Charge CPU' $txt 'WARN' } else { Write-Status 'Charge CPU' $txt 'OK' }
+    $avgLoad = ($cpus | Measure-Object -Property LoadPercentage -Average).Average
+    if ($null -eq $avgLoad) {
+        Write-Status 'Charge CPU' 'lecture impossible' 'INFO'
+    } else {
+        $load = [math]::Round($avgLoad)
+        $txt = "{0}  {1}%" -f (Get-MiniBar $load), $load
+        if ($load -gt 85) { Write-Status 'Charge CPU' $txt 'WARN' } else { Write-Status 'Charge CPU' $txt 'OK' }
+    }
 }
 
 $os = Get-CimInstance Win32_OperatingSystem
-$totGB = $os.TotalVisibleMemorySize / 1MB
-$freeGB = $os.FreePhysicalMemory / 1MB
-$usedPct = [math]::Round((1 - ($freeGB / $totGB)) * 100)
-$txt = "{0}  {1}%  ({2:N1} / {3:N1} Go)" -f (Get-MiniBar $usedPct), $usedPct, ($totGB - $freeGB), $totGB
-if ($usedPct -gt 90) { Write-Status 'Mémoire vive' $txt 'WARN' } else { Write-Status 'Mémoire vive' $txt 'OK' }
+if ($os -and $os.TotalVisibleMemorySize -gt 0 -and $null -ne $os.FreePhysicalMemory) {
+    $totGB = $os.TotalVisibleMemorySize / 1MB
+    $freeGB = $os.FreePhysicalMemory / 1MB
+    $usedPct = [math]::Round((1 - ($freeGB / $totGB)) * 100)
+    $txt = "{0}  {1}%  ({2:N1} / {3:N1} Go)" -f (Get-MiniBar $usedPct), $usedPct, ($totGB - $freeGB), $totGB
+    if ($usedPct -gt 90) { Write-Status 'Mémoire vive' $txt 'WARN' } else { Write-Status 'Mémoire vive' $txt 'OK' }
+} else {
+    Write-Status 'Mémoire vive' 'lecture impossible' 'INFO'
+}
 
 $top = Get-Process | Group-Object ProcessName | ForEach-Object {
     [pscustomobject]@{ Name = $_.Name; MB = [math]::Round((($_.Group | Measure-Object WorkingSet64 -Sum).Sum) / 1MB) }
 } | Sort-Object MB -Descending | Select-Object -First 5
 foreach ($p in $top) { Write-Sub ("{0,-30} {1,7:N0} Mo" -f (Cut $p.Name 30), $p.MB) }
 
-$plan = (powercfg /getactivescheme) -join ' '
+$plan = (& (Get-SystemToolPath 'powercfg.exe') /getactivescheme) -join ' '
 if ($plan -match '\(([^)]+)\)') { Write-Status 'Mode d''alimentation' $Matches[1] 'INFO' }
 
 if ($isLaptop) {
@@ -2897,8 +3715,10 @@ if ($isLaptop) {
     }
 }
 
-$startup = @(Get-CimInstance Win32_StartupCommand)
-if ($startup.Count -gt 15) { Write-Status 'Programmes au démarrage' ("{0} (beaucoup)" -f $startup.Count) 'WARN' }
+$startup = $null
+try { $startup = @(Get-CimInstance Win32_StartupCommand -ErrorAction Stop) } catch { $startup = $null }
+if ($null -eq $startup) { Write-Status 'Programmes au démarrage' 'lecture impossible' 'INFO' }
+elseif ($startup.Count -gt 15) { Write-Status 'Programmes au démarrage' ("{0} (beaucoup)" -f $startup.Count) 'WARN' }
 else { Write-Status 'Programmes au démarrage' ([string]$startup.Count) 'OK' }
 
 # ==================================================================
@@ -2940,25 +3760,23 @@ else { Write-Status 'Résolution DNS' 'échec' 'FAIL' }
 Write-Section '10' 'Journaux d''événements (7 jours)'
 
 $since = (Get-Date).AddDays(-7)
-$sysErr = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Level = 1, 2; StartTime = $since })
+# Un « 0 » n'est affiché en OK que si le journal a vraiment été lu (Get-EventsSafe)
+$sysRead = Get-EventsSafe @{ LogName = 'System'; Level = 1, 2; StartTime = $since }
+$sysErr = @($sysRead.Events)
 
 $kp = @($sysErr | Where-Object { $_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' -and $_.Id -eq 41 }).Count
-if ($kp -gt 0) { Write-Status 'Arrêts brutaux (Kernel-Power 41)' ([string]$kp) 'WARN' }
-else { Write-Status 'Arrêts brutaux (Kernel-Power 41)' '0' 'OK' }
+Write-EventCount 'Arrêts brutaux (Kernel-Power 41)' $sysRead.Ok $kp 'WARN'
 
-$bsod = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WER-SystemErrorReporting'; Id = 1001; StartTime = $since }).Count
-if ($bsod -gt 0) { Write-Status 'Écrans bleus (BugCheck)' ([string]$bsod) 'FAIL' }
-else { Write-Status 'Écrans bleus (BugCheck)' '0' 'OK' }
+$bsodRead = Get-EventsSafe @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WER-SystemErrorReporting'; Id = 1001; StartTime = $since }
+Write-EventCount 'Écrans bleus (BugCheck)' $bsodRead.Ok (@($bsodRead.Events).Count) 'FAIL'
 
-$whea = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WHEA-Logger'; StartTime = $since }).Count
-if ($whea -gt 0) { Write-Status 'Erreurs matérielles (WHEA)' ([string]$whea) 'WARN' }
-else { Write-Status 'Erreurs matérielles (WHEA)' '0' 'OK' }
+$wheaRead = Get-EventsSafe @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WHEA-Logger'; StartTime = $since }
+Write-EventCount 'Erreurs matérielles (WHEA)' $wheaRead.Ok (@($wheaRead.Events).Count) 'WARN'
 
 $diskErr = @($sysErr | Where-Object { $_.ProviderName -in 'disk', 'Ntfs', 'stornvme', 'storahci', 'Microsoft-Windows-Ntfs' }).Count
-if ($diskErr -gt 0) { Write-Status 'Erreurs disque / NTFS' ([string]$diskErr) 'WARN' }
-else { Write-Status 'Erreurs disque / NTFS' '0' 'OK' }
+Write-EventCount 'Erreurs disque / NTFS' $sysRead.Ok $diskErr 'WARN'
 
-Write-Status 'Erreurs système (total)' ([string]$sysErr.Count) 'INFO'
+if ($sysRead.Ok) { Write-Status 'Erreurs système (total)' ([string]$sysErr.Count) 'INFO' }
 $topErr = $sysErr | Group-Object ProviderName | Sort-Object Count -Descending | Select-Object -First 3
 foreach ($t in $topErr) { Write-Sub ("{0,-40} {1,4}" -f (Cut $t.Name 40), $t.Count) }
 
@@ -2989,6 +3807,7 @@ Write-Status 'Corbeille' ("{0:N0} Mo" -f $rbMB) 'INFO'
 $script:TempMB = $tUser + $tWin
 $all = $tUser + $tWin + $tWU + $rbMB
 if ($all -gt 5120) { Write-Status 'Espace récupérable' ("{0:N1} Go" -f ($all / 1024)) 'WARN' }
+elseif (-not $isAdmin) { Write-Status 'Espace récupérable' ("{0:N1} Go  (mesure partielle sans droits admin)" -f ($all / 1024)) 'INFO' }
 else { Write-Status 'Espace récupérable' ("{0:N1} Go" -f ($all / 1024)) 'OK' }
 
 # ==================================================================
@@ -2999,11 +3818,16 @@ Write-Section '12' 'BIOS / carte mère'
 $board = Get-CimInstance Win32_BaseBoard
 $bios  = Get-CimInstance Win32_BIOS
 Write-Status 'Carte mère' ("{0} {1}" -f $board.Manufacturer, $board.Product) 'INFO'
-$bAge = 0
-try { $bAge = ((Get-Date) - $bios.ReleaseDate).Days } catch {}
-$bTxt = "{0}  ({1})" -f $bios.SMBIOSBIOSVersion, (Format-Date $bios.ReleaseDate)
-if ($bAge -gt 365) { Write-Status 'Version BIOS' "$bTxt  (> 1 an)" 'WARN' }
-else { Write-Status 'Version BIOS' $bTxt 'OK' }
+if (-not $bios) {
+    Write-Status 'Version BIOS' 'lecture impossible' 'INFO'
+} else {
+    $bAge = $null
+    if ($bios.ReleaseDate) { try { $bAge = ((Get-Date) - [datetime]$bios.ReleaseDate).Days } catch { $bAge = $null } }
+    $bTxt = "{0}  ({1})" -f $bios.SMBIOSBIOSVersion, (Format-Date $bios.ReleaseDate)
+    if ($null -eq $bAge) { Write-Status 'Version BIOS' "$bTxt  (date illisible)" 'INFO' }
+    elseif ($bAge -gt 365) { Write-Status 'Version BIOS' "$bTxt  (> 1 an)" 'WARN' }
+    else { Write-Status 'Version BIOS' $bTxt 'OK' }
+}
 Write-Sub ("Dernière version : site du fabricant > Support > {0}" -f $board.Product)
 
 # ==================================================================
@@ -3015,8 +3839,8 @@ if ($script:DeepMode) {
 
     # --- DISM : état du magasin de composants
     $dism = Invoke-ProcessSpinner -Label 'DISM /ScanHealth (5-20 min)' `
-            -FilePath (Join-Path $env:windir 'System32\dism.exe') `
-            -Arguments '/Online /Cleanup-Image /ScanHealth' -TimeoutSec 2400 -Encoding 'Oem'
+            -FilePath (Get-SystemToolPath 'dism.exe') `
+            -Arguments '/Online /Cleanup-Image /ScanHealth' -TimeoutSec 2400 -Encoding 'Auto'
 
     $dv = $null
     if ($dism) { $dv = Get-DismVerdict $dism.Text $dism.Code }
@@ -3034,19 +3858,25 @@ if ($script:DeepMode) {
         Write-Status 'DISM ScanHealth' ("code de sortie {0}" -f $dism.Code) 'WARN'
         Write-Sub 'Détails : C:\Windows\Logs\DISM\dism.log'
     } else {
-        Write-Status 'DISM ScanHealth' 'terminé sans anomalie' 'OK'
+        # Message ni français ni anglais reconnu : pas de « sain » sans preuve
+        Write-Status 'DISM ScanHealth' 'résultat non reconnu' 'INFO'
+        Write-Sub 'Détails : C:\Windows\Logs\DISM\dism.log'
     }
 
     # --- SFC /scannow
     $sfcExe = Get-SfcPath
     $sfc = Invoke-ProcessSpinner -Label 'SFC /scannow (5-20 min)' -FilePath $sfcExe `
-           -Arguments '/scannow' -TimeoutSec 3600 -Encoding 'Auto'
+           -Arguments '/scannow' -TimeoutSec 3600 -Encoding 'Auto' -AskOnTimeout
 
     if ($null -eq $sfc) {
-        Write-Status 'SFC /scannow' 'délai dépassé (60 min)' 'WARN'
+        if ($script:ProcState -eq 'STOPPED') { Write-Status 'SFC /scannow' 'arrêté à ta demande avant la fin' 'WARN' }
+        else { Write-Status 'SFC /scannow' 'lancement impossible' 'WARN' }
     } else {
         $sv = Get-SfcVerdict $sfc.Text
-        if ($sv -eq 'CLEAN') {
+        if ($sv -eq 'STOREDAMAGED') {
+            Write-Status 'SFC /scannow' 'intégrité non garantie : magasin de composants endommagé' 'WARN'
+            $script:NeedRestore = $true
+        } elseif ($sv -eq 'CLEAN') {
             Write-Status 'SFC /scannow' 'aucune violation d''intégrité' 'OK'
         } elseif ($sv -eq 'NORUN') {
             Write-Status 'SFC /scannow' 'n''a pas pu s''exécuter' 'WARN'
@@ -3068,7 +3898,7 @@ if ($script:DeepMode) {
     foreach ($v in $ntfs) {
         $L = [string]$v.DriveLetter
         $ck = Invoke-ProcessSpinner -Label ("CHKDSK {0}: /scan" -f $L) `
-              -FilePath (Join-Path $env:windir 'System32\chkdsk.exe') `
+              -FilePath (Get-SystemToolPath 'chkdsk.exe') `
               -Arguments ("{0}: /scan" -f $L) -TimeoutSec 3600 -Encoding 'Oem'
         $code = $null
         if ($ck) { $code = $ck.Code }
@@ -3139,6 +3969,7 @@ $repFile = Save-Report 'checkup' ([string[]]$script:Report)
 # Actions proposées (rien n'est lancé sans réponse "o")
 # ------------------------------------------------------------------
 Write-Host ''
+$repMark = $script:Report.Count       # tout ce qui s'ajoute au rapport après ce point vient des actions
 if ($script:NeedRestore -and $isAdmin) {
     $online = Test-Connection -ComputerName 1.1.1.1 -Count 1 -Quiet
     if (-not $online) { $online = [bool](Resolve-DnsName 'www.microsoft.com' -DnsOnly -QuickTimeout) }
@@ -3146,13 +3977,10 @@ if ($script:NeedRestore -and $isAdmin) {
         Write-Host '   [!] Réparation DISM impossible sans Internet : elle télécharge les fichiers sains depuis Windows Update.' -ForegroundColor Yellow
         Write-Host '       Connecte le PC puis relance le scan complet.' -ForegroundColor Yellow
     } else {
-        $a = Read-Answer '   >> Réparer l''image Windows (DISM /RestoreHealth puis SFC, 15-45 min) ? [o/N]'
-        if ($a -match '^[oOyY]') {
-            Write-Host '   NE FERME PAS CETTE FENÊTRE pendant la réparation.' -ForegroundColor Yellow
-            Write-Host ''
-                    DISM /Online /Cleanup-Image /RestoreHealth
-            sfc /scannow
-                }
+        if (Read-YesNo '   >> Réparer l''image Windows (DISM /RestoreHealth puis SFC, 15-45 min) ?') {
+            if (Wait-ACPower 'une coupure pendant la réparation peut abîmer Windows.') { Invoke-WindowsRepair }
+            else { Write-Host '   >> Réparation annulée.' -ForegroundColor DarkGray }
+        }
     }
 }
 foreach ($L in $script:ChkdskFix) {
@@ -3162,10 +3990,9 @@ foreach ($L in $script:ChkdskFix) {
 if ($script:WGCount -gt 0) {
     Write-Host '   [i] winget peut fermer les applications concernées (navigateur, jeux, messageries) pendant leur mise à jour.' -ForegroundColor DarkGray
     Write-Host '       Enregistre ton travail avant de valider.' -ForegroundColor DarkGray
-    $a = Read-Answer ("   >> Mettre à jour les {0} application(s) avec winget ? [o/N]" -f $script:WGCount)
-    if ($a -match '^[oOyY]') {
+    if (Read-YesNo ("   >> Mettre à jour les {0} application(s) avec winget ?" -f $script:WGCount)) {
         Write-Host ''
-        $okList = @(); $koList = @(); $naList = @()
+        $okItems = @(); $koList = @(); $naList = @()
         $skip = @($script:WGSkipIds)
         $targets = @($script:WGItems | Where-Object { $_.Id })
         if ($targets.Count -eq 0) {
@@ -3177,7 +4004,7 @@ if ($script:WGCount -gt 0) {
                 Write-Host ('   >> Mise à jour de ' + $it.Name) -ForegroundColor Cyan
                 & winget upgrade --id $it.Id --exact --accept-source-agreements --accept-package-agreements --disable-interactivity
                 $rc = $LASTEXITCODE
-                if ($rc -eq 0) { $okList += $it.Name }
+                if ($rc -eq 0) { $okItems += $it }
                 elseif (('{0:X8}' -f $rc) -eq '8A15002B') {
                     # « Aucune mise à niveau applicable » : la nouvelle version ne convient pas à cette installation.
                     # Ce n'est pas une panne : l'application doit se mettre à jour par elle-même.
@@ -3193,34 +4020,47 @@ if ($script:WGCount -gt 0) {
         $raw2 = (& winget upgrade --accept-source-agreements --disable-interactivity 2>&1) | Out-String
         $leftAll = @(ConvertFrom-WingetText $raw2)
         $left = @($leftAll | Where-Object { $skip -notcontains $_.Id })
-        foreach ($n in $okList) { Write-Host ('   [ OK ] ' + $n) -ForegroundColor Green }
-        foreach ($n in $koList) { Write-Host ('   [FAIL] ' + $n) -ForegroundColor Red }
+        $verif = Get-WingetScanState $raw2 $leftAll.Count
+        $ell = [string][char]0x2026
+        foreach ($it in $okItems) {
+            # winget a répondu « terminé » : le succès n'est annoncé que si la nouvelle liste le confirme.
+            # Un identifiant coupé par winget (terminé par des points de suspension) se compare par son début.
+            $still = @($leftAll | Where-Object {
+                $_.Id -eq $it.Id -or ($_.Id.EndsWith($ell) -and $it.Id.StartsWith($_.Id.TrimEnd([char]0x2026), [StringComparison]::OrdinalIgnoreCase))
+            })
+            if ($verif -eq 'UNREADABLE') { Write-Action 'INFO' ($it.Name + ' : winget a répondu « terminé », résultat non vérifié') }
+            elseif ($still.Count -gt 0) { Write-Action 'WARN' ($it.Name + ' : winget a répondu « terminé », mais l''ancienne version est toujours là') }
+            else { Write-Action 'OK' ($it.Name + ' : mise à jour vérifiée') }
+        }
+        foreach ($n in $koList) { Write-Action 'FAIL' $n }
         foreach ($n in $naList) {
-            Write-Host ('   [INFO] ' + $n + ' : winget n''a pas de version adaptée à cette installation.') -ForegroundColor Cyan
+            Write-Action 'INFO' ($n + ' : winget n''a pas de version adaptée à cette installation')
             Write-Host '          Mets-la à jour depuis l''application elle-même (souvent automatique à son ouverture).' -ForegroundColor DarkGray
         }
         if ($left.Count -gt 0) {
-            Write-Host ("   [!] {0} application(s) toujours en retard :" -f $left.Count) -ForegroundColor Yellow
-            foreach ($l in $left) { Write-Host ('       - ' + (Cut $l.Name 60) + '  ' + $l.Installed + ' -> ' + $l.Available) -ForegroundColor Yellow }
+            Write-Action 'WARN' ("{0} application(s) toujours en retard :" -f $left.Count)
+            foreach ($l in $left) {
+                Write-Host ('       - ' + (Cut $l.Name 60) + '  ' + $l.Installed + ' -> ' + $l.Available) -ForegroundColor Yellow
+                $script:Report.Add('       - ' + (Cut $l.Name 60) + '  ' + $l.Installed + ' -> ' + $l.Available)
+            }
             Write-Host '       Cause fréquente : l''application était ouverte pendant la mise à jour.' -ForegroundColor DarkGray
             Write-Host '       Ferme-la puis relance JARVIS, ou mets-la à jour depuis l''application.' -ForegroundColor DarkGray
         } elseif ($leftAll.Count -gt 0) {
             # Seules restent des applications que winget refuse de mettre à jour (signalées ci-dessus)
-            Write-Host '   >> Vérifié : tout ce que winget peut mettre à jour est à jour.' -ForegroundColor Green
-        } elseif (Test-WingetNoUpgrade $raw2) {
-            Write-Host '   >> Vérifié : toutes les applications sont à jour.' -ForegroundColor Green
+            Write-Action 'OK' 'Vérifié : tout ce que winget peut mettre à jour est à jour'
+        } elseif ($verif -eq 'NONE') {
+            Write-Action 'OK' 'Vérifié : toutes les applications sont à jour'
         } else {
             # Ni liste lisible, ni message « aucune mise à jour » : on ne conclut pas
-            Write-Host '   [!] Vérification impossible : la réponse de winget n''a pas pu être lue.' -ForegroundColor Yellow
-            Write-Host '       Relance un scan pour contrôler.' -ForegroundColor DarkGray
+            Write-Action 'WARN' 'Vérification impossible : la réponse de winget n''a pas pu être lue'
+            Write-Host '          Relance un scan pour contrôler.' -ForegroundColor DarkGray
         }
     }
 }
 if ($script:WUCount -eq 0 -and $script:WUManual -gt 0) {
     Write-Host ''
     Write-Host ("   {0} mise(s) à jour Windows demandent une action à l'écran (souvent des pilotes de périphériques)." -f $script:WUManual) -ForegroundColor Cyan
-    $a = Read-Answer '   >> Ouvrir Windows Update avec le mode d''emploi ? [o/N]'
-    if ($a -match '^[oOyY]') { Open-WindowsUpdateGuided }
+    if (Read-YesNo '   >> Ouvrir Windows Update avec le mode d''emploi ?') { Open-WindowsUpdateGuided }
 }
 if ($script:WUCount -gt 0) {
     Write-Host ''
@@ -3233,25 +4073,33 @@ if ($script:WUCount -gt 0) {
     Write-Host '   [2] Ouvrir Windows Update, avec le mode d''emploi' -ForegroundColor Gray
     Write-Host '   [N] Plus tard' -ForegroundColor Gray
     $wkeys += '2'; $wkeys += 'N'
-    $a = Read-Answer ('   >> Choix [' + ($wkeys -join '/') + ']')
+    $a = Read-Choice ('   >> Choix [' + ($wkeys -join '/') + '] (Entrée = N)') $wkeys 'N'
     if ($a -eq '1' -and $isAdmin) { Install-WindowsUpdates }
     elseif ($a -eq '2') { Open-WindowsUpdateGuided }
 }
 if ($script:TempMB -gt 500) {
-    $a = Read-Answer ("   >> Nettoyer les fichiers temporaires de plus de 24 h ({0:N0} Mo au total) ? [o/N]" -f $script:TempMB)
-    if ($a -match '^[oOyY]') {
+    if (Read-YesNo ("   >> Nettoyer les fichiers temporaires de plus de 24 h ({0:N0} Mo au total) ?" -f $script:TempMB)) {
         $tot = 0
         foreach ($p in @($env:TEMP, (Join-Path $env:windir 'Temp'))) {
             $r = Clear-TempFolder $p 24
             if ($r.Ok) { $tot += $r.FreedMB } else { Write-Host ('   [!] ' + $r.Reason) -ForegroundColor Yellow }
         }
-        Write-Host ("   >> {0:N0} Mo libérés (fichiers récents ou verrouillés conservés)." -f $tot) -ForegroundColor Green
+        Write-Action 'OK' ("Nettoyage : {0:N0} Mo libérés (fichiers récents ou verrouillés conservés)" -f $tot)
     }
 }
 
+if ($repFile -and $script:Report.Count -gt $repMark) {
+    # Le rapport a été enregistré avant les actions : il est complété avec leur résultat
+    $script:Report.Insert($repMark, '== ACTIONS LANCÉES APRÈS LE SCAN ==')
+    $script:Report.Insert($repMark, '')
+    if (Update-Report $repFile ([string[]]$script:Report)) {
+        Write-Host '   >> Rapport complété avec le résultat des actions.' -ForegroundColor DarkGray
+    } else {
+        Write-Host '   [!] Rapport non complété : le résultat des actions n''y figure pas.' -ForegroundColor Yellow
+    }
+}
 if ($repFile) {
-    $a = Read-Answer '   >> Ouvrir le rapport ? [o/N]'
-    if ($a -match '^[oOyY]') { Start-Process -FilePath 'notepad.exe' -ArgumentList ('"{0}"' -f $repFile) }
+    if (Read-YesNo '   >> Ouvrir le rapport ?') { Start-Process -FilePath (Get-SystemToolPath 'notepad.exe') -ArgumentList ('"{0}"' -f $repFile) }
 }
 
 $null = Set-NoSleep $false

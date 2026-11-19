@@ -8,8 +8,8 @@ les tests T1 (fonctions pures, aucune dépendance au PC). Code de sortie : 0 si 
 
   1. Fichier    : UTF-8 avec BOM, fins de ligne CRLF, caractères interdits
   2. Syntaxe    : le vrai analyseur de Windows PowerShell 5.1
-  3. Règles     : version cohérente, Read-Host, Invoke-Expression, suppressions récursives,
-                  outils système appelés sans chemin, blocs catch vides
+  3. Règles     : version cohérente, Read-Host, questions oui/non, Invoke-Expression,
+                  suppressions récursives, outils système appelés sans chemin, blocs catch vides
   4. Tests T1   : Invoke-SelfTestAnalyzers, hors console, en mode strict
   5. PSScriptAnalyzer (s'il est installé ; exigé avec -RequireAnalyzer)
 #>
@@ -29,15 +29,15 @@ $Settings = Join-Path $Root 'PSScriptAnalyzerSettings.psd1'
 # Plafonds : ils ne peuvent que BAISSER. Chaque valeur est le nombre de cas connus et justifiés.
 # ------------------------------------------------------------------
 # Blocs « catch {} » vides (échec ignoré en silence).
-$MaxEmptyCatch = 29
-# Outils système appelés par leur seul nom (recherche dans le PATH) : cmd de l'auto-test, powercfg,
-# DISM et sfc de la réparation.
-$MaxBareTools = 4
-# « Remove-Item -Recurse » autorisés, par fonction : désinstallation (dossiers du profil, clé de registre)
-# et bac à sable de l'auto-test.
-$RecurseAllowed = @{ 'Uninstall-Jarvis' = 2; 'Invoke-SelfTest' = 1 }
+$MaxEmptyCatch = 26
+# Outils système appelés par leur seul nom (recherche dans le PATH) : plus aucun depuis la v3.13,
+# tous passent par Get-SystemToolPath.
+$MaxBareTools = 0
+# « Remove-Item -Recurse » autorisés, par fonction : seulement la clé de registre de la désinstallation.
+# Les dossiers se suppriment par Remove-TreeNoJunction, qui ne suit aucune jonction.
+$RecurseAllowed = @{ 'Uninstall-Jarvis' = 1 }
 # Nombre minimal de tests T1 attendus (garde-fou contre un lot de tests vidé par erreur).
-$MinT1 = 18
+$MinT1 = 30
 
 $script:Fails = New-Object System.Collections.Generic.List[string]
 function Add-Fail([string]$Message) {
@@ -141,6 +141,22 @@ $readHost = @($commands | Where-Object { [string]$_.GetCommandName() -match '(^|
 $badRead = @($readHost | Where-Object { (Get-OuterFunction $_) -ne 'Read-Answer' })
 if ($badRead.Count -eq 0) { Add-Pass 'Read-Host seulement dans Read-Answer' }
 else { foreach ($c in $badRead) { Add-Fail ("ligne {0} : Read-Host hors de Read-Answer" -f $c.Extent.StartLineNumber) } }
+
+# Toute question oui/non passe par Read-YesNo (règle 16) : la marque de réponse par défaut n'existe que là,
+# et aucune réponse n'est jugée sur sa première lettre
+$yesNoMarks = @($ast.FindAll({
+    param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+              ($n.Value -cmatch '\[o/N\]' -or $n.Value -cmatch '\[O/n\]')
+}, $true) | Where-Object { (Get-OuterFunction $_) -ne 'Read-YesNo' })
+$firstLetter = @([regex]::Matches($text, "(?m)^.*\^\[(oOyY|nN|yYoO|Nn)\].*$"))
+$testNo = @($commands | Where-Object { [string]$_.GetCommandName() -eq 'Test-No' })
+if ($yesNoMarks.Count -eq 0 -and $firstLetter.Count -eq 0 -and $testNo.Count -eq 0) {
+    Add-Pass 'questions oui/non seulement par Read-YesNo'
+} else {
+    foreach ($c in $yesNoMarks) { Add-Fail ("ligne {0} : question oui/non hors de Read-YesNo" -f $c.Extent.StartLineNumber) }
+    foreach ($c in $testNo) { Add-Fail ("ligne {0} : Test-No n'existe plus, utiliser Read-YesNo" -f $c.Extent.StartLineNumber) }
+    foreach ($m in $firstLetter) { Add-Fail ('réponse jugée sur sa première lettre, utiliser Read-YesNo : ' + $m.Value.Trim().Substring(0, [Math]::Min(70, $m.Value.Trim().Length))) }
+}
 
 # Aucune exécution de texte
 $iex = @($commands | Where-Object { [string]$_.GetCommandName() -match '^(Invoke-Expression|iex)$' })
