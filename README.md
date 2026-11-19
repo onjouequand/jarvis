@@ -21,7 +21,7 @@ Lien permanent, il donne toujours la dernière version publiée. Toutes les vers
 | 03 | Applications | mises à jour disponibles via winget |
 | 04 | Pilotes | Wi-Fi, Ethernet, Bluetooth, carte graphique, périphériques en erreur |
 | 05 | Bluetooth | service, adaptateur, économie d'énergie |
-| 06 | Sécurité | antivirus, Defender, pare-feu, Secure Boot, TPM, point de restauration |
+| 06 | Sécurité | antivirus, Defender et ses protections, pare-feu, Secure Boot, TPM, point de restauration, réglages de sécurité de Windows (contrôle de compte, SmartScreen, Bureau à distance, ancien partage SMBv1, comptes, fichier hosts, proxy, activation) |
 | 07 | Stockage | espace libre, santé des disques, température et usure des SSD, BitLocker |
 | 08 | Ressources | processeur, mémoire, programmes gourmands, démarrage, batterie |
 | 09 | Réseau | passerelle, latence Internet, DNS |
@@ -32,7 +32,7 @@ Lien permanent, il donne toujours la dernière version publiée. Toutes les vers
 
 Trois modes au menu : **scan rapide** (2 à 5 min, ne modifie rien), **scan complet** (20 à 60 min, ajoute la vérification des fichiers système de Windows) et **auto-test** (vérifie que JARVIS fonctionne correctement sur ce PC).
 
-En fin de scan, JARVIS propose, une par une et toujours avec confirmation : installer les mises à jour Windows, mettre à jour les applications, nettoyer les fichiers temporaires de plus de 24 h, réparer l'image Windows. Un rapport texte est enregistré dans `%LOCALAPPDATA%\JARVIS\Rapports`.
+En fin de scan, JARVIS propose, une par une et toujours avec confirmation : lancer une analyse antivirus rapide (si Microsoft Defender est ton antivirus), installer les mises à jour Windows, mettre à jour les applications, nettoyer les fichiers temporaires de plus de 24 h, réparer l'image Windows. Un rapport texte est enregistré dans `%LOCALAPPDATA%\JARVIS\Rapports`.
 
 ## Installation et mises à jour
 

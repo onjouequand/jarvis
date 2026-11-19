@@ -32,7 +32,7 @@ C'est fait. La prochaine fois, ouvre JARVIS depuis le **menu Démarrer** (tape �
 1. Au menu, appuie sur **1** puis **Entrée** : c'est le **scan rapide** (2 à 5 minutes, il ne modifie rien).
 2. La première fois, JARVIS affiche « Identité détectée » avec ton prénom : appuie sur **Entrée** s'il est juste, sinon tape ton prénom puis **Entrée**.
 3. Laisse-le travailler. Ne tape rien pendant le scan.
-4. À la fin, JARVIS te pose des questions, une par une (installer les mises à jour, faire le ménage…). Lis la question, puis :
+4. À la fin, JARVIS te pose des questions, une par une (lancer une analyse antivirus, installer les mises à jour, faire le ménage…). Lis la question, puis :
    - tape **o** puis **Entrée** pour accepter ;
    - appuie sur **Échap** pour refuser (Échap veut toujours dire « non ») ;
    - si tu tapes autre chose, JARVIS ne devine pas : il repose la question.

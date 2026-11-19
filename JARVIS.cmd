@@ -1,6 +1,6 @@
 <# : JARVIS.cmd - fichier hybride batch + PowerShell. Ne pas modifier ce fichier.
 @echo off
-rem JARVIS-SHA256=2b5d8bd3d993c75dbcb90bfa267c7edc0193e129b69fe6d39f7ee8fa82103276
+rem JARVIS-SHA256=3a68f4f19c58a0a5dd55e3cc9dc2aa976321abb9eec7cb868a4e0cd26ec1953e
 setlocal
 chcp 65001 >nul
 set "JARVIS_SELF=%~f0"
@@ -12,7 +12,7 @@ if "%JARVIS_RC%"=="4" pause
 exit /b %JARVIS_RC%
 #>
 <#
-    J.A.R.V.I.S. // Check-up système v3.13
+    J.A.R.V.I.S. // Check-up système v3.14
     -----------------------------------------------------------------
     Modules :
       [01] Système        : version Windows, uptime, redémarrage en attente
@@ -107,7 +107,7 @@ param(
 # ------------------------------------------------------------------
 # Identité du programme et emplacement
 # ------------------------------------------------------------------
-$JarvisVersion = '3.13'
+$JarvisVersion = '3.14'
 $JarvisSelf = $env:JARVIS_SELF                     # défini par JARVIS.cmd
 if (-not $JarvisSelf) { $JarvisSelf = $PSCommandPath }  # lancement direct du .ps1
 $JarvisHome = $null
@@ -198,6 +198,7 @@ $script:WGCount     = 0
 $script:WGSkipIds   = @()      # applications que winget refuse de mettre à jour (exclues de la vérification)
 $script:TempMB      = 0
 $script:NeedRestore = $false
+$script:DefenderScan = $false    # Defender est l'antivirus en service : analyse rapide proposable
 $script:ChkdskFix   = New-Object System.Collections.Generic.List[string]
 $script:DeepMode    = $false
 
@@ -228,7 +229,7 @@ function Show-Banner {
         foreach ($l in $plain) { Write-Host $l -ForegroundColor Cyan; Pause-Ms 70 }
         Write-Host ''
         Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-        Write-Host '      module check-up v3.13' -ForegroundColor DarkGray
+        Write-Host '      module check-up v3.14' -ForegroundColor DarkGray
         Write-Host ''
         return
     }
@@ -248,7 +249,7 @@ function Show-Banner {
     }
     Write-Host ''
     Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-    Write-Host '      module check-up v3.13' -ForegroundColor DarkGray
+    Write-Host '      module check-up v3.14' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -794,6 +795,68 @@ function Get-WeakWriters([string[]]$Paths) {
         }
     }
     return @($bad | Select-Object -Unique)
+}
+
+function Get-TallWindowPlacement([int]$Top, [int]$Height, [int]$ClientHeight, [int]$Rows, [int]$WorkTop, [int]$WorkBottom, [int]$WantRows = 50) {
+    # Nouvelle position verticale d'une fenêtre de console trop basse, en pixels, ou $null s'il n'y a rien à faire.
+    # $Top, $Height : fenêtre actuelle. $ClientHeight : sa zone utile, qui affiche $Rows lignes.
+    # $WorkTop, $WorkBottom : zone libre de l'écran (hors barre des tâches). La fenêtre grandit jusqu'à
+    # $WantRows lignes environ, sans jamais dépasser l'écran ni rétrécir. Fonction pure, testée en T1.
+    if ($Rows -le 0 -or $Rows -ge $WantRows -or $ClientHeight -le 0 -or $Height -le 0) { return $null }
+    $workH = $WorkBottom - $WorkTop
+    if ($workH -le 0) { return $null }
+    $newH = [int][math]::Ceiling($Height + ($WantRows - $Rows) * ($ClientHeight / $Rows))
+    if ($newH -gt $workH) { $newH = $workH }
+    if ($newH -le $Height) { return $null }
+    $newTop = $Top
+    if ($newTop + $newH -gt $WorkBottom) { $newTop = $WorkBottom - $newH }
+    if ($newTop -lt $WorkTop) { $newTop = $WorkTop }
+    return [pscustomobject]@{ Top = $newTop; Height = $newH }
+}
+
+function Set-ConsoleTall {
+    # Agrandit la fenêtre en hauteur (30 lignes d'origine : le scan défile trop vite pour être lu).
+    # Marche dans Windows Terminal comme dans la console classique : c'est la fenêtre elle-même qui est
+    # redimensionnée, largeur et position horizontale inchangées. Rien n'est fait si la fenêtre est
+    # agrandie en plein écran, réduite, invisible (sortie redirigée) ou déjà assez haute.
+    try {
+        if (-not ('JarvisNative.Win' -as [type])) {
+            Add-Type -Namespace JarvisNative -Name Win -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+[StructLayout(LayoutKind.Sequential)] public struct MONITORINFO { public int cbSize; public RECT rcMonitor; public RECT rcWork; public uint dwFlags; }
+[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+[DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+[DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hwnd, out RECT r);
+[DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr hwnd, out RECT r);
+[DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr hwnd);
+[DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
+[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
+[DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+[DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr hmon, ref MONITORINFO mi);
+[DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+'@
+        }
+        $rows = [Console]::WindowHeight
+        $con = [JarvisNative.Win]::GetConsoleWindow()
+        if ($con -eq [IntPtr]::Zero) { return $false }
+        # Dans Windows Terminal, la fenêtre de console est cachée : la vraie fenêtre est son propriétaire
+        $win = [JarvisNative.Win]::GetAncestor($con, 3)
+        if ($win -eq [IntPtr]::Zero) { $win = $con }
+        if (-not [JarvisNative.Win]::IsWindowVisible($win)) { return $false }
+        if ([JarvisNative.Win]::IsZoomed($win) -or [JarvisNative.Win]::IsIconic($win)) { return $false }
+        $wr = New-Object JarvisNative.Win+RECT
+        $cr = New-Object JarvisNative.Win+RECT
+        if (-not [JarvisNative.Win]::GetWindowRect($win, [ref]$wr)) { return $false }
+        if (-not [JarvisNative.Win]::GetClientRect($win, [ref]$cr)) { return $false }
+        $mi = New-Object JarvisNative.Win+MONITORINFO
+        $mi.cbSize = [Runtime.InteropServices.Marshal]::SizeOf($mi)
+        $mon = [JarvisNative.Win]::MonitorFromWindow($win, 2)
+        if (-not [JarvisNative.Win]::GetMonitorInfo($mon, [ref]$mi)) { return $false }
+        $pl = Get-TallWindowPlacement $wr.Top ($wr.Bottom - $wr.Top) ($cr.Bottom - $cr.Top) $rows $mi.rcWork.Top $mi.rcWork.Bottom
+        if ($null -eq $pl) { return $false }
+        # 0x14 : ordre d'empilement inchangé, fenêtre non activée
+        return [JarvisNative.Win]::SetWindowPos($win, [IntPtr]::Zero, $wr.Left, $pl.Top, ($wr.Right - $wr.Left), $pl.Height, 0x14)
+    } catch { return $false }
 }
 
 function Set-NoSleep([bool]$On) {
@@ -1803,6 +1866,12 @@ function Test-NoEventError([string]$ErrorId) {
     return ($ErrorId -like 'NoMatchingEventsFound*')
 }
 
+function Test-AppxInUseMessage([string]$Text) {
+    # Journal de déploiement de Windows : erreur 0x80073D02, « impossible d'installer, car les applications
+    # suivantes doivent être fermées ». Le code est le même dans toutes les langues de Windows.
+    return ($Text -match '0x80073D02')
+}
+
 function Get-WuDownloadState($Code, $Count, $Ready) {
     # Téléchargement Windows Update : $Code = code de résultat (2 = réussi, 3 = réussi avec erreurs),
     # $Count = mises à jour demandées, $Ready = celles que Windows Update déclare téléchargées.
@@ -1830,6 +1899,218 @@ function Get-AvState($ProductState) {
         On       = ($hex.Substring(2, 2) -in @('10', '11'))
         UpToDate = ($hex.Substring(4, 2) -eq '00')
     }
+}
+
+# ------------------------------------------------------------------
+# Réglages de sécurité de Windows (v3.14) : interprétations pures, testées en T1.
+# Une valeur absente ou illisible donne UNKNOWN, jamais « actif » par défaut.
+# ------------------------------------------------------------------
+function ConvertTo-IntOrNull($Value) {
+    # Nombre entier lu dans le registre ou rendu par un outil ; $null si absent ou non numérique
+    # (jamais 0 par défaut : 0 est souvent une vraie valeur, « désactivé »)
+    if ($null -eq $Value) { return $null }
+    $n = 0
+    if ([int]::TryParse(([string]$Value).Trim(), [ref]$n)) { return $n }
+    return $null
+}
+
+function Get-OnOffVerdict($Value) {
+    # Réglage binaire (booléen, ou 0 / 1) : ON, OFF, ou UNKNOWN si la lecture n'a rien donné
+    if ($null -eq $Value) { return 'UNKNOWN' }
+    if ($Value -is [bool]) {
+        if ($Value) { return 'ON' }
+        return 'OFF'
+    }
+    $n = ConvertTo-IntOrNull $Value
+    if ($null -eq $n) { return 'UNKNOWN' }
+    if ($n -ne 0) { return 'ON' }
+    return 'OFF'
+}
+
+function Get-UacVerdict($EnableLua, $ConsentAdmin) {
+    # Contrôle de compte d'utilisateur. OFF : désactivé (EnableLUA = 0). NOPROMPT : curseur tout en bas,
+    # les droits administrateur sont accordés sans demande (ConsentPromptBehaviorAdmin = 0). ON : actif.
+    $lua = ConvertTo-IntOrNull $EnableLua
+    if ($null -eq $lua) { return 'UNKNOWN' }
+    if ($lua -eq 0) { return 'OFF' }
+    $c = ConvertTo-IntOrNull $ConsentAdmin
+    if ($null -ne $c -and $c -eq 0) { return 'NOPROMPT' }
+    return 'ON'
+}
+
+function Get-SmartScreenVerdict($Policy, $Explorer) {
+    # SmartScreen pour les applications et les fichiers. La stratégie (EnableSmartScreen : 0 ou 1) l'emporte,
+    # puis le réglage de Sécurité Windows (Off, Warn, Block ; Prompt et RequireAdmin sous Windows 10).
+    # DEFAULT : rien d'enregistré, Windows garde son réglage d'origine (relevé le 19/11/2026 sur
+    # Windows 11 build 26300 : la valeur n'existe pas tant que le réglage n'a pas été modifié).
+    $p = ConvertTo-IntOrNull $Policy
+    if ($null -ne $p) {
+        if ($p -eq 0) { return 'OFF' }
+        return 'ON'
+    }
+    $e = ([string]$Explorer).Trim()
+    if ($e -eq '') { return 'DEFAULT' }
+    if ($e -eq 'Off') { return 'OFF' }
+    if (@('Warn', 'Block', 'Prompt', 'RequireAdmin', 'On') -contains $e) { return 'ON' }
+    return 'UNKNOWN'
+}
+
+function Get-CfaVerdict($Value) {
+    # Accès contrôlé aux dossiers (Get-MpPreference.EnableControlledFolderAccess)
+    $n = ConvertTo-IntOrNull $Value
+    if ($null -eq $n) { return 'UNKNOWN' }
+    switch ($n) {
+        0 { return 'OFF' }
+        1 { return 'ON' }
+        2 { return 'AUDIT' }
+        3 { return 'DISKONLY' }
+        4 { return 'AUDIT' }
+        default { return 'UNKNOWN' }
+    }
+}
+
+function Get-RdpVerdict($Policy, $Local) {
+    # fDenyTSConnections : 1 = connexions refusées, 0 = Bureau à distance activé. La stratégie l'emporte.
+    $v = ConvertTo-IntOrNull $Policy
+    if ($null -eq $v) { $v = ConvertTo-IntOrNull $Local }
+    if ($null -eq $v) { return 'UNKNOWN' }
+    if ($v -eq 0) { return 'ON' }
+    return 'OFF'
+}
+
+function Get-HvciVerdict($Running, $RegEnabled, [bool]$CimOk) {
+    # Intégrité de la mémoire. $Running : services de sécurité en service d'après Win32_DeviceGuard
+    # (2 = intégrité de la mémoire), lus seulement si $CimOk. $RegEnabled : réglage enregistré.
+    # RUNNING : en service. PENDING : réglée sur « activée » mais pas en service. OFF. UNKNOWN : rien de lisible.
+    if ($CimOk -and (@($Running) -contains 2)) { return 'RUNNING' }
+    $e = ConvertTo-IntOrNull $RegEnabled
+    if ($null -ne $e -and $e -ne 0) { return 'PENDING' }
+    if ($CimOk -or $null -ne $e) { return 'OFF' }
+    return 'UNKNOWN'
+}
+
+function Get-AccountFindings($Users) {
+    # $Users : comptes locaux (Name, Sid en texte, Enabled, PasswordRequired, PasswordSet).
+    # Seuls les comptes actifs comptent. BuiltinAdmin : le compte Administrateur intégré (SID en -500) est actif.
+    # NoPassword : mot de passe non exigé et jamais défini. Optional : non exigé, mais un mot de passe a été défini
+    # (Windows ne permet pas de savoir s'il est vide).
+    $r = [pscustomobject]@{ Active = 0; BuiltinAdmin = $false; NoPassword = @(); Optional = @() }
+    $np = New-Object System.Collections.Generic.List[string]
+    $op = New-Object System.Collections.Generic.List[string]
+    foreach ($u in @($Users)) {
+        if ($null -eq $u -or -not [bool]$u.Enabled) { continue }
+        $r.Active++
+        if ([string]$u.Sid -match '^S-1-5-21-[\d-]+-500$') { $r.BuiltinAdmin = $true }
+        if (-not [bool]$u.PasswordRequired) {
+            if ([bool]$u.PasswordSet) { $op.Add([string]$u.Name) } else { $np.Add([string]$u.Name) }
+        }
+    }
+    $r.NoPassword = $np.ToArray()
+    $r.Optional = $op.ToArray()
+    return $r
+}
+
+function Get-HostsFindings([string]$Text) {
+    # Fichier hosts : Entries = noms redirigés (hors localhost), Sensitive = ceux qui appartiennent à
+    # Microsoft ou à un éditeur d'antivirus (un logiciel malveillant bloque ainsi mises à jour et antivirus).
+    $r = [pscustomobject]@{ Entries = 0; Sensitive = @() }
+    $watch = @('microsoft.com', 'windowsupdate.com', 'windows.com', 'live.com', 'office.com', 'microsoftonline.com',
+               'msftconnecttest.com', 'avast.com', 'avg.com', 'avira.com', 'bitdefender.com', 'bitdefender.net',
+               'eset.com', 'kaspersky.com', 'kaspersky-labs.com', 'malwarebytes.com', 'mcafee.com', 'norton.com',
+               'symantec.com', 'sophos.com', 'trendmicro.com', 'f-secure.com', 'pandasecurity.com', 'drweb.com',
+               'emsisoft.com', 'virustotal.com')
+    $local = @('localhost', 'localhost.localdomain', 'ip6-localhost', 'ip6-loopback', 'broadcasthost')
+    $sens = New-Object System.Collections.Generic.List[string]
+    foreach ($line in ([string]$Text -split "`n")) {
+        # Commentaire retiré, puis espaces et retour chariot de fin de ligne Windows
+        $l = (($line -replace '#.*$', '') -replace '[\x00-\x1F﻿]', ' ').Trim()
+        if ($l -eq '') { continue }
+        $parts = @($l -split '\s+')
+        for ($i = 1; $i -lt $parts.Count; $i++) {
+            $h = $parts[$i].ToLower().TrimEnd('.')
+            if ($h -eq '' -or $local -contains $h) { continue }
+            $r.Entries++
+            foreach ($d in $watch) {
+                if ($h -eq $d -or $h.EndsWith('.' + $d)) {
+                    if (-not $sens.Contains($h)) { $sens.Add($h) }
+                    break
+                }
+            }
+        }
+    }
+    $r.Sensitive = $sens.ToArray()
+    return $r
+}
+
+function Get-ProxyVerdict($Enable, $Server, $AutoConfig) {
+    # Proxy du compte courant. MANUAL : serveur proxy actif. SCRIPT : script de configuration automatique.
+    # NONE : aucun. Detail : adresse affichable (identifiants éventuels retirés).
+    $r = [pscustomobject]@{ State = 'NONE'; Detail = '' }
+    $e = ConvertTo-IntOrNull $Enable
+    $srv = ([string]$Server).Trim()
+    $auto = ([string]$AutoConfig).Trim()
+    if ($null -ne $e -and $e -ne 0 -and $srv -ne '') {
+        $r.State = 'MANUAL'
+        $r.Detail = ($srv -replace '[^\s;=/@]+@', '')
+    } elseif ($auto -ne '') {
+        $r.State = 'SCRIPT'
+        $r.Detail = ($auto -replace '[^\s;=/@]+@', '')
+    }
+    return $r
+}
+
+function Get-ActivationVerdict($Statuses) {
+    # LicenseStatus des produits Windows qui ont une clé : 1 = activé. Liste vide = rien de lu, on ne conclut pas.
+    $s = @($Statuses | Where-Object { $null -ne $_ })
+    if ($s.Count -eq 0) { return 'UNKNOWN' }
+    if ($s -contains 1) { return 'ACTIVATED' }
+    return 'NOTACTIVATED'
+}
+
+function Get-MpScanVerdict($JobOk, $Start, $End, [bool]$TimedOut = $false) {
+    # Analyse Defender lancée par JARVIS. $JobOk : $true (lancée sans erreur), $false (erreur), $null (le job
+    # n'a rien rendu : délai dépassé si $TimedOut, sinon job interrompu).
+    # DONE seulement si Defender a enregistré une fin d'analyse postérieure au lancement.
+    if ($null -ne $JobOk -and -not [bool]$JobOk) { return 'FAILED' }
+    if ($End -is [datetime] -and $Start -is [datetime] -and $End -ge $Start) { return 'DONE' }
+    if ($null -eq $JobOk -and $TimedOut) { return 'TIMEOUT' }
+    return 'UNVERIFIED'
+}
+
+function Get-MpThreatsSince($Detections, [datetime]$Since) {
+    # Détections de Defender apparues depuis le lancement de l'analyse. Une détection ancienne dont seul
+    # le statut a changé entre-temps (nettoyage de l'historique, par exemple) n'est pas une nouvelle menace.
+    return @($Detections | Where-Object {
+        $null -ne $_ -and $_.InitialDetectionTime -is [datetime] -and $_.InitialDetectionTime -ge $Since
+    })
+}
+
+function Test-MpThreatHandled($StatusId) {
+    # ThreatStatusID de Defender : 2 nettoyée, 3 mise en quarantaine, 4 supprimée, 6 bloquée.
+    # Tout autre statut (1 détectée, 5 autorisée, 102 à 107 échecs, inconnu) : menace non traitée.
+    $n = ConvertTo-IntOrNull $StatusId
+    return ($null -ne $n -and @(2, 3, 4, 6) -contains $n)
+}
+
+function Get-HostsDirVerdict([string]$DataBasePath, [string]$WinDir) {
+    # Dossier où Windows lit le fichier hosts (valeur DataBasePath des paramètres Tcpip).
+    # DEFAULT : dossier d'origine. MOVED : ailleurs (détournement connu). UNKNOWN : valeur absente.
+    $p = ([string]$DataBasePath).Trim().TrimEnd('\')
+    $w = ([string]$WinDir).Trim().TrimEnd('\')
+    if ($p -eq '' -or $w -eq '') { return 'UNKNOWN' }
+    $p = $p -replace '%SystemRoot%|%windir%', $w.Replace('$', '$$')
+    if ($p -eq ($w + '\System32\drivers\etc')) { return 'DEFAULT' }
+    return 'MOVED'
+}
+
+function Test-SameAccount([string]$SessionUser, [string]$ProcessUser) {
+    # Le compte de la session ouverte à l'écran (« PC\Marie ») est-il celui sous lequel JARVIS tourne ?
+    # Après une élévation avec le mot de passe d'un autre compte, non : HKCU est alors le profil de cet autre
+    # compte. Session inconnue (connexion à distance) : on ne peut pas dire qu'il diffère.
+    $s = (([string]$SessionUser).Trim() -split '\\')[-1]
+    $u = (([string]$ProcessUser).Trim() -split '\\')[-1]
+    if ($s -eq '' -or $u -eq '') { return $true }
+    return ($s -eq $u)
 }
 
 function Convert-NvidiaVersion([string]$Version) {
@@ -1879,11 +2160,249 @@ function Get-EventsSafe([hashtable]$Filter) {
     return $r
 }
 
+function Test-AppxInUseBetween([datetime]$From, [datetime]$To) {
+    # Entre $From et $To, Windows a-t-il refusé d'installer une application du Store parce qu'elle tournait
+    # encore (fenêtre ouverte, icône près de l'horloge ou service en arrière-plan) ? winget répond alors
+    # « terminé » (code 0) alors que la nouvelle version est seulement téléchargée. $null : journal illisible.
+    # À appeler quelques secondes après la mise à jour, pas aussitôt : le journal de Windows n'est lisible
+    # qu'avec un léger retard (constaté le 19/11/2026 : rien lu juste après winget, tout lu 20 s plus tard).
+    # Événements 404 et 419 : échec d'une installation. Une suppression différée d'ancienne version porte le
+    # même code d'erreur sous d'autres numéros (401, 664) et ne compte pas.
+    $r = Get-EventsSafe @{ LogName = 'Microsoft-Windows-AppXDeploymentServer/Operational'; Id = 404, 419; StartTime = $From }
+    if (-not $r.Ok) { return $null }
+    $limit = $To.AddSeconds(2)
+    return (@($r.Events | Where-Object { $_.TimeCreated -le $limit -and (Test-AppxInUseMessage ([string]$_.Message)) }).Count -gt 0)
+}
+
 function Write-EventCount([string]$Label, [bool]$ReadOk, [int]$Count, [string]$BadState) {
     # Un compteur d'événements à 0 n'est « OK » que si le journal a vraiment été lu
     if (-not $ReadOk) { Write-Status $Label 'lecture du journal impossible' 'INFO' }
     elseif ($Count -gt 0) { Write-Status $Label ([string]$Count) $BadState }
     else { Write-Status $Label '0' 'OK' }
+}
+
+function Get-RegValueSafe([string]$Path, [string]$Name) {
+    # Lecture d'une valeur du registre. Ok : la clé a été lue (Value = $null si la valeur n'existe pas).
+    # Missing : la clé n'existe pas. Ni l'un ni l'autre : clé illisible.
+    $r = [pscustomobject]@{ Ok = $false; Missing = $false; Value = $null }
+    try {
+        $k = Get-Item -LiteralPath $Path -ErrorAction Stop
+        $r.Value = $k.GetValue($Name, $null)
+        $r.Ok = $true
+    } catch [System.Management.Automation.ItemNotFoundException] {
+        $r.Missing = $true
+    } catch {
+        $r.Ok = $false
+    }
+    return $r
+}
+
+function Get-UacState {
+    $k = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+    $lua = Get-RegValueSafe $k 'EnableLUA'
+    if (-not $lua.Ok) { return 'UNKNOWN' }
+    $consent = Get-RegValueSafe $k 'ConsentPromptBehaviorAdmin'
+    return (Get-UacVerdict $lua.Value $consent.Value)
+}
+
+function Get-SmartScreenState {
+    # Stratégie de groupe, puis stratégie d'un PC géré à distance (Intune), puis réglage de Sécurité Windows.
+    # Une clé de stratégie illisible (ni lue, ni absente) : on ne conclut pas.
+    $pol = Get-RegValueSafe 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' 'EnableSmartScreen'
+    $mdm = Get-RegValueSafe 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\SmartScreen' 'EnableSmartScreenInShell'
+    $exp = Get-RegValueSafe 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' 'SmartScreenEnabled'
+    if (-not $pol.Ok -and -not $pol.Missing) { return 'UNKNOWN' }
+    if (-not $mdm.Ok -and -not $mdm.Missing) { return 'UNKNOWN' }
+    $p = $pol.Value
+    if ($null -eq $p) { $p = $mdm.Value }
+    if ($null -eq $p -and -not $exp.Ok) { return 'UNKNOWN' }
+    return (Get-SmartScreenVerdict $p $exp.Value)
+}
+
+function Get-RdpState {
+    $pol = Get-RegValueSafe 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' 'fDenyTSConnections'
+    $loc = Get-RegValueSafe 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections'
+    if (-not $pol.Ok -and -not $pol.Missing) { return 'UNKNOWN' }
+    return (Get-RdpVerdict $pol.Value $loc.Value)
+}
+
+function Get-Smb1State {
+    try {
+        $cfg = Get-SmbServerConfiguration -ErrorAction Stop
+        return (Get-OnOffVerdict $cfg.EnableSMB1Protocol)
+    } catch { return 'UNKNOWN' }
+}
+
+function Get-HvciState {
+    $run = $null
+    $cimOk = $false
+    try {
+        $dg = Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard -ErrorAction Stop | Select-Object -First 1
+        if ($dg) {
+            $run = @($dg.SecurityServicesRunning)
+            $cimOk = $true
+        }
+    } catch { $cimOk = $false }
+    $reg = Get-RegValueSafe 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity' 'Enabled'
+    return (Get-HvciVerdict $run $reg.Value $cimOk)
+}
+
+function Get-LocalAccountState {
+    # Ok : la liste des comptes a été lue. Admins : nombre de comptes actifs du groupe Administrateurs,
+    # ou $null (Get-LocalGroupMember échoue sur certains PC quand le groupe contient un compte orphelin).
+    # CurrentIsBuiltin : JARVIS tourne sous le compte Administrateur intégré. Domain : PC rattaché à un domaine.
+    $r = [pscustomobject]@{ Ok = $false; Findings = $null; Admins = $null; CurrentIsBuiltin = $false; Domain = $false }
+    $users = @()
+    try {
+        $users = @(Get-LocalUser -ErrorAction Stop | ForEach-Object {
+            [pscustomobject]@{
+                Name = [string]$_.Name; Sid = [string]$_.SID.Value; Enabled = [bool]$_.Enabled
+                PasswordRequired = [bool]$_.PasswordRequired; PasswordSet = ($null -ne $_.PasswordLastSet)
+            }
+        })
+        if ($users.Count -gt 0) {
+            $r.Findings = Get-AccountFindings $users
+            $r.Ok = $true
+        }
+    } catch { $r.Ok = $false }
+    if ($r.Ok) {
+        try {
+            $sids = @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | ForEach-Object { [string]$_.SID.Value })
+            $r.Admins = @($users | Where-Object { $_.Enabled -and $sids -contains $_.Sid }).Count
+        } catch { $r.Admins = $null }
+        try { $r.CurrentIsBuiltin = ([string][Security.Principal.WindowsIdentity]::GetCurrent().User.Value -match '^S-1-5-21-[\d-]+-500$') } catch { $r.CurrentIsBuiltin = $false }
+        $r.Domain = [bool](Get-CimInstance Win32_ComputerSystem).PartOfDomain
+    }
+    return $r
+}
+
+function Get-HostsState {
+    # Ok : le fichier a été lu, ou il n'existe pas (aucune redirection). Accès refusé : Ok reste faux.
+    # Moved : Windows lit le fichier hosts dans un autre dossier que celui d'origine (chemin), on ne va pas plus loin.
+    $r = [pscustomobject]@{ Ok = $false; Moved = ''; Findings = $null }
+    $win = [Environment]::GetFolderPath('Windows')
+    if (-not $win) { $win = $env:windir }
+    $db = Get-RegValueSafe 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' 'DataBasePath'
+    $dir = 'UNKNOWN'
+    if ($db.Ok) { $dir = Get-HostsDirVerdict ([string]$db.Value) $win }
+    if ($dir -eq 'UNKNOWN') { return $r }
+    if ($dir -eq 'MOVED') {
+        $r.Ok = $true
+        $r.Moved = [string]$db.Value
+        return $r
+    }
+    $p = Join-Path $win 'System32\drivers\etc\hosts'
+    $txt = $null
+    try { $txt = [IO.File]::ReadAllText($p) }
+    catch [System.IO.FileNotFoundException] { $txt = '' }
+    catch [System.IO.DirectoryNotFoundException] { $txt = '' }
+    catch { $txt = $null }
+    if ($null -ne $txt) {
+        $r.Findings = Get-HostsFindings $txt
+        $r.Ok = $true
+    }
+    return $r
+}
+
+function Get-ProxyState {
+    # Le proxy est un réglage par compte : après une élévation sous un autre compte, HKCU n'est pas celui de l'utilisateur
+    $sess = [string](Get-CimInstance Win32_ComputerSystem).UserName
+    if (-not (Test-SameAccount $sess ([Environment]::UserName))) { return [pscustomobject]@{ State = 'OTHERUSER'; Detail = '' } }
+    $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+    $en = Get-RegValueSafe $k 'ProxyEnable'
+    if (-not $en.Ok) { return [pscustomobject]@{ State = 'UNKNOWN'; Detail = '' } }
+    $srv = Get-RegValueSafe $k 'ProxyServer'
+    $auto = Get-RegValueSafe $k 'AutoConfigURL'
+    return (Get-ProxyVerdict $en.Value $srv.Value $auto.Value)
+}
+
+function Get-ActivationState {
+    # Requête filtrée (sans filtre, la classe met plus d'une minute à répondre sur certains PC)
+    try {
+        $lic = @(Get-CimInstance -ClassName SoftwareLicensingProduct -OperationTimeoutSec 30 -ErrorAction Stop `
+                 -Filter "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL")
+        return (Get-ActivationVerdict @($lic | ForEach-Object { $_.LicenseStatus }))
+    } catch { return 'UNKNOWN' }
+}
+
+function Invoke-DefenderQuickScan {
+    # Analyse rapide de Microsoft Defender, sur confirmation. Le succès n'est annoncé que si Defender a
+    # enregistré une fin d'analyse postérieure au lancement ; « aucune menace » seulement si la liste des
+    # détections a été lue.
+    $where = 'Sécurité Windows > Protection contre les virus et menaces'
+    $start = Get-Date
+    Write-Host ''
+    Write-Host '   >> Analyse antivirus rapide (Microsoft Defender). Tu peux continuer à utiliser le PC.' -ForegroundColor Cyan
+    $job = Invoke-Spinner 'Analyse antivirus rapide' {
+        try {
+            Start-MpScan -ScanType QuickScan -ErrorAction Stop
+            [pscustomobject]@{ Ok = $true; Error = '' }
+        } catch {
+            [pscustomobject]@{ Ok = $false; Error = [string]$_.Exception.Message }
+        }
+    } 1800
+    $jobOk = $null
+    if ($null -ne $job) { $jobOk = [bool]$job.Ok }
+    # Aucun résultat : délai dépassé seulement si les 30 min sont écoulées, sinon le job s'est interrompu
+    $timedOut = ($null -eq $job -and ((Get-Date) - $start).TotalSeconds -ge 1790)
+    # Defender peut mettre quelques secondes à enregistrer la fin de l'analyse
+    $end = $null
+    for ($i = 0; $i -lt 6; $i++) {
+        $st = Get-MpComputerStatus
+        if ($st) { $end = $st.QuickScanEndTime }
+        if ((Get-MpScanVerdict $jobOk $start $end $timedOut) -ne 'UNVERIFIED') { break }
+        Start-Sleep -Seconds 2
+    }
+    $verdict = Get-MpScanVerdict $jobOk $start $end $timedOut
+    if ($verdict -eq 'FAILED') {
+        Write-Action 'FAIL' ('Analyse antivirus : Defender ne l''a pas lancée (' + (Cut ([string]$job.Error) 90) + ')')
+        Write-Host ('          Lance-la à la main : ' + $where + ' > Analyse rapide.') -ForegroundColor DarkGray
+        return
+    }
+    if ($verdict -eq 'TIMEOUT') {
+        Write-Action 'WARN' 'Analyse antivirus : pas terminée après 30 min, J.A.R.V.I.S. n''attend plus'
+        Write-Host ('          Son résultat se lit dans ' + $where + ' > Historique de protection.') -ForegroundColor DarkGray
+        return
+    }
+    if ($verdict -ne 'DONE') {
+        Write-Action 'INFO' 'Analyse antivirus : Defender n''a pas enregistré de fin d''analyse (résultat non vérifié)'
+        Write-Host ('          Contrôle dans ' + $where + ' > Historique de protection.') -ForegroundColor DarkGray
+        return
+    }
+    $mins = [math]::Max(1, [math]::Round(((Get-Date) - $start).TotalMinutes))
+    $det = $null
+    try { $det = @(Get-MpThreatDetection -ErrorAction Stop) } catch { $det = $null }
+    if ($null -eq $det) {
+        Write-Action 'INFO' ("Analyse antivirus terminée ({0} min), mais la liste des menaces est illisible" -f $mins)
+        Write-Host ('          Contrôle dans ' + $where + ' > Historique de protection.') -ForegroundColor DarkGray
+        return
+    }
+    $new = @(Get-MpThreatsSince $det $start)
+    if ($new.Count -eq 0) {
+        Write-Action 'OK' ("Analyse antivirus rapide terminée et vérifiée ({0} min) : aucune menace détectée" -f $mins)
+        return
+    }
+    $names = @()
+    try {
+        $known = @(Get-MpThreat -ErrorAction Stop)
+        $names = @($new | ForEach-Object {
+            $id = $_.ThreatID
+            ($known | Where-Object { $_.ThreatID -eq $id } | Select-Object -First 1).ThreatName
+        } | Where-Object { $_ } | Select-Object -Unique)
+    } catch { $names = @() }
+    $open = @($new | Where-Object { -not (Test-MpThreatHandled $_.ThreatStatusID) })
+    $txt = "Analyse antivirus : {0} menace(s) détectée(s)" -f $new.Count
+    if ($names.Count -gt 0) { $txt += ' : ' + (Cut ($names -join ', ') 120) }
+    if ($open.Count -eq 0) {
+        Write-Action 'WARN' ($txt + ', traitée(s) par Defender (quarantaine ou suppression)')
+        Write-Host ('          Détail : ' + $where + ' > Historique de protection.') -ForegroundColor Yellow
+        Write-Host '          Si une menace revient, demande de l''aide.' -ForegroundColor Yellow
+        return
+    }
+    Write-Action 'FAIL' ($txt + (', dont {0} pas encore traitée(s)' -f $open.Count))
+    Write-Host '          Defender les met en général lui-même en quarantaine. Ouvre' -ForegroundColor Yellow
+    Write-Host ('          ' + $where + ' > Historique de protection') -ForegroundColor Yellow
+    Write-Host '          et applique les actions proposées. Si une menace revient, demande de l''aide.' -ForegroundColor Yellow
 }
 
 function Update-Report([string]$File, [string[]]$Lines) {
@@ -2323,6 +2842,188 @@ function Invoke-SelfTestAnalyzers {
         Assert-True ($l[2].Length -le 88) 'ligne trop longue non coupée'
         '4/4 cas'
     }
+    Test-Case 'Sécurité : nombre lu ou absent' {
+        Assert-True ((ConvertTo-IntOrNull 0) -eq 0) '0 perdu'
+        Assert-True ((ConvertTo-IntOrNull ' 5 ') -eq 5) 'texte numérique non lu'
+        Assert-True ($null -eq (ConvertTo-IntOrNull $null)) 'valeur absente lue comme un nombre'
+        Assert-True ($null -eq (ConvertTo-IntOrNull 'Off')) 'texte lu comme un nombre'
+        Assert-True ($null -eq (ConvertTo-IntOrNull '')) 'texte vide lu comme 0'
+        Assert-True ((Get-OnOffVerdict $true) -eq 'ON' -and (Get-OnOffVerdict $false) -eq 'OFF') 'booléen mal lu'
+        Assert-True ((Get-OnOffVerdict 1) -eq 'ON' -and (Get-OnOffVerdict 0) -eq 'OFF') 'nombre mal lu'
+        Assert-True ((Get-OnOffVerdict $null) -eq 'UNKNOWN') 'valeur absente lue comme un réglage'
+        Assert-True ((Get-OnOffVerdict 'peut-être') -eq 'UNKNOWN') 'texte inattendu lu comme un réglage'
+        '9/9 cas'
+    }
+    Test-Case 'Sécurité : contrôle de compte (UAC)' {
+        Assert-True ((Get-UacVerdict 1 5) -eq 'ON') 'réglage d''origine mal lu'
+        Assert-True ((Get-UacVerdict 1 2) -eq 'ON') 'curseur au maximum mal lu'
+        Assert-True ((Get-UacVerdict 1 $null) -eq 'ON') 'niveau absent mal lu'
+        Assert-True ((Get-UacVerdict 1 0) -eq 'NOPROMPT') 'curseur tout en bas non signalé'
+        Assert-True ((Get-UacVerdict 0 5) -eq 'OFF') 'UAC désactivé non signalé'
+        Assert-True ((Get-UacVerdict 0 0) -eq 'OFF') 'UAC désactivé non signalé (niveau 0)'
+        Assert-True ((Get-UacVerdict $null 5) -eq 'UNKNOWN') 'lecture impossible prise pour « actif »'
+        '7/7 cas'
+    }
+    Test-Case 'Sécurité : SmartScreen' {
+        Assert-True ((Get-SmartScreenVerdict $null 'Warn') -eq 'ON') 'Warn mal lu'
+        Assert-True ((Get-SmartScreenVerdict $null 'Block') -eq 'ON') 'Block mal lu'
+        Assert-True ((Get-SmartScreenVerdict $null 'RequireAdmin') -eq 'ON') 'RequireAdmin mal lu'
+        Assert-True ((Get-SmartScreenVerdict $null 'off') -eq 'OFF') 'Off non signalé'
+        Assert-True ((Get-SmartScreenVerdict 0 'Warn') -eq 'OFF') 'stratégie de désactivation ignorée'
+        Assert-True ((Get-SmartScreenVerdict 1 'Off') -eq 'ON') 'stratégie d''activation ignorée'
+        Assert-True ((Get-SmartScreenVerdict $null $null) -eq 'DEFAULT') 'valeur absente prise pour « actif »'
+        Assert-True ((Get-SmartScreenVerdict $null 'Autre') -eq 'UNKNOWN') 'valeur inconnue prise pour « actif »'
+        '8/8 cas'
+    }
+    Test-Case 'Sécurité : accès contrôlé, RDP, mémoire' {
+        Assert-True ((Get-CfaVerdict 0) -eq 'OFF' -and (Get-CfaVerdict 1) -eq 'ON') 'accès contrôlé : 0 ou 1 mal lu'
+        Assert-True ((Get-CfaVerdict 2) -eq 'AUDIT' -and (Get-CfaVerdict 3) -eq 'DISKONLY') 'accès contrôlé : 2 ou 3 mal lu'
+        Assert-True ((Get-CfaVerdict $null) -eq 'UNKNOWN' -and (Get-CfaVerdict 9) -eq 'UNKNOWN') 'accès contrôlé : inconnu pris pour un réglage'
+        Assert-True ((Get-RdpVerdict $null 1) -eq 'OFF') 'Bureau à distance désactivé mal lu'
+        Assert-True ((Get-RdpVerdict $null 0) -eq 'ON') 'Bureau à distance activé non signalé'
+        Assert-True ((Get-RdpVerdict 0 1) -eq 'ON') 'stratégie d''activation ignorée'
+        Assert-True ((Get-RdpVerdict 1 0) -eq 'OFF') 'stratégie de refus ignorée'
+        Assert-True ((Get-RdpVerdict $null $null) -eq 'UNKNOWN') 'lecture impossible prise pour « désactivé »'
+        Assert-True ((Get-HvciVerdict @(2, 7) 1 $true) -eq 'RUNNING') 'mémoire : en service mal lu'
+        Assert-True ((Get-HvciVerdict @(1) 1 $true) -eq 'PENDING') 'mémoire : activée mais pas en service mal lu'
+        Assert-True ((Get-HvciVerdict @() $null $true) -eq 'OFF') 'mémoire : désactivée mal lue'
+        Assert-True ((Get-HvciVerdict $null 0 $false) -eq 'OFF') 'mémoire : réglage 0 mal lu'
+        Assert-True ((Get-HvciVerdict @(2) $null $false) -eq 'UNKNOWN') 'mémoire : lecture en échec prise pour « active »'
+        Assert-True ((Get-HvciVerdict $null $null $false) -eq 'UNKNOWN') 'mémoire : rien de lisible pris pour un réglage'
+        '14/14 cas'
+    }
+    Test-Case 'Sécurité : comptes Windows' {
+        $mk = { param($n, $sid, $on, $req, $set) [pscustomobject]@{ Name = $n; Sid = $sid; Enabled = $on; PasswordRequired = $req; PasswordSet = $set } }
+        $dom = 'S-1-5-21-1111111111-2222222222-3333333333-'
+        $sain = @(
+            (& $mk 'Administrateur' ($dom + '500') $false $true $false),
+            (& $mk 'Invité' ($dom + '501') $false $false $false),
+            (& $mk 'Marie' ($dom + '1001') $true $true $true),
+            (& $mk 'Ancien' ($dom + '1002') $false $false $true)
+        )
+        $f = Get-AccountFindings $sain
+        Assert-True ($f.Active -eq 1) ("{0} compte(s) actif(s), attendu 1" -f $f.Active)
+        Assert-True (-not $f.BuiltinAdmin) 'Administrateur intégré désactivé signalé'
+        Assert-True ($f.NoPassword.Count -eq 0 -and $f.Optional.Count -eq 0) 'compte désactivé signalé'
+        $risque = @(
+            (& $mk 'Administrateur' ($dom + '500') $true $true $true),
+            (& $mk 'Enfant' ($dom + '1003') $true $false $false),
+            (& $mk 'Paul' ($dom + '1004') $true $false $true),
+            (& $mk 'Chef' ($dom + '15001') $true $true $true)
+        )
+        $g = Get-AccountFindings $risque
+        Assert-True ($g.Active -eq 4) ("{0} compte(s) actif(s), attendu 4" -f $g.Active)
+        Assert-True $g.BuiltinAdmin 'Administrateur intégré actif non signalé'
+        Assert-True ($g.NoPassword.Count -eq 1 -and $g.NoPassword[0] -eq 'Enfant') 'compte sans mot de passe non signalé'
+        Assert-True ($g.Optional.Count -eq 1 -and $g.Optional[0] -eq 'Paul') 'mot de passe non obligatoire non signalé'
+        $h = Get-AccountFindings $null
+        Assert-True ($h.Active -eq 0 -and $h.NoPassword.Count -eq 0) 'liste absente mal lue'
+        '8/8 cas'
+    }
+    Test-Case 'Sécurité : fichier hosts (CRLF et LF)' {
+        $origine = "# Copyright (c) 1993-2009 Microsoft Corp.`r`n#`r`n# 102.54.94.97     rhino.acme.com          # source server`r`n" +
+                   "#       127.0.0.1       localhost`r`n#       ::1             localhost`r`n"
+        $h0 = Get-HostsFindings $origine
+        Assert-True ($h0.Entries -eq 0 -and $h0.Sensitive.Count -eq 0) 'fichier d''origine de Windows lu comme modifié'
+        $perso = $origine + "127.0.0.1 localhost`r`n::1 localhost`r`n192.168.1.20`tnas.maison nas   # mon NAS`r`n" +
+                 "127.0.0.1 host.docker.internal`r`n0.0.0.0 pub.exemple.com`r`n"
+        $h1 = Get-HostsFindings $perso
+        Assert-True ($h1.Entries -eq 4) ("{0} redirection(s), attendu 4" -f $h1.Entries)
+        Assert-True ($h1.Sensitive.Count -eq 0) 'redirection ordinaire signalée comme suspecte'
+        $pirate = $perso + "127.0.0.1 update.microsoft.com www.Kaspersky.com`r`n0.0.0.0 download.windowsupdate.com.`r`n" +
+                  "0.0.0.0 fauxmicrosoft.com`r`n127.0.0.1 update.microsoft.com`r`n# 0.0.0.0 www.avast.com`r`n"
+        $h2 = Get-HostsFindings $pirate
+        Assert-True ($h2.Sensitive.Count -eq 3) ("{0} site(s) sensible(s), attendu 3 : {1}" -f $h2.Sensitive.Count, ($h2.Sensitive -join ' '))
+        Assert-True ($h2.Sensitive -contains 'www.kaspersky.com') 'antivirus détourné non signalé'
+        Assert-True ($h2.Sensitive -contains 'download.windowsupdate.com') 'Windows Update détourné non signalé'
+        Assert-True (-not ($h2.Sensitive -contains 'fauxmicrosoft.com')) 'nom ressemblant pris pour Microsoft'
+        Assert-True (-not ($h2.Sensitive -contains 'www.avast.com')) 'ligne en commentaire prise en compte'
+        # Même contenu avec des fins de ligne Unix : même résultat
+        $h3 = Get-HostsFindings ($pirate -replace "`r`n", "`n")
+        Assert-True ($h3.Entries -eq $h2.Entries -and $h3.Sensitive.Count -eq 3) 'résultat différent selon les fins de ligne'
+        $h4 = Get-HostsFindings ''
+        Assert-True ($h4.Entries -eq 0) 'fichier vide mal lu'
+        Assert-True ((Get-HostsDirVerdict 'C:\WINDOWS\System32\drivers\etc' 'C:\Windows') -eq 'DEFAULT') 'dossier d''origine non reconnu'
+        Assert-True ((Get-HostsDirVerdict '%SystemRoot%\System32\drivers\etc\' 'C:\Windows\') -eq 'DEFAULT') 'forme %SystemRoot% non reconnue'
+        Assert-True ((Get-HostsDirVerdict 'C:\ProgramData\x\etc' 'C:\Windows') -eq 'MOVED') 'dossier déplacé non signalé'
+        Assert-True ((Get-HostsDirVerdict '' 'C:\Windows') -eq 'UNKNOWN') 'valeur absente prise pour le dossier d''origine'
+        Assert-True ((Get-HostsDirVerdict $null 'C:\Windows') -eq 'UNKNOWN') 'valeur illisible prise pour le dossier d''origine'
+        '15/15 cas'
+    }
+    Test-Case 'Sécurité : proxy et activation de Windows' {
+        Assert-True ((Get-ProxyVerdict 0 '' '').State -eq 'NONE') 'aucun proxy mal lu'
+        Assert-True ((Get-ProxyVerdict $null $null $null).State -eq 'NONE') 'valeurs absentes mal lues'
+        Assert-True ((Get-ProxyVerdict 0 'ancien:8080' '').State -eq 'NONE') 'proxy désactivé pris pour actif'
+        $m = Get-ProxyVerdict 1 'http=jean:secret@10.0.0.1:3128;https=10.0.0.1:3128' ''
+        Assert-True ($m.State -eq 'MANUAL') 'proxy actif non signalé'
+        Assert-True ($m.Detail -eq 'http=10.0.0.1:3128;https=10.0.0.1:3128') ('identifiants conservés : ' + $m.Detail)
+        $s = Get-ProxyVerdict 0 '' 'http://wpad.exemple/proxy.pac'
+        Assert-True ($s.State -eq 'SCRIPT' -and $s.Detail -eq 'http://wpad.exemple/proxy.pac') 'script de configuration non signalé'
+        Assert-True ((Get-ActivationVerdict @(1)) -eq 'ACTIVATED') 'Windows activé mal lu'
+        Assert-True ((Get-ActivationVerdict @(0, 1)) -eq 'ACTIVATED') 'un produit activé parmi plusieurs mal lu'
+        Assert-True ((Get-ActivationVerdict @(5)) -eq 'NOTACTIVATED') 'Windows non activé non signalé'
+        Assert-True ((Get-ActivationVerdict @(0, 2)) -eq 'NOTACTIVATED') 'période de grâce prise pour « activé »'
+        Assert-True ((Get-ActivationVerdict @()) -eq 'UNKNOWN') 'liste vide prise pour un résultat'
+        Assert-True ((Get-ActivationVerdict $null) -eq 'UNKNOWN') 'lecture impossible prise pour un résultat'
+        Assert-True (Test-SameAccount 'PC-SALON\Marie' 'marie') 'même compte non reconnu'
+        Assert-True (-not (Test-SameAccount 'PC-SALON\Marie' 'AdminPapa')) 'élévation sous un autre compte non vue'
+        Assert-True (Test-SameAccount '' 'Marie') 'session inconnue prise pour un autre compte'
+        '15/15 cas'
+    }
+    Test-Case 'Defender : résultat de l''analyse rapide' {
+        $t0 = [datetime]'2026-11-19T10:00:00'
+        Assert-True ((Get-MpScanVerdict $true $t0 $t0.AddMinutes(3)) -eq 'DONE') 'analyse terminée non reconnue'
+        Assert-True ((Get-MpScanVerdict $true $t0 $t0.AddHours(-4)) -eq 'UNVERIFIED') 'ancienne analyse prise pour la nouvelle'
+        Assert-True ((Get-MpScanVerdict $true $t0 $null) -eq 'UNVERIFIED') 'aucune fin enregistrée prise pour un succès'
+        Assert-True ((Get-MpScanVerdict $false $t0 $t0.AddMinutes(3)) -eq 'FAILED') 'erreur de lancement prise pour un succès'
+        Assert-True ((Get-MpScanVerdict $null $t0 $t0.AddHours(-4) $true) -eq 'TIMEOUT') 'délai dépassé non signalé'
+        Assert-True ((Get-MpScanVerdict $null $t0 $t0.AddHours(-4) $false) -eq 'UNVERIFIED') 'job interrompu pris pour un délai dépassé'
+        Assert-True ((Get-MpScanVerdict $null $t0 $t0.AddMinutes(29) $true) -eq 'DONE') 'analyse finie pendant l''attente non reconnue'
+        $mkd = { param($first, $last) [pscustomobject]@{ ThreatID = 1; InitialDetectionTime = $first; LastThreatStatusChangeTime = $last } }
+        $det = @(
+            (& $mkd $t0.AddDays(-30) $t0.AddDays(-30)),
+            (& $mkd $t0.AddMinutes(2) $t0.AddMinutes(2)),
+            (& $mkd $t0.AddDays(-5) $t0.AddMinutes(1)),
+            (& $mkd $null $null)
+        )
+        Assert-True (@(Get-MpThreatsSince $det $t0).Count -eq 1) 'menaces de cette analyse mal comptées'
+        Assert-True (@(Get-MpThreatsSince @($det[0]) $t0).Count -eq 0) 'ancienne menace comptée'
+        Assert-True (@(Get-MpThreatsSince @($det[2]) $t0).Count -eq 0) 'ancienne menace au statut modifié comptée comme nouvelle'
+        Assert-True (@(Get-MpThreatsSince @() $t0).Count -eq 0) 'liste vide mal lue'
+        Assert-True ((Test-MpThreatHandled 3) -and (Test-MpThreatHandled 4) -and (Test-MpThreatHandled 2)) 'menace traitée non reconnue'
+        Assert-True (-not (Test-MpThreatHandled 1) -and -not (Test-MpThreatHandled 102)) 'menace non traitée dite traitée'
+        Assert-True (-not (Test-MpThreatHandled $null) -and -not (Test-MpThreatHandled 5)) 'statut absent ou « autorisée » dit traité'
+        '14/14 cas'
+    }
+    Test-Case 'winget : application encore en service' {
+        $ap2 = [string][char]0x2019
+        $vrai = 'erreur 0x80073D02' + [char]0xA0 + ': impossible d' + $ap2 + "installer, car les applications suivantes doivent être fermées OpenAI.Codex_26.1111.2228.0_x64__2p2nqsd0c76g0.`r`n"
+        Assert-True (Test-AppxInUseMessage $vrai) 'message réel de Windows non reconnu'
+        Assert-True (Test-AppxInUseMessage 'Deployment failed with HRESULT: 0x80073d02, The package could not be installed because resources it modifies are currently in use.') 'message anglais non reconnu'
+        Assert-True (-not (Test-AppxInUseMessage 'erreur 0x80073CF9 : échec de l''installation.')) 'autre erreur prise pour une application en service'
+        Assert-True (-not (Test-AppxInUseMessage '')) 'texte vide pris pour une erreur'
+        Assert-True (-not (Test-AppxInUseMessage $null)) 'texte absent pris pour une erreur'
+        '5/5 cas'
+    }
+    Test-Case 'Fenêtre : agrandissement en hauteur' {
+        # Windows Terminal d'origine sur un écran 1440 : 30 lignes, fenêtre de 640 px en haut de l'écran
+        $a = Get-TallWindowPlacement 100 640 600 30 0 1400
+        Assert-True ($null -ne $a -and $a.Top -eq 100 -and $a.Height -eq 1040) 'agrandissement simple mal calculé'
+        # Fenêtre basse dans l'écran : elle remonte pour ne pas dépasser la barre des tâches
+        $b2 = Get-TallWindowPlacement 700 640 600 30 0 1400
+        Assert-True ($null -ne $b2 -and $b2.Top -eq 360 -and ($b2.Top + $b2.Height) -eq 1400) 'fenêtre qui dépasse le bas de l''écran'
+        # Petit écran (768) : toute la hauteur libre, pas plus
+        $c2 = Get-TallWindowPlacement 50 640 600 30 0 728
+        Assert-True ($null -ne $c2 -and $c2.Top -eq 0 -and $c2.Height -eq 728) 'fenêtre plus haute que l''écran'
+        # Écran secondaire placé au-dessus (coordonnées négatives)
+        $d2 = Get-TallWindowPlacement -900 640 600 30 -1080 -40
+        Assert-True ($null -ne $d2 -and $d2.Top -ge -1080 -and ($d2.Top + $d2.Height) -le -40) 'écran aux coordonnées négatives mal géré'
+        Assert-True ($null -eq (Get-TallWindowPlacement 0 1100 1060 55 0 1400)) 'fenêtre déjà haute modifiée'
+        Assert-True ($null -eq (Get-TallWindowPlacement 0 728 690 34 0 728)) 'fenêtre déjà à la hauteur de l''écran modifiée'
+        Assert-True ($null -eq (Get-TallWindowPlacement 0 640 600 0 0 1400)) 'nombre de lignes inconnu accepté'
+        Assert-True ($null -eq (Get-TallWindowPlacement 0 640 600 30 0 0)) 'écran sans hauteur accepté'
+        '8/8 cas'
+    }
     Test-Case 'Mode ASCII : conversion des glyphes' {
         $got = Convert-Glyph '█░┌─┐…'
         Assert-True ($got -eq '#.+-+...') "obtenu $got"
@@ -2506,6 +3207,51 @@ function Invoke-SelfTest {
         $n = @(Get-NetFirewallProfile -ErrorAction Stop).Count
         Assert-True ($n -ge 1) 'aucun profil'
         "$n profil(s)"
+    }
+    Test-Case 'Sécurité : UAC, SmartScreen, RDP' {
+        $u = Get-UacState
+        $s = Get-SmartScreenState
+        $d = Get-RdpState
+        Assert-True ($u -ne 'UNKNOWN') 'réglage UAC illisible dans le registre'
+        Assert-True ($s -ne 'UNKNOWN') 'réglage SmartScreen illisible ou non reconnu'
+        Assert-True ($d -ne 'UNKNOWN') 'réglage du Bureau à distance illisible'
+        "UAC $u  //  SmartScreen $s  //  Bureau à distance $d"
+    }
+    Test-Case 'Sécurité : réglages de Defender' {
+        $mp3 = Get-MpComputerStatus
+        if (-not $mp3 -or -not $mp3.AntivirusEnabled) { return 'SKIP:Defender n''est pas l''antivirus en service' }
+        $t = Get-OnOffVerdict $mp3.IsTamperProtected
+        $pref = Get-MpPreference
+        Assert-True ($null -ne $pref) 'préférences de Defender illisibles'
+        $c = Get-CfaVerdict $pref.EnableControlledFolderAccess
+        Assert-True ($t -ne 'UNKNOWN') 'protection contre les falsifications illisible'
+        Assert-True ($c -ne 'UNKNOWN') 'accès contrôlé aux dossiers illisible'
+        Assert-True ($mp3.QuickScanEndTime -is [datetime] -or $null -eq $mp3.QuickScanEndTime) 'date de fin d''analyse dans un format inattendu'
+        $null = @(Get-MpThreatDetection -ErrorAction Stop)
+        "falsification $t  //  accès contrôlé $c  //  détections lisibles"
+    }
+    Test-Case 'Sécurité : SMBv1, intégrité mémoire' {
+        $s = Get-Smb1State
+        $h = Get-HvciState
+        Assert-True ($s -ne 'UNKNOWN') 'configuration du partage de fichiers illisible'
+        Assert-True ($h -ne 'UNKNOWN') 'état de l''intégrité de la mémoire illisible'
+        "SMBv1 $s  //  mémoire $h"
+    }
+    Test-Case 'Sécurité : comptes locaux du PC' {
+        $a = Get-LocalAccountState
+        Assert-True $a.Ok 'liste des comptes illisible'
+        $adm = 'groupe Administrateurs illisible'
+        if ($null -ne $a.Admins) { $adm = '{0} administrateur(s)' -f $a.Admins }
+        ('{0} compte(s) actif(s), {1}' -f $a.Findings.Active, $adm)
+    }
+    Test-Case 'Sécurité : hosts, proxy, activation' {
+        $h = Get-HostsState
+        $p = Get-ProxyState
+        $w = Get-ActivationState
+        Assert-True $h.Ok 'fichier hosts illisible'
+        Assert-True ($p.State -ne 'UNKNOWN') 'réglages de proxy illisibles'
+        Assert-True ($w -ne 'UNKNOWN') 'état d''activation de Windows illisible'
+        ('hosts : {0} redirection(s)  //  proxy {1}  //  Windows {2}' -f $h.Findings.Entries, $p.State, $w)
     }
     Test-Case 'Réseau : ping 1.1.1.1' {
         if (-not (Test-Connection -ComputerName 1.1.1.1 -Count 1 -Quiet)) { return 'SKIP:pas de réponse (hors ligne ou ICMP filtré)' }
@@ -2848,6 +3594,7 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 
 try {
+$null = Set-ConsoleTall
 Clear-Host
 Show-Banner
 if ($Name) { $Name = [string](Get-SafeName $Name) }
@@ -3561,6 +4308,26 @@ if ($mp -and -not $mp.RealTimeProtectionEnabled -and $avOther.Count -gt 0) {
         if ($qs -gt 14) { Write-Status 'Dernière analyse rapide' "il y a $qs j" 'WARN' }
         else { Write-Status 'Dernière analyse rapide' "il y a $qs j" 'OK' }
     }
+    $secWhere = 'Sécurité Windows > Protection contre les virus et menaces > Gérer les paramètres'
+    $tp = Get-OnOffVerdict $mp.IsTamperProtected
+    if ($tp -eq 'ON') { Write-Status 'Protection anti-falsification' 'active' 'OK' }
+    elseif ($tp -eq 'OFF') {
+        Write-Status 'Protection anti-falsification' 'désactivée' 'WARN'
+        Write-Sub 'Un programme peut alors couper l''antivirus sans te le demander. À réactiver :'
+        Write-Sub $secWhere
+    } else { Write-Status 'Protection anti-falsification' 'lecture impossible' 'INFO' }
+    $mpPref = Get-MpPreference
+    $cfa = 'UNKNOWN'
+    if ($mpPref) { $cfa = Get-CfaVerdict $mpPref.EnableControlledFolderAccess }
+    switch ($cfa) {
+        'ON'       { Write-Status 'Accès contrôlé aux dossiers' 'actif (protège tes documents des rançongiciels)' 'INFO' }
+        'OFF'      { Write-Status 'Accès contrôlé aux dossiers' 'désactivé (réglage d''origine de Windows)' 'INFO' }
+        'AUDIT'    { Write-Status 'Accès contrôlé aux dossiers' 'mode audit (note sans rien bloquer)' 'INFO' }
+        'DISKONLY' { Write-Status 'Accès contrôlé aux dossiers' 'partiel (secteurs de disque seulement)' 'INFO' }
+        default    { Write-Status 'Accès contrôlé aux dossiers' 'lecture impossible' 'INFO' }
+    }
+    # L'analyse rapide n'est proposée en fin de scan que si Defender est bien l'antivirus en service
+    $script:DefenderScan = [bool]$mp.AntivirusEnabled
 } else {
     if ($avOther.Count -eq 0 -and $avs.Count -eq 0) {
         Write-Status 'Antivirus' 'aucun antivirus détecté' 'FAIL'
@@ -3612,6 +4379,141 @@ if ($isAdmin) {
     }
 } else {
     Write-Status 'Secure Boot / TPM / restauration' 'nécessite les droits admin' 'INFO'
+}
+
+# --- Réglages de sécurité de Windows (lecture seule, rien n'est modifié)
+switch (Get-UacState) {
+    'ON'       { Write-Status 'Contrôle de compte (UAC)' 'actif' 'OK' }
+    'NOPROMPT' {
+        Write-Status 'Contrôle de compte (UAC)' 'actif, mais sans demande de confirmation' 'WARN'
+        Write-Sub 'Un programme peut obtenir les droits administrateur sans que tu le voies.'
+        Write-Sub 'Menu Démarrer, tape « UAC », puis remonte le curseur au 2e cran en partant du haut.'
+    }
+    'OFF'      {
+        Write-Status 'Contrôle de compte (UAC)' 'désactivé' 'FAIL'
+        Write-Sub 'Tout programme lancé a les droits administrateur, sans aucune demande.'
+        Write-Sub 'Menu Démarrer, tape « UAC », remonte le curseur au 2e cran en partant du haut, redémarre.'
+    }
+    default    { Write-Status 'Contrôle de compte (UAC)' 'lecture impossible' 'INFO' }
+}
+
+switch (Get-SmartScreenState) {
+    'ON'      { Write-Status 'SmartScreen (applications)' 'actif' 'OK' }
+    'OFF'     {
+        Write-Status 'SmartScreen (applications)' 'désactivé' 'WARN'
+        Write-Sub 'Windows ne te prévient plus avant d''ouvrir un programme inconnu ou dangereux.'
+        Write-Sub 'Sécurité Windows > Contrôle des applications et du navigateur >'
+        Write-Sub 'Protection fondée sur la réputation > « Vérifier les applications et les fichiers ».'
+    }
+    'DEFAULT' { Write-Status 'SmartScreen (applications)' 'réglage d''origine de Windows, aucune désactivation notée' 'INFO' }
+    default   { Write-Status 'SmartScreen (applications)' 'lecture impossible' 'INFO' }
+}
+
+switch (Get-RdpState) {
+    'OFF'   { Write-Status 'Bureau à distance' 'désactivé' 'OK' }
+    'ON'    {
+        Write-Status 'Bureau à distance' 'activé' 'WARN'
+        Write-Sub 'Ce PC accepte d''être piloté depuis un autre appareil.'
+        Write-Sub 'Si tu ne t''en sers pas : Paramètres > Système > Bureau à distance > Désactivé.'
+    }
+    default { Write-Status 'Bureau à distance' 'lecture impossible' 'INFO' }
+}
+
+switch (Get-Smb1State) {
+    'OFF'   { Write-Status 'Partage SMBv1 (ancien protocole)' 'désactivé' 'OK' }
+    'ON'    {
+        Write-Status 'Partage SMBv1 (ancien protocole)' 'activé' 'WARN'
+        Write-Sub 'Protocole ancien et vulnérable, utile seulement pour un très vieux NAS ou une vieille imprimante.'
+        Write-Sub 'Menu Démarrer, tape « fonctionnalités Windows », puis décoche'
+        Write-Sub '« Support de partage de fichiers SMB 1.0/CIFS ».'
+    }
+    default { Write-Status 'Partage SMBv1 (ancien protocole)' 'lecture impossible' 'INFO' }
+}
+
+switch (Get-HvciState) {
+    'RUNNING' { Write-Status 'Intégrité de la mémoire' 'active' 'INFO' }
+    'PENDING' { Write-Status 'Intégrité de la mémoire' 'activée dans les réglages, pas en service (redémarrage à faire ?)' 'INFO' }
+    'OFF'     { Write-Status 'Intégrité de la mémoire' 'désactivée' 'INFO' }
+    default   { Write-Status 'Intégrité de la mémoire' 'lecture impossible' 'INFO' }
+}
+
+$acc = Get-LocalAccountState
+if (-not $acc.Ok) {
+    Write-Status 'Comptes Windows locaux' 'lecture impossible' 'INFO'
+} else {
+    # INFO : la présence réelle d'un mot de passe ne se lit pas, cette ligne ne conclut donc rien
+    $accTxt = '{0} actif(s)' -f $acc.Findings.Active
+    if ($null -ne $acc.Admins) { $accTxt += ', dont {0} administrateur(s)' -f $acc.Admins }
+    Write-Status 'Comptes Windows locaux' $accTxt 'INFO'
+    if (-not $acc.Findings.BuiltinAdmin) {
+        Write-Status 'Compte Administrateur intégré' 'désactivé' 'OK'
+    } elseif ($acc.Domain) {
+        Write-Status 'Compte Administrateur intégré' 'actif (PC rattaché à un domaine : souvent voulu)' 'INFO'
+    } else {
+        Write-Status 'Compte Administrateur intégré' 'actif' 'WARN'
+        Write-Sub 'Ce compte agit sans aucune demande de confirmation.'
+        if ($acc.CurrentIsBuiltin) {
+            Write-Sub 'Tu l''utilises en ce moment : ne le désactive pas. Mieux vaut créer un autre compte'
+            Write-Sub 'administrateur et t''en servir au quotidien (demande de l''aide).'
+        } else {
+            Write-Sub 'Si tu ne l''as pas activé toi-même, demande de l''aide avant d''y toucher :'
+            Write-Sub 'le désactiver sans autre compte administrateur bloquerait le PC.'
+        }
+    }
+    if ($acc.Findings.NoPassword.Count -gt 0) {
+        Write-Status 'Compte sans mot de passe' (Cut ($acc.Findings.NoPassword -join ', ') 60) 'WARN'
+        Write-Sub 'Aucun mot de passe n''y a jamais été défini.'
+        Write-Sub 'Paramètres > Comptes > Options de connexion > Mot de passe.'
+    }
+    if ($acc.Findings.Optional.Count -gt 0) {
+        Write-Status 'Mot de passe non obligatoire' (Cut ($acc.Findings.Optional -join ', ') 60) 'INFO'
+        Write-Sub 'Windows accepterait un mot de passe vide pour ce(s) compte(s) : vérifie qu''il en a bien un.'
+    }
+}
+
+$hostsState = Get-HostsState
+if (-not $hostsState.Ok) {
+    Write-Status 'Fichier hosts' 'lecture impossible' 'INFO'
+} elseif ($hostsState.Moved) {
+    Write-Status 'Fichier hosts' ('dossier déplacé : ' + (Cut $hostsState.Moved 60)) 'WARN'
+    Write-Sub 'Windows ne lit plus le fichier hosts habituel, mais celui de ce dossier :'
+    Write-Sub 'procédé connu de logiciels malveillants. Demande de l''aide si ce réglage ne vient pas de toi.'
+} elseif ($hostsState.Findings.Sensitive.Count -gt 0) {
+    Write-Status 'Fichier hosts' ('{0} site(s) Microsoft ou antivirus détourné(s)' -f $hostsState.Findings.Sensitive.Count) 'WARN'
+    Write-Sub (Cut ($hostsState.Findings.Sensitive -join ', ') 90)
+    Write-Sub 'Sans gravité si cela vient de toi ou d''un outil qui bloque la télémétrie.'
+    Write-Sub 'Sinon c''est suspect : un logiciel malveillant bloque ainsi mises à jour et antivirus.'
+    Write-Sub 'Fichier : C:\Windows\System32\drivers\etc\hosts'
+} elseif ($hostsState.Findings.Entries -gt 0) {
+    Write-Status 'Fichier hosts' ('{0} redirection(s), aucune vers Microsoft ou un antivirus' -f $hostsState.Findings.Entries) 'INFO'
+} else {
+    Write-Status 'Fichier hosts' 'aucune redirection' 'OK'
+}
+
+$proxy = Get-ProxyState
+switch ($proxy.State) {
+    'NONE'   { Write-Status 'Proxy' 'aucun' 'OK' }
+    'MANUAL' {
+        Write-Status 'Proxy' ('actif : ' + (Cut $proxy.Detail 50)) 'INFO'
+        Write-Sub 'Tout ton trafic web passe par ce serveur. Normal au travail ou avec certains VPN ;'
+        Write-Sub 'sinon : Paramètres > Réseau et Internet > Proxy.'
+    }
+    'SCRIPT' {
+        Write-Status 'Proxy' ('script de configuration : ' + (Cut $proxy.Detail 40)) 'INFO'
+        Write-Sub 'Normal au travail ou avec certains VPN ; sinon : Paramètres > Réseau et Internet > Proxy.'
+    }
+    'OTHERUSER' { Write-Status 'Proxy' 'non lu : J.A.R.V.I.S. tourne sous un autre compte que le tien' 'INFO' }
+    default  { Write-Status 'Proxy' 'lecture impossible' 'INFO' }
+}
+
+switch (Get-ActivationState) {
+    'ACTIVATED'    { Write-Status 'Activation de Windows' 'activé' 'OK' }
+    'NOTACTIVATED' {
+        Write-Status 'Activation de Windows' 'non activé' 'WARN'
+        Write-Sub 'Windows 11 : Paramètres > Système > Activation.'
+        Write-Sub 'Windows 10 : Paramètres > Mise à jour et sécurité > Activation.'
+    }
+    default        { Write-Status 'Activation de Windows' 'lecture impossible' 'INFO' }
 }
 
 # ==================================================================
@@ -4000,12 +4902,17 @@ foreach ($L in $script:ChkdskFix) {
     Write-Host ("   >> Volume {0}: correction conseillée : chkdsk {0}: /spotfix" -f $L) -ForegroundColor Yellow
     Write-Host '      (pour le disque système, la correction a lieu au prochain redémarrage)' -ForegroundColor DarkGray
 }
+if ($script:DefenderScan) {
+    if (Read-YesNo '   >> Lancer une analyse antivirus rapide (Microsoft Defender, quelques minutes) ?') { Invoke-DefenderQuickScan }
+}
 if ($script:WGCount -gt 0) {
     Write-Host '   [i] winget peut fermer les applications concernées (navigateur, jeux, messageries) pendant leur mise à jour.' -ForegroundColor DarkGray
     Write-Host '       Enregistre ton travail avant de valider.' -ForegroundColor DarkGray
     if (Read-YesNo ("   >> Mettre à jour les {0} application(s) avec winget ?" -f $script:WGCount)) {
         Write-Host ''
         $okItems = @(); $koList = @(); $naList = @()
+        $spans = @{}      # début et fin de chaque mise à jour, pour relire ensuite le journal de Windows
+        $explained = @()  # applications dont le retard vient d'être expliqué (encore en service)
         $skip = @($script:WGSkipIds)
         $targets = @($script:WGItems | Where-Object { $_.Id })
         if ($targets.Count -eq 0) {
@@ -4015,9 +4922,13 @@ if ($script:WGCount -gt 0) {
             foreach ($it in $targets) {
                 Write-Host ''
                 Write-Host ('   >> Mise à jour de ' + $it.Name) -ForegroundColor Cyan
+                $itStart = Get-Date
                 & winget upgrade --id $it.Id --exact --accept-source-agreements --accept-package-agreements --disable-interactivity
                 $rc = $LASTEXITCODE
-                if ($rc -eq 0) { $okItems += $it }
+                if ($rc -eq 0) {
+                    $okItems += $it
+                    $spans[$it.Id] = @($itStart, (Get-Date))
+                }
                 elseif (('{0:X8}' -f $rc) -eq '8A15002B') {
                     # « Aucune mise à niveau applicable » : la nouvelle version ne convient pas à cette installation.
                     # Ce n'est pas une panne : l'application doit se mettre à jour par elle-même.
@@ -4042,6 +4953,14 @@ if ($script:WGCount -gt 0) {
                 $_.Id -eq $it.Id -or ($_.Id.EndsWith($ell) -and $it.Id.StartsWith($_.Id.TrimEnd([char]0x2026), [StringComparison]::OrdinalIgnoreCase))
             })
             if ($verif -eq 'UNREADABLE') { Write-Action 'INFO' ($it.Name + ' : winget a répondu « terminé », résultat non vérifié') }
+            elseif ($still.Count -gt 0 -and $spans.ContainsKey($it.Id) -and (Test-AppxInUseBetween $spans[$it.Id][0] $spans[$it.Id][1])) {
+                # Preuve lue dans le journal de Windows (erreur 0x80073D02)
+                Write-Action 'WARN' ($it.Name + ' : nouvelle version téléchargée, mais pas installée : Windows a constaté que l''application tournait encore')
+                $explained += $it.Id
+                Write-Host '          Même sans fenêtre ouverte : icône près de l''horloge ou service en arrière-plan,' -ForegroundColor DarkGray
+                Write-Host '          parfois lancé dès le démarrage de Windows. Le plus sûr : Microsoft Store >' -ForegroundColor DarkGray
+                Write-Host '          Bibliothèque > Obtenir les mises à jour, ou la mise à jour proposée par l''application.' -ForegroundColor DarkGray
+            }
             elseif ($still.Count -gt 0) { Write-Action 'WARN' ($it.Name + ' : winget a répondu « terminé », mais l''ancienne version est toujours là') }
             else { Write-Action 'OK' ($it.Name + ' : mise à jour vérifiée') }
         }
@@ -4056,8 +4975,12 @@ if ($script:WGCount -gt 0) {
                 Write-Host ('       - ' + (Cut $l.Name 60) + '  ' + $l.Installed + ' -> ' + $l.Available) -ForegroundColor Yellow
                 $script:Report.Add('       - ' + (Cut $l.Name 60) + '  ' + $l.Installed + ' -> ' + $l.Available)
             }
-            Write-Host '       Cause fréquente : l''application était ouverte pendant la mise à jour.' -ForegroundColor DarkGray
-            Write-Host '       Ferme-la puis relance JARVIS, ou mets-la à jour depuis l''application.' -ForegroundColor DarkGray
+            if (@($left | Where-Object { $explained -notcontains $_.Id }).Count -gt 0) {
+                # Au moins un retard sans explication lue dans le journal : cause la plus courante rappelée
+                Write-Host '       Cause fréquente : l''application tournait encore pendant la mise à jour, parfois sans fenêtre' -ForegroundColor DarkGray
+                Write-Host '       (icône près de l''horloge, service en arrière-plan). Ferme-la complètement ou redémarre le PC,' -ForegroundColor DarkGray
+                Write-Host '       puis relance JARVIS ; sinon mets-la à jour depuis l''application ou le Microsoft Store.' -ForegroundColor DarkGray
+            }
         } elseif ($leftAll.Count -gt 0) {
             # Seules restent des applications que winget refuse de mettre à jour (signalées ci-dessus)
             Write-Action 'OK' 'Vérifié : tout ce que winget peut mettre à jour est à jour'

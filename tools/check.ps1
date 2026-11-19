@@ -37,7 +37,7 @@ $MaxBareTools = 0
 # Les dossiers se suppriment par Remove-TreeNoJunction, qui ne suit aucune jonction.
 $RecurseAllowed = @{ 'Uninstall-Jarvis' = 1 }
 # Nombre minimal de tests T1 attendus (garde-fou contre un lot de tests vidé par erreur).
-$MinT1 = 30
+$MinT1 = 40
 
 $script:Fails = New-Object System.Collections.Generic.List[string]
 function Add-Fail([string]$Message) {
