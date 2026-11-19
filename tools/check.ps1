@@ -29,15 +29,20 @@ $Settings = Join-Path $Root 'PSScriptAnalyzerSettings.psd1'
 # Plafonds : ils ne peuvent que BAISSER. Chaque valeur est le nombre de cas connus et justifiés.
 # ------------------------------------------------------------------
 # Blocs « catch {} » vides (échec ignoré en silence).
-$MaxEmptyCatch = 26
+$MaxEmptyCatch = 25
 # Outils système appelés par leur seul nom (recherche dans le PATH) : plus aucun depuis la v3.13,
 # tous passent par Get-SystemToolPath.
 $MaxBareTools = 0
 # « Remove-Item -Recurse » autorisés, par fonction : seulement la clé de registre de la désinstallation.
 # Les dossiers se suppriment par Remove-TreeNoJunction, qui ne suit aucune jonction.
 $RecurseAllowed = @{ 'Uninstall-Jarvis' = 1 }
+# Suppressions de bas niveau autorisées, par fonction (règle 18) : [IO.File]::Delete, [IO.Directory]::Delete,
+# vidage de la corbeille (SHEmptyRecycleBin) et suppression par CIM (Invoke-CimMethod -MethodName Delete).
+# Invoke-SelfTest : jonctions et fichiers des bacs à sable des tests T5 seulement.
+$LowDeleteAllowed = @{ 'Remove-TempCandidates' = 2; 'Remove-EmptyDir' = 1; 'Remove-TreeNoJunction' = 1; 'Clear-CleanTarget' = 1;
+                       'Clear-RecycleBinChecked' = 1; 'Clear-DoCache' = 1; 'Invoke-SelfTest' = 5 }
 # Nombre minimal de tests T1 attendus (garde-fou contre un lot de tests vidé par erreur).
-$MinT1 = 46
+$MinT1 = 50
 
 $script:Fails = New-Object System.Collections.Generic.List[string]
 function Add-Fail([string]$Message) {
@@ -181,6 +186,27 @@ foreach ($g in ($recurse | Group-Object { Get-OuterFunction $_ })) {
     }
 }
 if ($recurseOk) { Add-Pass ("Remove-Item -Recurse : {0}, tous sur liste blanche" -f $recurse.Count) }
+
+# Suppressions de bas niveau : liste blanche par fonction (règle 18)
+$lowDel = @($ast.FindAll({
+    param($n)
+    if (-not ($n -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) -or -not $n.Static) { return $false }
+    $m = [string]$n.Member.Extent.Text
+    $ty = [string]$n.Expression.Extent.Text
+    return (($m -eq 'Delete' -and $ty -match '^\[(System\.)?IO\.(File|Directory)\]$') -or $m -eq 'SHEmptyRecycleBin')
+}, $true))
+$lowDel += @($commands | Where-Object { [string]$_.GetCommandName() -eq 'Invoke-CimMethod' -and $_.Extent.Text -match '-MethodName\s+[''"]?Delete\b' })
+$lowOk = $true
+foreach ($g in ($lowDel | Group-Object { Get-OuterFunction $_ })) {
+    $allowed = 0
+    if ($LowDeleteAllowed.ContainsKey($g.Name)) { $allowed = $LowDeleteAllowed[$g.Name] }
+    if ($g.Count -gt $allowed) {
+        $lowOk = $false
+        $where = ($g.Group | ForEach-Object { $_.Extent.StartLineNumber }) -join ', '
+        Add-Fail ("suppression de bas niveau dans {0} : {1} trouvée(s), {2} autorisée(s) (lignes {3})" -f $g.Name, $g.Count, $allowed, $where)
+    }
+}
+if ($lowOk) { Add-Pass ("suppressions de bas niveau : {0}, toutes sur liste blanche" -f $lowDel.Count) }
 
 # Outils système appelés par leur seul nom : un programme du même nom placé dans le PATH serait lancé en admin
 $bare = @($commands | Where-Object {

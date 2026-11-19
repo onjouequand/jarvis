@@ -36,7 +36,8 @@ C'est fait. La prochaine fois, ouvre JARVIS depuis le **menu Démarrer** (tape �
    - tape **o** puis **Entrée** pour accepter ;
    - appuie sur **Échap** pour refuser (Échap veut toujours dire « non ») ;
    - si tu tapes autre chose, JARVIS ne devine pas : il repose la question.
-5. En cas de doute, refuse : rien n'est grave si tu ne fais rien.
+5. Le ménage supprime pour de bon : une corbeille vidée ne se récupère pas. Si tu n'es pas sûr de ce qu'elle contient, refuse cette question-là.
+6. En cas de doute, refuse : rien n'est grave si tu ne fais rien.
 
 Le **scan complet** (touche **2**) dure 20 à 60 minutes : lance-le quand tu n'as pas besoin du PC, avec le chargeur branché si c'est un portable.
 

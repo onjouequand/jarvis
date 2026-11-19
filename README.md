@@ -26,13 +26,13 @@ Lien permanent, il donne toujours la dernière version publiée. Toutes les vers
 | 08 | Ressources | processeur, mémoire, programmes gourmands, démarrage, batterie |
 | 09 | Réseau | passerelle, latence Internet, DNS |
 | 10 | Journaux (7 jours) | arrêts brutaux, écrans bleus, erreurs matérielles et disque |
-| 11 | Nettoyage | fichiers temporaires, cache Windows Update, corbeille |
+| 11 | Nettoyage | fichiers temporaires, corbeille, caches de Windows Update et de l'optimisation de livraison, vidages mémoire de plus de 30 jours, anciens composants de Windows (scan complet), dossier Windows.old (mesuré seulement) |
 | 12 | BIOS | carte mère, version et date, page de support du fabricant (JARVIS n'installe pas de BIOS) |
 | 13 | Intégrité (scan complet) | DISM, SFC /scannow, CHKDSK |
 
 Trois modes au menu : **scan rapide** (2 à 5 min, ne modifie rien), **scan complet** (20 à 60 min, ajoute la vérification des fichiers système de Windows) et **auto-test** (vérifie que JARVIS fonctionne correctement sur ce PC).
 
-En fin de scan, JARVIS propose, une par une et toujours avec confirmation : lancer une analyse antivirus rapide (si Microsoft Defender est ton antivirus), installer les mises à jour Windows, mettre à jour les applications (winget et Microsoft Store, chaque résultat vérifié), nettoyer les fichiers temporaires de plus de 24 h, réparer l'image Windows. Un rapport texte est enregistré dans `%LOCALAPPDATA%\JARVIS\Rapports`.
+En fin de scan, JARVIS propose, une par une et toujours avec confirmation : lancer une analyse antivirus rapide (si Microsoft Defender est ton antivirus), installer les mises à jour Windows, mettre à jour les applications (winget et Microsoft Store, chaque résultat vérifié), faire le ménage (une question par élément : fichiers temporaires de plus de 24 h, corbeille, caches de mises à jour, vidages mémoire, anciens composants de Windows ; l'espace libéré est mesuré après coup), réparer l'image Windows. Le dossier Windows.old n'est jamais supprimé par JARVIS : il permet de revenir à la version précédente de Windows, JARVIS indique seulement où le retirer. Un rapport texte est enregistré dans `%LOCALAPPDATA%\JARVIS\Rapports`.
 
 ## Installation et mises à jour
 

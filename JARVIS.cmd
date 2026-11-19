@@ -1,6 +1,6 @@
 <# : JARVIS.cmd - fichier hybride batch + PowerShell. Ne pas modifier ce fichier.
 @echo off
-rem JARVIS-SHA256=c0b2099244ca9e9fab5f87662d89a74487a847f6f22b0618b31b90332de62a49
+rem JARVIS-SHA256=1a36f186093ce17e527d0c820d5c8a5c23850021b010b9f6eab3b3b0bbfdfc72
 setlocal
 chcp 65001 >nul
 set "JARVIS_SELF=%~f0"
@@ -12,7 +12,7 @@ if "%JARVIS_RC%"=="4" pause
 exit /b %JARVIS_RC%
 #>
 <#
-    J.A.R.V.I.S. // Check-up système v3.15
+    J.A.R.V.I.S. // Check-up système v3.16
     -----------------------------------------------------------------
     Modules :
       [01] Système        : version Windows, uptime, redémarrage en attente
@@ -25,7 +25,8 @@ exit /b %JARVIS_RC%
       [08] Ressources     : CPU, RAM, processus gourmands, programmes au démarrage
       [09] Réseau         : passerelle, latence Internet, DNS, vitesse de lien
       [10] Journaux       : arrêts brutaux, écrans bleus, erreurs matérielles (7 j)
-      [11] Nettoyage      : taille des fichiers temporaires et de la corbeille
+      [11] Nettoyage      : temporaires, corbeille, caches de Windows Update, vidages
+                            mémoire, composants Windows (mode complet), Windows.old
       [12] BIOS           : version et date du firmware
       [13] Intégrité      : DISM, SFC /scannow, CHKDSK  (mode complet uniquement)
 
@@ -109,7 +110,7 @@ param(
 # ------------------------------------------------------------------
 # Identité du programme et emplacement
 # ------------------------------------------------------------------
-$JarvisVersion = '3.15'
+$JarvisVersion = '3.16'
 $JarvisSelf = $env:JARVIS_SELF                     # défini par JARVIS.cmd
 if (-not $JarvisSelf) { $JarvisSelf = $PSCommandPath }  # lancement direct du .ps1
 $JarvisHome = $null
@@ -198,7 +199,12 @@ $script:WUManual    = 0
 $script:WGItems     = @()
 $script:WGCount     = 0
 $script:WGSkipIds   = @()      # applications que winget refuse de mettre à jour (exclues de la vérification)
-$script:TempMB      = 0
+$script:CleanTargets = @()      # cibles du nettoyage mesurées par la section 11 (New-CleanTarget)
+$script:KeepSysDumps = $true     # vidages système gardés (écran bleu récent ou journal illisible)
+$script:ComponentInfo = $null    # analyse des composants Windows (scan complet)
+$script:WinOld      = $false     # dossier Windows.old présent et assez ancien pour proposer de le retirer
+$script:WuTouched   = $false     # installation de mises à jour Windows lancée par JARVIS pendant cette session
+$script:CleanUser   = $null      # compte qui exécute JARVIS, quand ce n'est pas celui de la session
 $script:NeedRestore = $false
 $script:DefenderScan = $false    # Defender est l'antivirus en service : analyse rapide proposable
 $script:ChkdskFix   = New-Object System.Collections.Generic.List[string]
@@ -234,7 +240,7 @@ function Show-Banner {
         foreach ($l in $plain) { Write-Host $l -ForegroundColor Cyan; Pause-Ms 70 }
         Write-Host ''
         Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-        Write-Host '      module check-up v3.15' -ForegroundColor DarkGray
+        Write-Host '      module check-up v3.16' -ForegroundColor DarkGray
         Write-Host ''
         return
     }
@@ -254,7 +260,7 @@ function Show-Banner {
     }
     Write-Host ''
     Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-    Write-Host '      module check-up v3.15' -ForegroundColor DarkGray
+    Write-Host '      module check-up v3.16' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -654,18 +660,20 @@ function Test-NoLinkInChain([string]$Root, [string]$Path) {
     return $false
 }
 
-function Get-TempCandidates([string]$Path, [int]$MinAgeHours = 24) {
+function Get-TempCandidates([string]$Path, [int]$MinAgeHours = 24, [string]$Extension = '') {
     # Ce que le nettoyage peut retirer : fichiers de plus de $MinAgeHours (un fichier récent est peut-être
     # en cours d'utilisation) et sous-dossiers anciens. Les jonctions ne sont jamais suivies.
+    # $Extension (vidages mémoire : '.dmp') : seuls ces fichiers sont pris, et aucun dossier.
     $limit = (Get-Date).AddHours(-$MinAgeHours)
     $files = [System.Collections.Generic.List[object]]::new()
     $dirs = [System.Collections.Generic.List[string]]::new()
     foreach ($it in @(Get-FilesNoJunction $Path -WithDirs)) {
         if ($it.PSIsContainer) {
-            if ($it.CreationTime -lt $limit) { $dirs.Add($it.FullName) }
+            if (-not $Extension -and $it.CreationTime -lt $limit) { $dirs.Add($it.FullName) }
             continue
         }
         if ($it.LastWriteTime -ge $limit) { continue }
+        if ($Extension -and $it.Extension -ne $Extension) { continue }
         $files.Add([pscustomobject]@{ Path = $it.FullName; Length = [int64]$it.Length })
     }
     # Tableaux simples en sortie : sous PowerShell 5.1, « @(...) » autour d'une liste générique échoue
@@ -739,6 +747,425 @@ function Remove-TreeNoJunction([string]$Path) {
     }
     foreach ($d in ($dirs | Sort-Object { $_.Length } -Descending)) { $null = Remove-EmptyDir $d }
     return (-not (Test-Path -LiteralPath $full))
+}
+
+# ------------------------------------------------------------------
+# Nettoyage étendu (v3.16) : cibles calculées par le programme, jamais saisies
+# ------------------------------------------------------------------
+$CleanMinBytes = 100MB      # une cible plus petite n'est pas proposée (une question de moins)
+$CleanMinDoBytes = 1GB      # optimisation de livraison : Windows la vide de lui-même après quelques jours
+
+function Get-CleanTargetPaths {
+    # Chemins exacts que le nettoyage étendu peut toucher. Dossier Windows et profil lus par l'API de Windows,
+    # pas par des variables d'environnement qu'un programme pourrait détourner.
+    $t = [ordered]@{}
+    $win = [Environment]::GetFolderPath('Windows')
+    $local = [Environment]::GetFolderPath('LocalApplicationData')
+    if ($win -match '^[A-Za-z]:\\.') {
+        $t['WuCache'] = Join-Path $win 'SoftwareDistribution\Download'
+        $t['Minidump'] = Join-Path $win 'Minidump'
+        $t['MemoryDump'] = Join-Path $win 'MEMORY.DMP'
+    }
+    if ($local -match '^[A-Za-z]:\\.') { $t['CrashDumps'] = Join-Path $local 'CrashDumps' }
+    return $t
+}
+
+function Test-SafeCleanTarget([string]$Path, $Allowed = $null) {
+    # Vrai seulement pour un chemin de la liste blanche (comparaison exacte après dépliage), qui existe, et dont
+    # aucun élément, de lui-même jusqu'à la racine du disque, n'est une jonction ou un lien. $Allowed ne sert
+    # qu'à l'auto-test (bac à sable) : sinon la liste est celle de Get-CleanTargetPaths.
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    if ($null -eq $Allowed) { $Allowed = @((Get-CleanTargetPaths).Values) }
+    $full = $null
+    try { $full = [IO.Path]::GetFullPath($Path).TrimEnd('\') } catch { return $false }
+    if ($Path -notmatch '^[A-Za-z]:\\' -or $full -notmatch '^[A-Za-z]:\\.') { return $false }   # chemin complet, ni racine ni réseau
+    $listed = $false
+    foreach ($a in @($Allowed)) {
+        if ([string]::IsNullOrWhiteSpace([string]$a)) { continue }
+        $af = $null
+        try { $af = [IO.Path]::GetFullPath([string]$a).TrimEnd('\') } catch { continue }
+        if ($af -notmatch '^[A-Za-z]:\\.') { continue }
+        if ([string]::Equals($af, $full, [StringComparison]::OrdinalIgnoreCase)) { $listed = $true; break }
+    }
+    if (-not $listed) { return $false }
+    $cur = $full
+    while ($cur -match '^[A-Za-z]:\\.') {
+        $at = $null
+        try { $at = [IO.File]::GetAttributes($cur) } catch { return $false }
+        if ($at -band [IO.FileAttributes]::ReparsePoint) { return $false }
+        $cur = Split-Path -Parent $cur
+    }
+    return $true
+}
+
+function Measure-AgedFiles([string]$Path, [int]$MinAgeHours, [string]$Extension = '') {
+    # Taille totale et taille des fichiers de plus de $MinAgeHours (avec l'extension voulue), sans suivre les
+    # jonctions. Ok = $false si la cible existe mais ne peut pas être lue (droits) : jamais un « 0 » trompeur.
+    # Link : la cible elle-même est une jonction ou un lien (dossier déplacé), elle n'est ni comptée ni nettoyée.
+    # Partial : un sous-dossier n'a pas pu être lu, les tailles sont des minimums.
+    $r = [pscustomobject]@{ Ok = $false; Exists = $false; Link = $false; Partial = $false; TotalBytes = [int64]0; AgedBytes = [int64]0; AgedCount = 0 }
+    $top = $null
+    try { $top = Get-Item -LiteralPath $Path -Force -ErrorAction Stop }
+    catch [System.Management.Automation.ItemNotFoundException] { $r.Ok = $true; return $r }
+    catch { return $r }
+    $r.Exists = $true
+    if ($top.Attributes -band [IO.FileAttributes]::ReparsePoint) { $r.Ok = $true; $r.Link = $true; return $r }
+    $files = New-Object System.Collections.Generic.List[object]
+    if ($top.PSIsContainer) {
+        # Parcours sans suivre les jonctions, chaque dossier lu avec arrêt sur erreur pour savoir s'il manque quelque chose
+        $stack = New-Object System.Collections.Stack
+        $stack.Push($top.FullName)
+        $first = $true
+        while ($stack.Count -gt 0) {
+            $cur = [string]$stack.Pop()
+            $items = $null
+            try { $items = @(Get-ChildItem -LiteralPath $cur -Force -ErrorAction Stop) }
+            catch {
+                if ($first) { return $r }       # dossier lui-même illisible : aucune mesure
+                $r.Partial = $true
+                continue
+            }
+            $first = $false
+            foreach ($it in $items) {
+                if ($it.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+                if ($it.PSIsContainer) { $stack.Push($it.FullName) } else { $files.Add($it) }
+            }
+        }
+    } else { $files.Add($top) }
+    $limit = (Get-Date).AddHours(-$MinAgeHours)
+    foreach ($f in $files) {
+        $r.TotalBytes += [int64]$f.Length
+        if ($f.LastWriteTime -ge $limit) { continue }
+        if ($Extension -and $f.Extension -ne $Extension) { continue }
+        $r.AgedBytes += [int64]$f.Length
+        $r.AgedCount++
+    }
+    $r.Ok = $true
+    return $r
+}
+
+function Clear-CleanTarget([string]$Key, [int]$MinAgeHours, [string]$Extension = '', $Paths = $null) {
+    # Nettoyage d'une cible de la liste blanche : fichiers de plus de $MinAgeHours, sans suivre les jonctions,
+    # chaque chemin recontrôlé juste avant sa suppression. Le résultat vient d'un nouveau contrôle des fichiers
+    # visés (ceux qui existent encore sont « conservés »), pas de l'absence d'erreur.
+    # $Paths ne sert qu'à l'auto-test (bac à sable) : le programme passe toujours par Get-CleanTargetPaths.
+    $res = [pscustomobject]@{ Ok = $false; FreedBytes = [int64]0; LeftBytes = [int64]0; Reason = '' }
+    if ($null -eq $Paths) { $Paths = Get-CleanTargetPaths }
+    $allowed = @($Paths.Values)
+    $p = $null
+    if ($Paths.Contains($Key)) { $p = [string]$Paths[$Key] }
+    if ($p -and -not [IO.Directory]::Exists($p) -and -not [IO.File]::Exists($p) -and -not (Test-Path -LiteralPath $p)) {
+        $res.Ok = $true      # rien à cet endroit : rien à nettoyer
+        return $res
+    }
+    if (-not $p -or -not (Test-SafeCleanTarget $p $allowed)) { $res.Reason = 'nettoyage refusé, chemin anormal : ' + $p; return $res }
+    $full = [IO.Path]::GetFullPath($p).TrimEnd('\')
+    $limit = (Get-Date).AddHours(-$MinAgeHours)
+    if (-not [IO.Directory]::Exists($full)) {
+        # Fichier seul (MEMORY.DMP)
+        $f = Get-Item -LiteralPath $full -Force
+        if ($null -eq $f) { $res.Reason = 'cible introuvable'; return $res }
+        $res.Ok = $true
+        if ($f.LastWriteTime -ge $limit -or ($Extension -and $f.Extension -ne $Extension)) { return $res }
+        $len = [int64]$f.Length
+        if (Test-SafeCleanTarget $full $allowed) {
+            try { [IO.File]::Delete($full) } catch { $res.LeftBytes = $len }
+        }
+        if ([IO.File]::Exists($full)) { $res.LeftBytes = $len } else { $res.FreedBytes = $len }
+        return $res
+    }
+    $cand = Get-TempCandidates $full $MinAgeHours $Extension
+    $null = Remove-TempCandidates $full $cand
+    foreach ($c in @($cand.Files)) {
+        if ([IO.File]::Exists($c.Path)) { $res.LeftBytes += $c.Length } else { $res.FreedBytes += $c.Length }
+    }
+    $res.Ok = $true
+    return $res
+}
+
+function Initialize-NativeBin {
+    # Fonctions de Windows pour mesurer et vider la corbeille (chargées une seule fois). La lecture par
+    # Shell.Application compte 0 octet pour un dossier supprimé ; SHQueryRecycleBin donne le vrai total.
+    # En PowerShell 32 bits, Windows range cette structure sans trou après cbSize (taille 20 au lieu de 24) :
+    # sans « Pack = 4 », la taille lue valait le nombre d'éléments fois 4 Go et le nombre, 0 (essai du 19/11/2026).
+    if ('JarvisNative.Bin' -as [type]) { return $true }
+    $pack = ''
+    if ([IntPtr]::Size -eq 4) { $pack = ', Pack = 4' }
+    $def = '[StructLayout(LayoutKind.Sequential' + $pack + ')] public struct SHQUERYRBINFO { public int cbSize; public long i64Size; public long i64NumItems; }' + "`r`n" +
+           '[DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern int SHQueryRecycleBin(string pszRootPath, ref SHQUERYRBINFO pSHQueryRBInfo);' + "`r`n" +
+           '[DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern int SHEmptyRecycleBin(IntPtr hwnd, string pszRootPath, uint dwFlags);'
+    try {
+        Add-Type -Namespace JarvisNative -Name Bin -MemberDefinition $def
+        return $true
+    } catch { return $false }
+}
+
+function Get-RecycleBinState {
+    # Corbeille du compte qui exécute JARVIS, tous disques confondus. Ok = $false si la lecture échoue ou si elle
+    # est incohérente (structure de taille inattendue, octets sans aucun élément).
+    $r = [pscustomobject]@{ Ok = $false; Bytes = [int64]0; Count = [int64]0 }
+    if (-not (Initialize-NativeBin)) { return $r }
+    try {
+        $q = New-Object JarvisNative.Bin+SHQUERYRBINFO
+        $q.cbSize = [Runtime.InteropServices.Marshal]::SizeOf($q)
+        $expected = 24
+        if ([IntPtr]::Size -eq 4) { $expected = 20 }
+        if ($q.cbSize -ne $expected) { return $r }
+        $hr = [JarvisNative.Bin]::SHQueryRecycleBin([NullString]::Value, [ref]$q)
+        if ($hr -eq 0 -and $q.i64Size -ge 0 -and $q.i64NumItems -ge 0 -and -not ($q.i64NumItems -eq 0 -and $q.i64Size -gt 0)) {
+            $r.Bytes = [int64]$q.i64Size; $r.Count = [int64]$q.i64NumItems; $r.Ok = $true
+        }
+    } catch { $r.Ok = $false }
+    return $r
+}
+
+function Clear-RecycleBinChecked {
+    # Vide la corbeille (tous les disques), sans fenêtre ni son, puis la relit : le résultat vient de la
+    # nouvelle lecture, pas de la réponse de Windows (qui répond aussi « erreur » pour une corbeille déjà vide).
+    $res = [pscustomobject]@{ Ok = $false; FreedBytes = [int64]0; LeftCount = [int64]0; Reason = '' }
+    $before = Get-RecycleBinState
+    if (-not $before.Ok) { $res.Reason = 'contenu de la corbeille illisible, rien n''a été supprimé'; return $res }
+    try { $null = [JarvisNative.Bin]::SHEmptyRecycleBin([IntPtr]::Zero, [NullString]::Value, 7) }
+    catch { $res.Reason = 'Windows a refusé le vidage' }
+    $after = Get-RecycleBinState
+    if (-not $after.Ok) { $res.Reason = 'résultat non vérifiable : corbeille illisible après le vidage'; return $res }
+    $res.Ok = $true
+    $res.FreedBytes = [math]::Max([int64]0, $before.Bytes - $after.Bytes)
+    $res.LeftCount = $after.Count
+    return $res
+}
+
+function Get-DoCacheDir {
+    # Dossier par défaut du cache de l'optimisation de livraison ; $null si une stratégie l'a déplacé
+    # (DOModifyCacheDrive) ou si la stratégie est illisible : la taille est alors estimée.
+    $pol = Get-RegValueSafe 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization' 'DOModifyCacheDrive'
+    if (-not $pol.Ok -and -not $pol.Missing) { return $null }
+    if ($pol.Ok -and -not [string]::IsNullOrWhiteSpace([string]$pol.Value)) { return $null }
+    $win = [Environment]::GetFolderPath('Windows')
+    if ($win -notmatch '^[A-Za-z]:\\.') { return $null }
+    return (Join-Path $win 'ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache')
+}
+
+function Get-DoCacheEstimate {
+    # Taille estimée sans droits admin : somme de ce que Windows annonce pour chaque fichier du cache, la part
+    # réellement présente (FileSizeInCache) quand elle est fournie, sinon la taille du fichier ($null si illisible).
+    # Sur le PC de Thomas le 19/11/2026 : 7,1 Go de tailles de fichiers pour 7,0 Go sur le disque.
+    # Cache vide : Windows répond par un avertissement en anglais (« No active Delivery Optimization download or
+    # upload jobs »), masqué ici ; aucun fichier = 0.
+    try {
+        $sum = [int64]0
+        foreach ($f in @(Get-DeliveryOptimizationStatus -ErrorAction Stop -WarningAction SilentlyContinue)) {
+            if ($null -ne $f.FileSizeInCache) { $sum += [int64]$f.FileSizeInCache }
+            elseif ($null -ne $f.FileSize) { $sum += [int64]$f.FileSize }
+        }
+        return $sum
+    } catch { return $null }
+}
+
+function Get-DoCacheState {
+    # Cache de l'optimisation de livraison (copies de mises à jour partagées avec d'autres PC) : taille et
+    # téléchargements en cours. Taille : le dossier lui-même quand il est lisible (droits admin), Exact = $true ;
+    # sinon l'estimation de Get-DoCacheEstimate. Jamais CacheSizeBytes de Get-DeliveryOptimizationPerfSnap : ce
+    # n'est pas la taille du cache (460 Mo annoncés pour 7,0 Go sur le disque, auto-test du 19/11/2026).
+    # Busy = $null : nombre de téléchargements en attente illisible (anciennes versions de Windows 10), traité
+    # comme un empêchement : [int]$null vaudrait 0, soit « aucun téléchargement » sans preuve (règle 24).
+    $r = [pscustomobject]@{ Ok = $false; Bytes = [int64]0; Exact = $false; Busy = $null }
+    try {
+        $s = Get-DeliveryOptimizationPerfSnap -ErrorAction Stop -WarningAction SilentlyContinue
+        if ($null -ne $s) {
+            $fg = ConvertTo-IntOrNull $s.ForegroundDownloadsPending
+            $bg = ConvertTo-IntOrNull $s.BackgroundDownloadsPending
+            if ($null -ne $fg -and $null -ne $bg) { $r.Busy = ($fg + $bg) -gt 0 }
+        }
+    } catch { $r.Busy = $null }
+    $dir = Get-DoCacheDir
+    if ($dir) {
+        $m = Measure-AgedFiles $dir 0
+        if ($m.Ok -and -not $m.Partial -and -not $m.Link) {
+            $r.Bytes = $m.TotalBytes; $r.Exact = $true; $r.Ok = $true
+            return $r
+        }
+    }
+    $est = Get-DoCacheEstimate
+    if ($null -ne $est) { $r.Bytes = [int64]$est; $r.Ok = $true }
+    return $r
+}
+
+function Format-DoSize($State) {
+    # « 7,0 Go » mesuré sur le disque, « environ 7,1 Go » estimé
+    if ($State.Exact -or $State.Bytes -le 0) { return (Format-Bytes $State.Bytes) }
+    return ('environ ' + (Format-Bytes $State.Bytes))
+}
+
+function Clear-DoCache {
+    # Vidage par l'interface de Windows (celle qu'appelle Delete-DeliveryOptimizationCache, sans ses messages
+    # en anglais) ; fichiers épinglés conservés. Résultat lu dans une nouvelle mesure, de même nature qu'avant.
+    $res = [pscustomobject]@{ Ok = $false; FreedBytes = [int64]0; LeftBytes = [int64]0; Reason = '' }
+    $before = Get-DoCacheState
+    if (-not $before.Ok) { $res.Reason = 'taille du cache illisible, rien n''a été supprimé'; return $res }
+    if ($null -eq $before.Busy) { $res.Reason = 'état des téléchargements illisible, rien n''a été supprimé'; return $res }
+    if ($before.Busy) { $res.Reason = 'un téléchargement est en cours : réessaie plus tard'; return $res }
+    try {
+        $null = Invoke-CimMethod -Namespace 'root/Microsoft/Windows/DeliveryOptimization' -ClassName MSFT_DeliveryOptimizationFile `
+                -MethodName Delete -Arguments @{ deletePinned = $false } -ErrorAction Stop
+    } catch {
+        $res.Reason = 'Windows a refusé le vidage : ' + (Cut (Remove-ControlChars $_.Exception.Message) 80)
+        return $res
+    }
+    $after = Get-DoCacheState
+    if ($after.Ok -and $after.Bytes -gt 0) {
+        # Le service peut lâcher ses fichiers avec un peu de retard : une seconde mesure
+        Start-Sleep -Seconds 3
+        $after = Get-DoCacheState
+    }
+    if (-not $after.Ok -or $after.Exact -ne $before.Exact) {
+        $res.Reason = 'résultat non vérifiable : taille du cache illisible après le vidage'
+        return $res
+    }
+    $res.Ok = $true
+    $res.FreedBytes = [math]::Max([int64]0, $before.Bytes - $after.Bytes)
+    $res.LeftBytes = $after.Bytes
+    if (-not $after.Exact) { $res.Reason = 'tailles estimées par Windows, pas mesurées sur le disque' }
+    return $res
+}
+
+function Get-WuBusyState {
+    # Raisons de ne pas toucher aux fichiers de Windows Update ni aux composants. InstallerBusy = $null :
+    # état de l'installateur illisible (traité comme un empêchement).
+    $rp = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
+          (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')
+    $sv = [bool](Get-Process TiWorker)
+    $ib = $null
+    try { $ib = [bool](New-Object -ComObject Microsoft.Update.Session -ErrorAction Stop).CreateUpdateInstaller().IsBusy } catch { $ib = $null }
+    return [pscustomobject]@{ RebootPending = [bool]$rp; ServicingBusy = $sv; InstallerBusy = $ib }
+}
+
+function Get-ServicingBlocker($RebootPending, $ServicingBusy, $InstallerBusy) {
+    # Raison de reporter le vidage du cache Windows Update ou le nettoyage des composants, '' si rien ne
+    # l'empêche. Un état illisible ($null) empêche aussi. Fonction pure, testée en T1.
+    if ($null -eq $RebootPending -or [bool]$RebootPending) { return 'un redémarrage est en attente (mises à jour à terminer)' }
+    if ($null -eq $InstallerBusy) { return 'état de Windows Update illisible' }
+    if ([bool]$InstallerBusy) { return 'Windows Update installe des mises à jour en ce moment' }
+    if ($null -eq $ServicingBusy -or [bool]$ServicingBusy) { return 'Windows installe des composants en ce moment' }
+    return ''
+}
+
+function Clear-WuCache {
+    # Vide SoftwareDistribution\Download : Windows Update et BITS arrêtés, suppression par Clear-CleanTarget,
+    # puis relance vérifiée des services qui tournaient. Rien n'est supprimé si l'arrêt échoue.
+    $res = [pscustomobject]@{ Ok = $false; FreedBytes = [int64]0; LeftBytes = [int64]0; Reason = ''; Restarted = $true }
+    $b = Get-WuBusyState
+    $why = Get-ServicingBlocker $b.RebootPending $b.ServicingBusy $b.InstallerBusy
+    if ($why) { $res.Reason = $why; return $res }
+    $wasRunning = @()
+    foreach ($n in @('wuauserv', 'bits')) {
+        $s = Get-Service -Name $n
+        if ($null -eq $s) { $res.Reason = 'service ' + $n + ' introuvable, rien n''a été supprimé'; return $res }
+        if ($s.Status -ne 'Stopped') { $wasRunning += $n }
+    }
+    $stopped = $true
+    foreach ($n in $wasRunning) {
+        try {
+            $s = Get-Service -Name $n
+            # En cours de démarrage : attendre qu'il tourne ; en cours d'arrêt : attendre seulement
+            if ($s.Status -eq 'StartPending') { $s.WaitForStatus('Running', [TimeSpan]::FromSeconds(60)); $s.Refresh() }
+            if ($s.Status -eq 'Running' -or $s.Status -eq 'Paused') { $s.Stop() }
+            $s.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(60))
+        } catch { $stopped = $false; break }
+    }
+    if (-not $stopped) {
+        $res.Reason = 'Windows Update n''a pas pu être arrêté, rien n''a été supprimé'
+    } else {
+        # Juste avant la suppression : un déclencheur de Windows a pu relancer un service entre-temps
+        foreach ($n in @('wuauserv', 'bits')) {
+            $s = Get-Service -Name $n
+            if ($null -eq $s -or $s.Status -ne 'Stopped') { $stopped = $false }
+        }
+        if ($stopped) {
+            $c = Clear-CleanTarget 'WuCache' 0
+            $res.Ok = $c.Ok; $res.FreedBytes = $c.FreedBytes; $res.LeftBytes = $c.LeftBytes; $res.Reason = $c.Reason
+        } else {
+            $res.Reason = 'Windows Update s''est relancé tout seul, rien n''a été supprimé : réessaie plus tard'
+        }
+    }
+    # Relance, dans l'ordre inverse de l'arrêt, de ce qui tournait au départ
+    foreach ($n in @('bits', 'wuauserv')) {
+        if ($wasRunning -notcontains $n) { continue }
+        try {
+            $s = Get-Service -Name $n
+            if ($s.Status -eq 'StopPending') { $s.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(60)); $s.Refresh() }
+            if ($s.Status -eq 'Stopped') { $s.Start() }
+            $s.WaitForStatus('Running', [TimeSpan]::FromSeconds(60))
+        } catch { $res.Restarted = $false }
+    }
+    return $res
+}
+
+function Measure-FolderBounded([string]$Path, [int]$MaxSeconds) {
+    # Taille d'un gros dossier (Windows.old), sans suivre les jonctions, arrêtée au bout de $MaxSeconds.
+    # Complete = $false si le temps a manqué ou si un sous-dossier était illisible : la taille est un minimum.
+    $r = [pscustomobject]@{ Bytes = [int64]0; Complete = $false }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $stack = New-Object System.Collections.Stack
+    $stack.Push($Path)
+    $partial = $false
+    while ($stack.Count -gt 0) {
+        if ($sw.Elapsed.TotalSeconds -ge $MaxSeconds) { return $r }
+        $cur = [string]$stack.Pop()
+        try {
+            foreach ($it in (New-Object IO.DirectoryInfo $cur).EnumerateFileSystemInfos()) {
+                if ($it.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+                if ($it -is [IO.DirectoryInfo]) { $stack.Push($it.FullName) } else { $r.Bytes += [int64]$it.Length }
+            }
+        } catch { $partial = $true }
+    }
+    $r.Complete = -not $partial
+    return $r
+}
+
+function Format-Bytes($Bytes) {
+    # Taille lisible : « 812 Mo », « 2,3 Go », « moins de 1 Mo ». Fonction pure, testée en T1.
+    if ($null -eq $Bytes) { return 'taille inconnue' }
+    $b = [double]$Bytes
+    if ($b -le 0) { return '0 Mo' }
+    if ($b -lt 1MB) { return 'moins de 1 Mo' }
+    if ($b -lt 1GB) { return ('{0:N0} Mo' -f ($b / 1MB)) }
+    return ('{0:N1} Go' -f ($b / 1GB))
+}
+
+function Format-AgedText($M, [string]$AgeText) {
+    # Mesure de Measure-AgedFiles en clair : « 1 234 Mo, dont 812 Mo de plus de 24 h ». Fonction pure, testée en T1.
+    # Partial (sous-dossier illisible) : « au moins », la mesure n'est pas complète
+    if ($null -eq $M -or -not $M.Ok) { return 'lecture impossible' }
+    if ($M.Link) { return 'dossier déplacé (lien)' }
+    $min = ''
+    if ($M.Partial) { $min = 'au moins ' }
+    if ((-not $M.Exists -or $M.TotalBytes -eq 0) -and -not $M.Partial) { return '0 Mo' }
+    if (-not $AgeText) { return ($min + (Format-Bytes $M.TotalBytes)) }
+    return ('{0}{1}, dont {0}{2} {3}' -f $min, (Format-Bytes $M.TotalBytes), (Format-Bytes $M.AgedBytes), $AgeText)
+}
+
+function New-CleanTarget([string]$Key, [string]$Label, $Bytes, [bool]$Ok, [bool]$NeedAdmin, [string]$Blocker = '', [bool]$Forced = $false, [string]$Detail = '') {
+    # Une cible du nettoyage étendu, telle que mesurée par la section 11. Forced : proposée quelle que soit sa
+    # taille (composants Windows, quand DISM conseille le nettoyage). Detail : précision pour la question.
+    # MinBytes : seuil propre à la cible quand il dépasse le seuil commun (optimisation de livraison).
+    $n = [int64]0
+    if ($null -ne $Bytes) { $n = [int64]$Bytes }
+    return [pscustomobject]@{ Key = $Key; Label = $Label; Bytes = $n; Ok = $Ok; NeedAdmin = $NeedAdmin; Blocker = $Blocker; Forced = $Forced; Detail = $Detail; MinBytes = [int64]0 }
+}
+
+function Get-CleanProposal($Targets, [int64]$MinBytes, [bool]$IsAdmin) {
+    # Cibles réellement proposées : lecture réussie, droits suffisants, rien qui l'empêche, et au moins $MinBytes
+    # (ou conseillée par Windows), ou le seuil propre à la cible s'il est plus haut. Le total « récupérable » ne
+    # compte que celles-là. Fonction pure, testée en T1.
+    $keep = @(@($Targets) | Where-Object {
+        $min = $MinBytes
+        if ($null -ne $_ -and $_.MinBytes -gt $min) { $min = $_.MinBytes }
+        $null -ne $_ -and $_.Ok -and (-not $_.NeedAdmin -or $IsAdmin) -and -not $_.Blocker -and ($_.Forced -or $_.Bytes -ge $min)
+    })
+    $sum = [int64]0
+    foreach ($k in $keep) { $sum += [int64]$k.Bytes }
+    return [pscustomobject]@{ Items = $keep; Bytes = $sum }
 }
 
 function Resolve-InstallDir([string]$Dir) {
@@ -1219,6 +1646,7 @@ function Wait-ACPower([string]$Reason) {
 }
 
 function Install-WindowsUpdates {
+    $script:WuTouched = $true      # l'analyse des composants faite pendant le scan n'est plus à jour
     if (-not (Wait-ACPower 'une coupure pendant l''installation des mises à jour peut endommager Windows.')) {
         Write-Host '   >> Installation annulée.' -ForegroundColor DarkGray
         return
@@ -1961,6 +2389,269 @@ function Get-DismRepairVerdict([string]$Text, $Code) {
     if ($null -eq $Code -or [int]$Code -ne 0) { return 'FAILED' }
     if ($t -match 'restore operation completed successfully|restauration a .{1,3}t.{1,3} effectu') { return 'REPAIRED' }
     return 'UNKNOWN'
+}
+
+function ConvertFrom-DismSize([string]$Text) {
+    # Taille écrite par DISM (« 7.85 GB », « 7,85 Go », « 0 bytes », « 512.30 MB ») : octets, ou $null si
+    # illisible. Fonction pure, testée en T1.
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $t = $Text.Trim()
+    $m = [regex]::Match($t, '^(\d[\d\s]*(?:[.,]\d+)?)\s*(bytes|octets|KB|Ko|MB|Mo|GB|Go|TB|To|B|o)(?![A-Za-z])', 'IgnoreCase')
+    if (-not $m.Success) { return $null }
+    $num = ($m.Groups[1].Value -replace '\s', '') -replace ',', '.'
+    $v = 0.0
+    if (-not [double]::TryParse($num, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$v)) { return $null }
+    $u = $m.Groups[2].Value.ToUpperInvariant()
+    $mult = 1.0
+    if ($u.StartsWith('K')) { $mult = 1KB }
+    elseif ($u.StartsWith('M')) { $mult = 1MB }
+    elseif ($u.StartsWith('G')) { $mult = 1GB }
+    elseif ($u.StartsWith('T')) { $mult = 1TB }
+    return [int64][math]::Round($v * $mult)
+}
+
+function Get-ComponentStoreInfo([string]$Text) {
+    # Lecture de DISM /AnalyzeComponentStore. Libellés français relevés dans CbsProvider.dll.mui le 19/11/2026
+    # (accents en jokers, règle 21). Recommended : 'YES', 'NO', ou $null si le texte n'est pas reconnu (jamais
+    # « rien à faire » sans preuve). Fonction pure, testée en T1.
+    $r = [pscustomobject]@{ Recommended = $null; Reclaimable = $null; ActualBytes = $null; BackupBytes = $null; CacheBytes = $null }
+    if ([string]::IsNullOrEmpty($Text)) { return $r }
+    foreach ($raw in (($Text -replace "`0", '') -split "`r?`n")) {
+        $l = $raw.Trim()
+        $m = [regex]::Match($l, '^(Component Store Cleanup Recommended|Nettoyage du magasin de composants recommand.{1,3})\s*:\s*(\S+)', 'IgnoreCase')
+        if ($m.Success) {
+            $v = $m.Groups[2].Value.ToLowerInvariant()
+            if (@('yes', 'oui') -contains $v) { $r.Recommended = 'YES' }
+            elseif (@('no', 'non') -contains $v) { $r.Recommended = 'NO' }
+            continue
+        }
+        $m = [regex]::Match($l, '^(Number of Reclaimable Packages|Nombre de packages r.{1,3}cup.{1,3}rables)\s*:\s*(\d+)', 'IgnoreCase')
+        if ($m.Success) { $r.Reclaimable = [int]$m.Groups[2].Value; continue }
+        $m = [regex]::Match($l, '^(Actual Size of Component Store|Taille r.{1,3}elle du magasin de composants)\s*:\s*(.+)$', 'IgnoreCase')
+        if ($m.Success) { $r.ActualBytes = ConvertFrom-DismSize $m.Groups[2].Value; continue }
+        $m = [regex]::Match($l, '^(Backups and Disabled Features|Sauvegardes et fonctionnalit.{1,3}s d.{1,3}sactiv.{1,3}es)\s*:\s*(.+)$', 'IgnoreCase')
+        if ($m.Success) { $r.BackupBytes = ConvertFrom-DismSize $m.Groups[2].Value; continue }
+        $m = [regex]::Match($l, '^(Cache and Temporary Data|Cache et donn.{1,3}es temporaires)\s*:\s*(.+)$', 'IgnoreCase')
+        if ($m.Success) { $r.CacheBytes = ConvertFrom-DismSize $m.Groups[2].Value }
+    }
+    return $r
+}
+
+function Get-ComponentCleanupVerdict([string]$Text, $Code) {
+    # DISM /StartComponentCleanup : DONE (code 0 ou 3010 et réussite annoncée), PENDING (opérations en attente
+    # d'un redémarrage, 0x800F0806), FAILED (autre code ou aucun), UNKNOWN (code 0 sans message reconnu).
+    # « L'opération a réussi » relevé dans Dism.exe.mui le 19/11/2026. Fonction pure, testée en T1.
+    $t = ($Text -replace "`0", '') -replace '\s+', ' '
+    if ($null -eq $Code) { return 'FAILED' }
+    if (('{0:X8}' -f [int]$Code) -eq '800F0806' -or $t -match '0x800f0806') { return 'PENDING' }
+    if ([int]$Code -ne 0 -and [int]$Code -ne 3010) { return 'FAILED' }
+    if ($t -match 'operation completed successfully|op.{1,3}ration a r.{1,3}ussi') { return 'DONE' }
+    return 'UNKNOWN'
+}
+
+function Invoke-ComponentAnalysis {
+    # DISM /AnalyzeComponentStore (lecture seule, droits admin). $null si DISM n'a pas pu tourner jusqu'au bout.
+    # Pas de -AskOnTimeout : arrêter une analyse ne touche à rien.
+    $r = Invoke-ProcessSpinner -Label 'Analyse des composants Windows (1-5 min)' -FilePath (Get-SystemToolPath 'dism.exe') `
+         -Arguments '/Online /Cleanup-Image /AnalyzeComponentStore' -TimeoutSec 900 -Encoding 'Auto'
+    if ($null -eq $r) { return $null }
+    $i = Get-ComponentStoreInfo $r.Text
+    $i | Add-Member -NotePropertyName Code -NotePropertyValue $r.Code
+    return $i
+}
+
+function Invoke-ComponentCleanup {
+    # DISM /StartComponentCleanup sans /ResetBase (avec /ResetBase, plus aucune mise à jour installée ne
+    # pourrait être désinstallée). Reporté si un redémarrage ou une installation est en cours ; résultat lu,
+    # puis gain mesuré par une nouvelle analyse.
+    $b = Get-WuBusyState
+    $why = Get-ServicingBlocker $b.RebootPending $b.ServicingBusy $b.InstallerBusy
+    if ($why) {
+        Write-Action 'INFO' ('Composants Windows : nettoyage reporté, ' + $why)
+        Write-Host '          Redémarre le PC puis relance un scan complet.' -ForegroundColor DarkGray
+        return
+    }
+    if (-not (Wait-ACPower 'une coupure pendant le nettoyage des composants peut abîmer Windows.')) {
+        Write-Action 'INFO' 'Composants Windows : nettoyage annulé (PC sur batterie)'
+        return
+    }
+    $before = $script:ComponentInfo
+    $r = Invoke-ProcessSpinner -Label 'Nettoyage des composants Windows (jusqu''à 30 min)' -FilePath (Get-SystemToolPath 'dism.exe') `
+         -Arguments '/Online /Cleanup-Image /StartComponentCleanup' -TimeoutSec 3600 -Encoding 'Auto' -AskOnTimeout
+    if ($null -eq $r) {
+        if ($script:ProcState -eq 'STOPPED') { Write-Action 'WARN' 'Composants Windows : nettoyage arrêté à ta demande avant la fin' }
+        else { Write-Action 'WARN' 'Composants Windows : DISM n''a pas pu être lancé' }
+        return
+    }
+    $v = Get-ComponentCleanupVerdict $r.Text $r.Code
+    if ($v -eq 'PENDING') {
+        Write-Action 'INFO' 'Composants Windows : des mises à jour attendent un redémarrage, nettoyage impossible pour l''instant'
+        Write-Host '          Redémarre le PC puis relance un scan complet.' -ForegroundColor DarkGray
+        return
+    }
+    if ($v -eq 'FAILED') {
+        Write-Action 'WARN' ('Composants Windows : échec du nettoyage (code 0x{0:X8})' -f [int]$r.Code)
+        Write-Host '          Détails : C:\Windows\Logs\DISM\dism.log' -ForegroundColor DarkGray
+        return
+    }
+    $after = Invoke-ComponentAnalysis
+    $gain = ''
+    if ($null -ne $before -and $null -ne $after -and $null -ne $before.ActualBytes -and $null -ne $after.ActualBytes) {
+        $gain = ', ' + (Format-Bytes ([math]::Max([int64]0, [int64]$before.ActualBytes - [int64]$after.ActualBytes))) + ' libérés'
+    }
+    if ($v -eq 'UNKNOWN') {
+        Write-Action 'INFO' ('Composants Windows : DISM a terminé sans message reconnu' + $gain)
+        Write-Host '          Détails : C:\Windows\Logs\DISM\dism.log' -ForegroundColor DarkGray
+    } elseif ($null -ne $after -and $after.Recommended -eq 'NO') {
+        Write-Action 'OK' ('Composants Windows : nettoyage vérifié' + $gain)
+    } elseif ($null -ne $after -and $after.Recommended -eq 'YES') {
+        # Relevé du 19/11/2026 (Windows 11 build 26300) : DISM a fini en 2 s, sans rien retirer ni demander de
+        # redémarrage (dism.log), et l'analyse suivante conseillait toujours le nettoyage (2 paquets).
+        Write-Action 'INFO' ('Composants Windows : DISM a terminé' + $gain + ', mais Windows garde des composants qu''il dit récupérables')
+        Write-Host '          Rien d''autre à faire de ton côté.' -ForegroundColor DarkGray
+    } else {
+        Write-Action 'INFO' 'Composants Windows : nettoyage terminé d''après DISM, gain non mesuré (nouvelle analyse impossible)'
+    }
+}
+
+function Write-CleanResult([string]$Label, $Res) {
+    # Résultat d'un nettoyage, d'après la nouvelle mesure. Ok = $false : rien de fait (Reason dit pourquoi).
+    # Reason non vide avec Ok : résultat partiel, jamais affiché en « OK ».
+    # Un reste de moins de 1 Mo (fichiers verrouillés, fichiers de suivi d'un service) ne change pas le verdict.
+    if (-not $Res.Ok) { Write-Action 'WARN' ($Label + ' : ' + $Res.Reason); return }
+    $left = [int64]$Res.LeftBytes
+    if ($left -lt 1MB) { $left = 0 }
+    $txt = '{0} : {1} libérés' -f $Label, (Format-Bytes $Res.FreedBytes)
+    if ($left -gt 0) { $txt += (', {0} conservés (fichiers verrouillés ou en cours d''utilisation)' -f (Format-Bytes $left)) }
+    if ($Res.Reason) { $txt += ' ; ' + $Res.Reason }
+    if ($left -gt 0 -or $Res.Reason) { Write-Action 'INFO' $txt } else { Write-Action 'OK' $txt }
+}
+
+function Wait-ServicingIdle([int]$TimeoutSec = 300) {
+    # TiWorker (programme d'installation des modules Windows) démarre à chaque recherche de mises à jour, celle de
+    # la section 02 comprise, et reste environ 2 minutes (relevé le 19/11/2026) : on attend qu'il s'arrête de
+    # lui-même. $true quand il ne tourne plus.
+    if (-not (Get-Process TiWorker)) { return $true }
+    $null = Invoke-Spinner -Label 'Windows termine une vérification de ses composants' -TimeoutSec $TimeoutSec -ScriptBlock {
+        while (Get-Process TiWorker -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 2 }
+        $true
+    }
+    return (-not (Get-Process TiWorker))
+}
+
+function Test-CleanStillBlocked([string]$Label) {
+    # Juste avant la question : un redémarrage ou une installation a pu apparaître depuis la section 11
+    # (mises à jour Windows installées par JARVIS juste avant). TiWorker en cours : attente de 5 minutes au plus.
+    # $true = cible écartée, sans question.
+    $b = Get-WuBusyState
+    $why = Get-ServicingBlocker $b.RebootPending $false $b.InstallerBusy
+    if (-not $why -and $b.ServicingBusy -and -not (Wait-ServicingIdle 300)) {
+        $why = 'Windows installe des composants depuis plus de 5 minutes'
+    }
+    if (-not $why) { return $false }
+    Write-Action 'INFO' ($Label + ' : pas de nettoyage maintenant, ' + $why)
+    Write-Host '          Relance un scan plus tard (après un redémarrage si des mises à jour l''attendent).' -ForegroundColor DarkGray
+    return $true
+}
+
+function Invoke-CleanTarget($Target) {
+    # Une question par cible (réponse par défaut : non), posée sur un état relu juste avant (taille, empêchements),
+    # puis le résultat vérifié par une nouvelle mesure, ajouté au rapport
+    $size = Format-Bytes $Target.Bytes
+    $who = ''
+    if ($script:CleanUser) { $who = ', compte ' + $script:CleanUser }
+    switch ($Target.Key) {
+        'Temp' {
+            if (-not (Read-YesNo ('   >> Supprimer les fichiers temporaires de plus de 24 h ({0}{1}) ?' -f $size, $who))) { return }
+            $dirs = @((Join-Path $env:windir 'Temp'))
+            if (Test-SafeTempPath $env:TEMP) { $dirs = @($env:TEMP) + $dirs }
+            $res = [pscustomobject]@{ Ok = $false; FreedBytes = [int64]0; LeftBytes = [int64]0; Reason = '' }
+            $notes = @()
+            foreach ($p in $dirs) {
+                $m1 = Measure-AgedFiles $p 24
+                $r = Clear-TempFolder $p 24
+                if (-not $r.Ok) { $notes += $r.Reason; continue }
+                $m2 = Measure-AgedFiles $p 24
+                if ($m1.Ok -and $m2.Ok) {
+                    $res.Ok = $true
+                    $res.FreedBytes += [math]::Max([int64]0, $m1.AgedBytes - $m2.AgedBytes)
+                    $res.LeftBytes += $m2.AgedBytes
+                } elseif (-not $isAdmin) {
+                    $notes += ($p + ' : droits admin nécessaires')
+                } else {
+                    $notes += ($p + ' : non mesuré, résultat inconnu')
+                }
+            }
+            $res.Reason = $notes -join ' ; '
+            Write-CleanResult 'Fichiers temporaires' $res
+        }
+        'RecycleBin' {
+            # Contenu relu juste avant : un fichier jeté depuis la section 11 doit figurer dans la question
+            $rb = Get-RecycleBinState
+            if (-not $rb.Ok) { Write-Action 'INFO' 'Corbeille : lecture impossible, rien n''a été supprimé'; return }
+            if ($rb.Count -eq 0) { return }
+            if (-not (Read-YesNo ('   >> Vider la corbeille ({0}, {1} élément(s), contenu perdu définitivement) ?' -f (Format-Bytes $rb.Bytes), $rb.Count))) { return }
+            $r = Clear-RecycleBinChecked
+            if (-not $r.Ok) { Write-Action 'WARN' ('Corbeille : ' + $r.Reason) }
+            elseif ($r.LeftCount -eq 0) { Write-Action 'OK' ('Corbeille vidée : {0} libérés' -f (Format-Bytes $r.FreedBytes)) }
+            else { Write-Action 'WARN' ('Corbeille : {0} libérés, {1} élément(s) encore présent(s)' -f (Format-Bytes $r.FreedBytes), $r.LeftCount) }
+        }
+        'WuCache' {
+            if (Test-CleanStillBlocked 'Cache Windows Update') { return }
+            Write-Host '   [i] Fichiers de mises à jour déjà téléchargés. Windows Update est arrêté quelques secondes puis relancé ;' -ForegroundColor DarkGray
+            Write-Host '       il retéléchargera au besoin ce qui manque.' -ForegroundColor DarkGray
+            if (-not (Read-YesNo ('   >> Vider le cache de Windows Update ({0}) ?' -f $size))) { return }
+            $r = Clear-WuCache
+            Write-CleanResult 'Cache Windows Update' $r
+            if (-not $r.Restarted) {
+                Write-Action 'WARN' 'Windows Update ou BITS n''a pas redémarré : redémarre le PC pour le relancer'
+            }
+        }
+        'DoCache' {
+            $d = Get-DoCacheState
+            if (-not $d.Ok -or $d.Busy -ne $false) {
+                Write-Action 'INFO' 'Optimisation de livraison : pas de nettoyage maintenant (téléchargement en cours ou état illisible)'
+                return
+            }
+            Write-Host '   [i] Copies de mises à jour gardées pour les partager avec d''autres PC ; Windows les retire de lui-même' -ForegroundColor DarkGray
+            Write-Host '       après quelques jours. Les vider ne change rien au fonctionnement du PC.' -ForegroundColor DarkGray
+            if (-not (Read-YesNo ('   >> Vider le cache de l''optimisation de livraison ({0}) ?' -f (Format-DoSize $d)))) { return }
+            Write-CleanResult 'Optimisation de livraison' (Clear-DoCache)
+        }
+        'Dumps' {
+            Write-Host '   [i] Fichiers écrits lors d''anciens plantages (applications ou écrans bleus), utiles seulement pour en' -ForegroundColor DarkGray
+            Write-Host '       chercher la cause. Seuls ceux de plus de 30 jours sont supprimés.' -ForegroundColor DarkGray
+            if (-not (Read-YesNo ('   >> Supprimer les vidages mémoire de plus de 30 jours ({0}{1}) ?' -f $size, $who))) { return }
+            $keys = @('CrashDumps')
+            if ($isAdmin -and -not $script:KeepSysDumps) { $keys += @('Minidump', 'MemoryDump') }
+            $res = [pscustomobject]@{ Ok = $false; FreedBytes = [int64]0; LeftBytes = [int64]0; Reason = '' }
+            $notes = @()
+            foreach ($k in $keys) {
+                $r = Clear-CleanTarget $k 720 '.dmp'
+                if ($r.Ok) { $res.Ok = $true; $res.FreedBytes += $r.FreedBytes; $res.LeftBytes += $r.LeftBytes }
+                else { $notes += $r.Reason }
+            }
+            $res.Reason = $notes -join ' ; '
+            Write-CleanResult 'Vidages mémoire' $res
+        }
+        'Components' {
+            if (Test-CleanStillBlocked 'Composants Windows') { return }
+            if ($script:WuTouched) {
+                # Des mises à jour viennent d'être installées : l'analyse du scan n'est plus à jour
+                $script:ComponentInfo = Invoke-ComponentAnalysis
+                if ($null -eq $script:ComponentInfo) { Write-Action 'INFO' 'Composants Windows : nouvelle analyse impossible, nettoyage non proposé'; return }
+                if ($script:ComponentInfo.Recommended -ne 'YES') { Write-Action 'INFO' 'Composants Windows : plus de nettoyage conseillé après les mises à jour'; return }
+            }
+            $upTo = ''
+            if ($null -ne $script:ComponentInfo -and $null -ne $script:ComponentInfo.BackupBytes) {
+                $upTo = ' (jusqu''à ' + (Format-Bytes $script:ComponentInfo.BackupBytes) + ')'
+            }
+            Write-Host '   [i] Retire les anciennes versions de composants remplacées par des mises à jour. Sans /ResetBase :' -ForegroundColor DarkGray
+            Write-Host '       la désinstallation des mises à jour reste possible. Jusqu''à 30 min, ne ferme pas la fenêtre.' -ForegroundColor DarkGray
+            if (-not (Read-YesNo ('   >> Nettoyer les anciens composants de Windows' + $upTo + ' ?'))) { return }
+            Invoke-ComponentCleanup
+        }
+    }
 }
 
 function Get-ChkdskVerdict($Code) {
@@ -3684,6 +4375,103 @@ function Invoke-SelfTestAnalyzers {
         Assert-True ((Get-QuickEditRestoreMode 0x1B7 0x1B7) -eq 0x1B7) 'sélection remise alors qu''elle était coupée au départ'
         '5/5 cas'
     }
+    Test-Case 'Composants Windows : analyse DISM EN/FR' {
+        # Sortie anglaise de référence et sortie française reconstituée avec les libellés de CbsProvider.dll.mui
+        # (relevés le 19/11/2026), fins de ligne Windows, espace insécable avant les deux-points
+        $nb = [string][char]0x00A0
+        $en = ("`r`nDeployment Image Servicing and Management tool`r`nVersion: 10.0.26100.1`r`n`r`n" +
+               "[==========================100.0%==========================]`r`n`r`nComponent Store (WinSxS) information:`r`n`r`n" +
+               "Windows Explorer Reported Size of Component Store : 8.42 GB`r`n`r`nActual Size of Component Store : 8.12 GB`r`n`r`n" +
+               "    Shared with Windows : 6.01 GB`r`n    Backups and Disabled Features : 2.03 GB`r`n    Cache and Temporary Data :  0 bytes`r`n`r`n" +
+               "Date of Last Cleanup : 2026-10-12 03:41:07`r`n`r`nNumber of Reclaimable Packages : 3`r`n" +
+               "Component Store Cleanup Recommended : Yes`r`n`r`nThe operation completed successfully.`r`n")
+        $i = Get-ComponentStoreInfo $en
+        Assert-True ($i.Recommended -eq 'YES') 'nettoyage conseillé non lu (anglais)'
+        Assert-True ($i.Reclaimable -eq 3) 'paquets récupérables (anglais)'
+        Assert-True ($i.ActualBytes -eq [int64][math]::Round(8.12 * 1GB)) 'taille réelle (anglais)'
+        Assert-True ($i.CacheBytes -eq 0) 'cache à 0 octet'
+        $fr = ("`r`nInformations sur le magasin de composants (WinSxS)" + $nb + ":`r`n`r`n" +
+               'L' + $ap + "Explorateur Windows a signalé la taille du magasin de composants. : 7,95 Go`r`n`r`n" +
+               "Taille réelle du magasin de composants : 7,75 Go`r`n`r`n    Partagé avec Windows : 6,04 Go`r`n" +
+               "    Sauvegardes et fonctionnalités désactivées : 1,71 Go`r`n    Cache et données temporaires : 512,30 Mo`r`n`r`n" +
+               "Date du dernier nettoyage : 2026-11-10 09:12:34`r`n`r`nNombre de packages récupérables" + $nb + ": 0`r`n" +
+               'Nettoyage du magasin de composants recommandé' + $nb + ": Non`r`n`r`nL" + $ap + "opération a réussi.`r`n")
+        $f = Get-ComponentStoreInfo $fr
+        Assert-True ($f.Recommended -eq 'NO') 'nettoyage non nécessaire non lu (français)'
+        Assert-True ($f.Reclaimable -eq 0) 'paquets récupérables (français)'
+        Assert-True ($f.ActualBytes -eq [int64][math]::Round(7.75 * 1GB)) 'taille réelle (français, virgule décimale)'
+        Assert-True ($f.CacheBytes -eq [int64][math]::Round(512.30 * 1MB)) 'cache en Mo'
+        # Accents décodés dans une autre page de code : les jokers des expressions doivent tenir
+        Assert-True ((Get-ComponentStoreInfo ($fr -replace 'é', 'Ã©')).Recommended -eq 'NO') 'accents mal décodés non tolérés'
+        Assert-True ($null -eq (Get-ComponentStoreInfo 'Error: 87 The parameter is incorrect.').Recommended) 'texte inconnu pris pour une réponse'
+        Assert-True ($null -eq (Get-ComponentStoreInfo '').Recommended) 'texte vide pris pour une réponse'
+        $sizes = @(@('8.42 GB', [int64][math]::Round(8.42 * 1GB)), @('0 bytes', 0), @('1 234,5 Mo', [int64][math]::Round(1234.5 * 1MB)),
+                   @('12 Ko', 12288), @('beaucoup', $null))
+        foreach ($c in $sizes) {
+            $got = ConvertFrom-DismSize $c[0]
+            Assert-True ($got -eq $c[1]) ('taille « {0} » lue {1}' -f $c[0], $got)
+        }
+        '16/16 cas'
+    }
+    Test-Case 'Composants Windows : résultat du nettoyage' {
+        $cases = @(
+            @(("[==========================100.0%==========================]`r`nL" + $ap + "opération a réussi.`r`n"), 0, 'DONE'),
+            @("The operation completed successfully.`r`n", 0, 'DONE'),
+            @("Error: 0x800f0806`r`n`r`nThe operation could not be completed due to pending operations.`r`n", -2146498554, 'PENDING'),
+            @("Erreur : 0x800f0806`r`n", -2146498554, 'PENDING'),
+            @('Error: 5 Access is denied.', 5, 'FAILED'),
+            @('', 0, 'UNKNOWN'),
+            @('', $null, 'FAILED')
+        )
+        foreach ($c in $cases) {
+            $got = Get-ComponentCleanupVerdict $c[0] $c[1]
+            Assert-True ($got -eq $c[2]) ("« {0} » -> {1}, attendu {2}" -f (Cut $c[0] 30), $got, $c[2])
+        }
+        '{0}/{0} cas' -f $cases.Count
+    }
+    Test-Case 'Nettoyage : conditions de Windows Update' {
+        Assert-True ((Get-ServicingBlocker $false $false $false) -eq '') 'PC libre bloqué à tort'
+        Assert-True ((Get-ServicingBlocker $true $false $false) -match 'redémarrage') 'redémarrage en attente ignoré'
+        Assert-True ((Get-ServicingBlocker $false $false $true) -match 'installe des mises') 'installation en cours ignorée'
+        Assert-True ((Get-ServicingBlocker $false $true $false) -match 'composants') 'maintenance de Windows ignorée'
+        Assert-True ((Get-ServicingBlocker $false $false $null) -ne '') 'installateur illisible pris pour « libre »'
+        Assert-True ((Get-ServicingBlocker $null $false $false) -ne '') 'redémarrage illisible pris pour « aucun »'
+        '6/6 cas'
+    }
+    Test-Case 'Nettoyage : total proposé et tailles affichées' {
+        $mb = [int64]1MB
+        $ts = @(
+            (New-CleanTarget 'Temp' 'Temp' (812 * $mb) $true $false),
+            (New-CleanTarget 'RecycleBin' 'Corbeille' (50 * $mb) $true $false),
+            (New-CleanTarget 'WuCache' 'Cache WU' (300 * $mb) $true $true 'un redémarrage est en attente'),
+            (New-CleanTarget 'DoCache' 'Optimisation' (400 * $mb) $true $true),
+            (New-CleanTarget 'Dumps' 'Vidages' (900 * $mb) $false $false),
+            (New-CleanTarget 'Components' 'Composants' 0 $true $true '' $true),
+            (New-CleanTarget 'Seuil' 'Seuil propre plus haut' (600 * $mb) $true $false)
+        )
+        $ts[6].MinBytes = 1024 * $mb
+        $na = Get-CleanProposal $ts (100 * $mb) $false
+        $k1 = (@($na.Items) | ForEach-Object { $_.Key }) -join ','
+        Assert-True ($k1 -eq 'Temp') ('sans droits admin : ' + $k1)
+        Assert-True ($na.Bytes -eq 812 * $mb) 'total sans droits admin'
+        $ad = Get-CleanProposal $ts (100 * $mb) $true
+        $k2 = (@($ad.Items) | ForEach-Object { $_.Key }) -join ','
+        Assert-True ($k2 -eq 'Temp,DoCache,Components') ('avec droits admin : ' + $k2)
+        Assert-True ($ad.Bytes -eq 1212 * $mb) 'total avec droits admin'
+        Assert-True (@((Get-CleanProposal @() (100 * $mb) $true).Items).Count -eq 0) 'liste vide'
+        Assert-True ((Format-Bytes 0) -eq '0 Mo') 'zéro'
+        Assert-True ((Format-Bytes 1000) -eq 'moins de 1 Mo') 'moins de 1 Mo'
+        Assert-True ((Format-Bytes (812 * $mb)) -eq ('{0:N0} Mo' -f 812)) 'Mo'
+        Assert-True ((Format-Bytes ([int64](2.34 * 1GB))) -eq ('{0:N1} Go' -f 2.34)) 'Go'
+        Assert-True ((Format-Bytes $null) -eq 'taille inconnue') 'taille inconnue'
+        $m = [pscustomobject]@{ Ok = $true; Exists = $true; Link = $false; Partial = $false; TotalBytes = 900 * $mb; AgedBytes = 812 * $mb; AgedCount = 3 }
+        Assert-True ((Format-AgedText $m 'de plus de 24 h') -eq ('{0:N0} Mo, dont {1:N0} Mo de plus de 24 h' -f 900, 812)) 'mesure avec âge'
+        $m.Partial = $true
+        Assert-True ((Format-AgedText $m 'de plus de 24 h') -eq ('au moins {0:N0} Mo, dont au moins {1:N0} Mo de plus de 24 h' -f 900, 812)) 'mesure partielle présentée comme complète'
+        $m.Ok = $false
+        Assert-True ((Format-AgedText $m 'de plus de 24 h') -eq 'lecture impossible') 'lecture en échec affichée comme une taille'
+        '14/14 cas'
+    }
     Test-Case 'Mode ASCII : conversion des glyphes' {
         $got = Convert-Glyph '█░┌─┐…'
         Assert-True ($got -eq '#.+-+...') "obtenu $got"
@@ -3931,6 +4719,35 @@ function Invoke-SelfTest {
         Assert-True ($w -ne 'UNKNOWN') 'état d''activation de Windows illisible'
         ('hosts : {0} redirection(s)  //  proxy {1}  //  Windows {2}' -f $h.Findings.Entries, $p.State, $w)
     }
+    Test-Case 'Nettoyage : corbeille lisible' {
+        $rb = Get-RecycleBinState
+        Assert-True $rb.Ok 'contenu de la corbeille illisible'
+        ('{0} élément(s), {1}' -f $rb.Count, (Format-Bytes $rb.Bytes))
+    }
+    Test-Case 'Nettoyage : optimisation de livraison' {
+        $d = Get-DoCacheState
+        Assert-True $d.Ok 'taille du cache illisible'
+        Assert-True ($null -ne $d.Busy) 'téléchargements en cours illisibles'
+        $est = Get-DoCacheEstimate
+        Assert-True ($null -ne $est) 'liste des fichiers du cache illisible'
+        $txt = 'estimation ' + (Format-Bytes $est)
+        # Avec les droits admin, le dossier est mesuré : l'estimation affichée sans droits admin doit en être proche
+        if ($isAdmin -and (Get-DoCacheDir)) {
+            Assert-True $d.Exact 'dossier du cache illisible en administrateur'
+            $gap = [math]::Abs([double]$d.Bytes - [double]$est)
+            Assert-True ($gap -le [math]::Max([double]50MB, 0.1 * [double]$d.Bytes)) ('estimation {0}, dossier {1}' -f (Format-Bytes $est), (Format-Bytes $d.Bytes))
+            $txt += ', dossier ' + (Format-Bytes $d.Bytes)
+        }
+        $txt
+    }
+    Test-Case 'Composants Windows : analyse (1-5 min)' {
+        $ci = Invoke-ComponentAnalysis
+        Assert-True ($null -ne $ci) 'DISM n''a pas répondu à temps'
+        if ($ci.Code -ne 0 -and (Get-ComponentCleanupVerdict '' $ci.Code) -eq 'PENDING') { return 'SKIP:mises à jour en attente d''un redémarrage' }
+        Assert-True ($ci.Code -eq 0) ('code de sortie ' + $ci.Code)
+        Assert-True ($null -ne $ci.Recommended) 'message de DISM non reconnu (langue de Windows autre que français ou anglais ?)'
+        ('nettoyage conseillé : {0}, taille réelle {1}, sauvegardes {2}' -f $ci.Recommended, (Format-Bytes $ci.ActualBytes), (Format-Bytes $ci.BackupBytes))
+    } -NeedAdmin
     Test-Case 'Réseau : ping 1.1.1.1' {
         if (-not (Test-Connection -ComputerName 1.1.1.1 -Count 1 -Quiet)) { return 'SKIP:pas de réponse (hors ligne ou ICMP filtré)' }
         'réponse reçue'
@@ -4096,6 +4913,106 @@ function Invoke-SelfTest {
         }
         'chemin détourné écarté, fichier extérieur intact'
     }
+    Test-Case 'Nettoyage étendu : liste blanche' {
+        # Lecture seule : aucun vrai dossier n'est vidé ici (règle 18)
+        $real = Get-CleanTargetPaths
+        Assert-True (@($real.Keys).Count -eq 4) ('cibles calculées : ' + (@($real.Keys) -join ', '))
+        $win = [Environment]::GetFolderPath('Windows')
+        $bad = @($win, (Join-Path $win 'SoftwareDistribution'), (Join-Path $win 'System32'), ([IO.Path]::GetPathRoot($win)),
+                 $env:USERPROFILE, $env:TEMP, '', 'SoftwareDistribution\Download', '..\SoftwareDistribution\Download',
+                 '\\serveur\partage\Download')
+        foreach ($p in $bad) { Assert-True (-not (Test-SafeCleanTarget $p)) ('accepté à tort : ' + $p) }
+        $n = $bad.Count
+        if (Test-Path -LiteralPath $real['WuCache']) {
+            Assert-True (Test-SafeCleanTarget $real['WuCache']) 'cache Windows Update refusé à tort'
+            Assert-True (Test-SafeCleanTarget ($real['WuCache'] + '\')) 'barre finale refusée à tort'
+            Assert-True (-not (Test-SafeCleanTarget (Join-Path $real['WuCache'] 'sous-dossier'))) 'sous-dossier accepté'
+        }
+        ('4 cibles, {0} refus' -f $n)
+    }
+    Test-Case 'Nettoyage étendu : bac à sable' {
+        $root = Join-Path $env:TEMP ('jarvis_cible_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $win = Join-Path $root 'Windows'
+        $outside = Join-Path $root 'Protege'
+        $paths = [ordered]@{
+            WuCache    = (Join-Path $win 'SoftwareDistribution\Download')
+            Minidump   = (Join-Path $win 'Minidump')
+            MemoryDump = (Join-Path $win 'MEMORY.DMP')
+            CrashDumps = (Join-Path $root 'Local\CrashDumps')
+        }
+        foreach ($d in @((Join-Path $paths.WuCache 'a1b2'), $paths.Minidump, $paths.CrashDumps, $outside)) {
+            New-Item -ItemType Directory -Path $d -Force -ErrorAction Stop | Out-Null
+        }
+        $old = (Get-Date).AddDays(-40)
+        $mk = { param($File, $When) Set-Content -LiteralPath $File -Value 'x'; if ($When) { (Get-Item -LiteralPath $File).LastWriteTime = $When } }
+        & $mk (Join-Path $paths.WuCache 'a1b2\maj.cab') $null          # récent : le cache se vide en entier
+        & $mk (Join-Path $paths.Minidump 'ancien.dmp') $old
+        & $mk (Join-Path $paths.Minidump 'recent.dmp') $null
+        & $mk (Join-Path $paths.Minidump 'notes.txt') $old             # pas un vidage : gardé
+        & $mk $paths.MemoryDump $old
+        & $mk (Join-Path $paths.CrashDumps 'appli.exe.1234.dmp') $old
+        $keep = Join-Path $outside 'precieux.dmp'
+        & $mk $keep $old
+        $j = Join-Path $paths.WuCache 'lien'
+        & (Get-SystemToolPath 'cmd.exe') /c ('mklink /J "{0}" "{1}"' -f $j, $outside) | Out-Null
+        try {
+            Assert-True (Test-Path -LiteralPath (Join-Path $j 'precieux.dmp')) 'jonction de test non créée'
+            $one = [int64](Get-Item -LiteralPath $keep).Length
+            $fb = Measure-FolderBounded $win 30
+            Assert-True ($fb.Complete -and $fb.Bytes -eq 5 * $one) ('mesure du dossier : {0} octets, complète {1}' -f $fb.Bytes, $fb.Complete)
+            Assert-True (-not (Measure-FolderBounded $win 0).Complete) 'mesure arrêtée annoncée complète'
+            $w = Clear-CleanTarget 'WuCache' 0 '' $paths
+            Assert-True ($w.Ok -and $w.LeftBytes -eq 0 -and $w.FreedBytes -eq $one) ('cache non vidé : ' + $w.Reason)
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path $paths.WuCache 'a1b2'))) 'sous-dossier du cache laissé'
+            Assert-True (Test-Path -LiteralPath $keep) 'jonction suivie : fichier extérieur supprimé'
+            $m = Clear-CleanTarget 'Minidump' 720 '.dmp' $paths
+            Assert-True ($m.Ok -and $m.FreedBytes -eq $one) ('vidages refusés : ' + $m.Reason)
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path $paths.Minidump 'ancien.dmp'))) 'vidage ancien non supprimé'
+            Assert-True (Test-Path -LiteralPath (Join-Path $paths.Minidump 'recent.dmp')) 'vidage récent supprimé'
+            Assert-True (Test-Path -LiteralPath (Join-Path $paths.Minidump 'notes.txt')) 'fichier autre qu''un vidage supprimé'
+            $f = Clear-CleanTarget 'MemoryDump' 720 '.dmp' $paths
+            Assert-True ($f.Ok -and $f.FreedBytes -eq $one -and -not (Test-Path -LiteralPath $paths.MemoryDump)) 'MEMORY.DMP ancien non supprimé'
+            $c = Clear-CleanTarget 'CrashDumps' 720 '.dmp' $paths
+            Assert-True ($c.Ok -and $c.FreedBytes -eq $one) 'vidage d''application non supprimé'
+            Assert-True (-not (Clear-CleanTarget 'Inconnue' 0 '' $paths).Ok) 'cible hors liste acceptée'
+        } finally {
+            if (Test-Path -LiteralPath $j) { [IO.Directory]::Delete($j, $false) }
+            if (-not (Test-Path -LiteralPath $j)) { $null = Remove-TreeNoJunction $root }
+        }
+        '4 cibles nettoyées ; jonction, fichiers récents et autres fichiers préservés'
+    }
+    Test-Case 'Nettoyage étendu : cible remplacée par une jonction' {
+        $root = Join-Path $env:TEMP ('jarvis_lien_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $outside = Join-Path $root 'Protege'
+        $mini = Join-Path $root 'Windows\Minidump'
+        $par = Join-Path $root 'Parent'
+        New-Item -ItemType Directory -Path (Join-Path $outside 'CrashDumps') -Force -ErrorAction Stop | Out-Null
+        New-Item -ItemType Directory -Path (Split-Path -Parent $mini) -Force -ErrorAction Stop | Out-Null
+        $keep = Join-Path $outside 'ancien.dmp'
+        $keep2 = Join-Path $outside 'CrashDumps\ancien.dmp'
+        foreach ($k in @($keep, $keep2)) {
+            Set-Content -LiteralPath $k -Value 'x'
+            (Get-Item -LiteralPath $k).LastWriteTime = (Get-Date).AddDays(-40)
+        }
+        $cmd = Get-SystemToolPath 'cmd.exe'
+        & $cmd /c ('mklink /J "{0}" "{1}"' -f $mini, $outside) | Out-Null
+        & $cmd /c ('mklink /J "{0}" "{1}"' -f $par, $outside) | Out-Null
+        try {
+            Assert-True ((Test-Path -LiteralPath (Join-Path $mini 'ancien.dmp')) -and (Test-Path -LiteralPath (Join-Path $par 'CrashDumps'))) 'jonctions de test non créées'
+            $paths = [ordered]@{ Minidump = $mini; CrashDumps = (Join-Path $par 'CrashDumps') }
+            Assert-True (-not (Test-SafeCleanTarget $mini @($paths.Values))) 'jonction acceptée comme cible'
+            Assert-True (-not (Test-SafeCleanTarget $paths.CrashDumps @($paths.Values))) 'cible sous un dossier-jonction acceptée'
+            Assert-True (-not (Clear-CleanTarget 'Minidump' 720 '.dmp' $paths).Ok) 'nettoyage accepté à travers une jonction'
+            Assert-True (-not (Clear-CleanTarget 'CrashDumps' 720 '.dmp' $paths).Ok) 'nettoyage accepté sous un dossier-jonction'
+            Assert-True ((Test-Path -LiteralPath $keep) -and (Test-Path -LiteralPath $keep2)) 'fichier extérieur supprimé'
+            $m = Measure-AgedFiles $mini 720 '.dmp'
+            Assert-True ($m.Ok -and $m.Link -and $m.AgedBytes -eq 0) 'jonction comptée dans la mesure'
+        } finally {
+            foreach ($l in @($mini, $par)) { if (Test-Path -LiteralPath $l) { [IO.Directory]::Delete($l, $false) } }
+            if (-not (Test-Path -LiteralPath $mini) -and -not (Test-Path -LiteralPath $par)) { $null = Remove-TreeNoJunction $root }
+        }
+        'jonctions refusées, fichiers extérieurs intacts'
+    }
     Test-Case 'Désinstallation : suppression sans suivre les jonctions' {
         $root = Join-Path $env:TEMP ('jarvis_arbre_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
         $tree = Join-Path $root 'JARVIS'
@@ -4256,13 +5173,6 @@ function Get-CMErrorText([int]$code) {
 function Format-Date($d) {
     if ($null -eq $d) { return 'inconnue' }
     try { return ([datetime]$d).ToString('yyyy-MM-dd') } catch { return 'inconnue' }
-}
-
-function Get-FolderSizeMB([string]$Path) {
-    if (-not (Test-Path -LiteralPath $Path)) { return 0 }
-    $sum = (@(Get-FilesNoJunction $Path) | Measure-Object -Property Length -Sum).Sum
-    if ($null -eq $sum) { return 0 }
-    return [math]::Round($sum / 1MB)
 }
 
 # ------------------------------------------------------------------
@@ -4450,7 +5360,7 @@ if ($SelfTest) {
     Write-Host '   SÉLECTION DU PROTOCOLE' -ForegroundColor Cyan
     Write-Host '   [1] Scan rapide    ~2-5 min    état, mises à jour, pilotes, sécurité, journaux' -ForegroundColor Gray
     Write-Host '   [2] Scan complet   ~20-60 min  tout le scan rapide + DISM, SFC /scannow, CHKDSK' -ForegroundColor Gray
-    Write-Host '   [3] Auto-test      ~1-2 min    vérifie que JARVIS fonctionne correctement sur ce PC' -ForegroundColor Gray
+    Write-Host '   [3] Auto-test      ~1-5 min    vérifie que JARVIS fonctionne correctement sur ce PC' -ForegroundColor Gray
     $upd = Get-JarvisUpdateResult $script:UpdateCheck 3000
     $showU = ($upd.Status -eq 'NEW')
     if ($showU) {
@@ -5481,30 +6391,164 @@ foreach ($t in $topErr) { Write-Sub ("{0,-40} {1,4}" -f (Cut $t.Name 40), $t.Cou
 # ==================================================================
 Write-Section '11' 'Nettoyage'
 
-$tUser = Get-FolderSizeMB $env:TEMP
-if (-not (Test-SafeTempPath $env:TEMP)) {
+# Chaque cible est mesurée ici ; seules celles qui peuvent vraiment être nettoyées sont proposées en fin de
+# scan, une question par cible (Get-CleanProposal), et le total « récupérable » ne compte qu'elles.
+$cleanPaths = Get-CleanTargetPaths
+$script:CleanTargets = @()
+# Élévation sous un autre compte (enfant aidé par un parent) : %TEMP%, corbeille et vidages d'applications sont
+# ceux du compte qui a validé les droits admin. Sa corbeille n'est jamais proposée : ses fichiers ne sont pas les tiens.
+$script:CleanUser = $null
+if (-not (Test-SameAccount ([string](Get-CimInstance Win32_ComputerSystem).UserName) ([Environment]::UserName))) {
+    $script:CleanUser = [Environment]::UserName
+}
+
+# --- Fichiers temporaires : seuls ceux de plus de 24 h sont proposés (un fichier récent sert peut-être encore)
+$tmpUser = $null
+if (Test-SafeTempPath $env:TEMP) {
+    $tmpUser = Measure-AgedFiles $env:TEMP 24
+    Write-Status 'Temp utilisateur (%TEMP%)' (Format-AgedText $tmpUser 'de plus de 24 h') 'INFO'
+} else {
     Write-Status 'Variable %TEMP% anormale' (Cut $env:TEMP 40) 'WARN'
     Write-Sub 'Nettoyage désactivé pour ce dossier par sécurité'
-    $tUser = 0
 }
-$tWin  = Get-FolderSizeMB (Join-Path $env:windir 'Temp')
-$tWU   = Get-FolderSizeMB (Join-Path $env:windir 'SoftwareDistribution\Download')
-$rbMB  = 0
-try {
-    $shell = New-Object -ComObject Shell.Application
-    $rbSum = ($shell.Namespace(10).Items() | Measure-Object -Property Size -Sum).Sum
-    if ($rbSum) { $rbMB = [math]::Round($rbSum / 1MB) }
-} catch {}
+$tmpWin = Measure-AgedFiles (Join-Path $env:windir 'Temp') 24
+$twTxt = Format-AgedText $tmpWin 'de plus de 24 h'
+if (-not $tmpWin.Ok -and -not $isAdmin) { $twTxt = 'lecture impossible sans droits admin' }
+Write-Status 'Temp Windows' $twTxt 'INFO'
+$tmpAged = [int64]0
+$tmpOk = $false
+foreach ($m in @($tmpUser, $tmpWin)) { if ($null -ne $m -and $m.Ok) { $tmpAged += $m.AgedBytes; $tmpOk = $true } }
+$script:CleanTargets += New-CleanTarget 'Temp' 'Fichiers temporaires de plus de 24 h' $tmpAged $tmpOk $false
 
-Write-Status 'Temp utilisateur (%TEMP%)' ("{0:N0} Mo" -f $tUser) 'INFO'
-Write-Status 'Temp Windows' ("{0:N0} Mo" -f $tWin) 'INFO'
-Write-Status 'Cache Windows Update' ("{0:N0} Mo" -f $tWU) 'INFO'
-Write-Status 'Corbeille' ("{0:N0} Mo" -f $rbMB) 'INFO'
-$script:TempMB = $tUser + $tWin
-$all = $tUser + $tWin + $tWU + $rbMB
-if ($all -gt 5120) { Write-Status 'Espace récupérable' ("{0:N1} Go" -f ($all / 1024)) 'WARN' }
-elseif (-not $isAdmin) { Write-Status 'Espace récupérable' ("{0:N1} Go  (mesure partielle sans droits admin)" -f ($all / 1024)) 'INFO' }
-else { Write-Status 'Espace récupérable' ("{0:N1} Go" -f ($all / 1024)) 'OK' }
+# --- Corbeille
+$rb = Get-RecycleBinState
+if ($rb.Ok) { Write-Status 'Corbeille' ('{0}  ({1} élément(s))' -f (Format-Bytes $rb.Bytes), $rb.Count) 'INFO' }
+else { Write-Status 'Corbeille' 'lecture impossible' 'INFO' }
+$rbWhy = ''
+if ($script:CleanUser) {
+    $rbWhy = 'autre compte'
+    if ($rb.Ok -and $rb.Count -gt 0) { Write-Sub ('Corbeille du compte ' + $script:CleanUser + ' : JARVIS ne propose pas de la vider') }
+}
+$script:CleanTargets += New-CleanTarget 'RecycleBin' 'Corbeille' $rb.Bytes $rb.Ok $false $rbWhy
+
+# --- Cache Windows Update : vidé seulement si aucune mise à jour n'attend un redémarrage ni ne s'installe
+# TiWorker n'est pas regardé ici : la recherche de mises à jour de la section 02 vient de le réveiller pour
+# environ 2 minutes (relevé le 19/11/2026), il bloquait donc chaque scan. Il est attendu juste avant la question.
+$svcWhy = ''
+if ($isAdmin) {
+    $svcBusy = Get-WuBusyState
+    $svcWhy = Get-ServicingBlocker $svcBusy.RebootPending $false $svcBusy.InstallerBusy
+}
+$wuM = Measure-AgedFiles $cleanPaths['WuCache'] 0
+Write-Status 'Cache Windows Update' (Format-AgedText $wuM '') 'INFO'
+if ($wuM.Link) { Write-Sub 'Dossier déplacé par un lien : JARVIS n''y touche pas' }
+elseif ($svcWhy -and $wuM.Ok -and $wuM.TotalBytes -ge $CleanMinBytes) { Write-Sub ('Pas de nettoyage maintenant : ' + $svcWhy) }
+$script:CleanTargets += New-CleanTarget 'WuCache' 'Cache Windows Update' $wuM.TotalBytes ($wuM.Ok -and -not $wuM.Link) $true $svcWhy
+
+# --- Optimisation de livraison
+$doS = Get-DoCacheState
+if ($doS.Ok) {
+    Write-Status 'Optimisation de livraison' (Format-DoSize $doS) 'INFO'
+    if ($doS.Bytes -ge $CleanMinBytes) { Write-Sub 'Copies de mises à jour déjà téléchargées ; Windows les retire de lui-même après quelques jours' }
+} else {
+    Write-Status 'Optimisation de livraison' 'lecture impossible' 'INFO'
+}
+$doWhy = ''
+if ($null -eq $doS.Busy) { $doWhy = 'état des téléchargements illisible' }
+elseif ($doS.Busy) { $doWhy = 'téléchargement en cours' }
+$doT = New-CleanTarget 'DoCache' 'Cache de l''optimisation de livraison' $doS.Bytes $doS.Ok $true $doWhy
+$doT.MinBytes = $CleanMinDoBytes
+$script:CleanTargets += $doT
+
+# --- Vidages mémoire de plus de 30 jours. Ceux de Windows (écrans bleus) sont gardés s'il y a eu un écran bleu
+# ces 7 derniers jours, ou si ce journal n'a pas pu être lu (section 10) : ils servent au diagnostic.
+$script:KeepSysDumps = (-not $bsodRead.Ok) -or (@($bsodRead.Events).Count -gt 0)
+$dApp = Measure-AgedFiles $cleanPaths['CrashDumps'] 720 '.dmp'
+$dSys = @((Measure-AgedFiles $cleanPaths['Minidump'] 720 '.dmp'), (Measure-AgedFiles $cleanPaths['MemoryDump'] 720 '.dmp'))
+$dSysBytes = [int64]0
+$dSysOk = $true
+foreach ($m in $dSys) { if ($m.Ok) { $dSysBytes += $m.AgedBytes } else { $dSysOk = $false } }
+$dShown = $dSysBytes
+if ($dApp.Ok) { $dShown += $dApp.AgedBytes }
+if ($dApp.Ok -or $dSysOk) { Write-Status 'Vidages mémoire de plus de 30 j' (Format-Bytes $dShown) 'INFO' }
+else { Write-Status 'Vidages mémoire de plus de 30 j' 'lecture impossible' 'INFO' }
+$dProp = [int64]0
+if ($dApp.Ok) { $dProp += $dApp.AgedBytes }
+if ($dSysBytes -gt 0) {
+    if ($script:KeepSysDumps -and $bsodRead.Ok) { Write-Sub 'Vidages de Windows conservés : écran bleu ces 7 derniers jours, utiles au diagnostic' }
+    elseif ($script:KeepSysDumps) { Write-Sub 'Vidages de Windows conservés : journal des écrans bleus illisible' }
+    elseif ($isAdmin) { $dProp += $dSysBytes }
+    else { Write-Sub ('Vidages de Windows (' + (Format-Bytes $dSysBytes) + ') : droits admin nécessaires pour les supprimer') }
+}
+$script:CleanTargets += New-CleanTarget 'Dumps' 'Vidages mémoire de plus de 30 jours' $dProp ($dApp.Ok -or $dSysOk) $false
+
+# --- Composants Windows (scan complet) : DISM dit si un nettoyage est utile
+if ($script:DeepMode) {
+    $script:ComponentInfo = Invoke-ComponentAnalysis
+    $ci = $script:ComponentInfo
+    if ($null -eq $ci) {
+        Write-Status 'Composants Windows (WinSxS)' 'analyse impossible' 'INFO'
+    } elseif ($ci.Code -ne 0 -and (Get-ComponentCleanupVerdict '' $ci.Code) -eq 'PENDING') {
+        Write-Status 'Composants Windows (WinSxS)' 'analyse impossible : mises à jour en attente' 'INFO'
+        Write-Sub 'Redémarre le PC puis relance un scan complet.'
+    } elseif ($ci.Code -ne 0) {
+        Write-Status 'Composants Windows (WinSxS)' ('analyse impossible (code 0x{0:X8})' -f [int]$ci.Code) 'INFO'
+        Write-Sub 'Détails : C:\Windows\Logs\DISM\dism.log'
+    } elseif ($ci.Recommended -eq 'YES') {
+        $ciTxt = 'nettoyage conseillé par Windows'
+        if ($null -ne $ci.Reclaimable) { $ciTxt += (' ({0} paquet(s) remplacé(s))' -f $ci.Reclaimable) }
+        Write-Status 'Composants Windows (WinSxS)' $ciTxt 'INFO'
+        # Sauvegardes de composants remplacés : le nettoyage ne peut pas libérer plus. Trop peu : pas de question
+        # (Windows fait aussi ce nettoyage de lui-même, par une tâche planifiée).
+        if ($null -ne $ci.BackupBytes -and $ci.BackupBytes -lt $CleanMinBytes) {
+            Write-Sub ('Gain trop faible pour être proposé : ' + (Format-Bytes $ci.BackupBytes) + ' au plus')
+        } else {
+            $script:CleanTargets += New-CleanTarget 'Components' 'Anciens composants de Windows' 0 $true $true $svcWhy $true
+            if ($svcWhy) { Write-Sub ('Pas de nettoyage maintenant : ' + $svcWhy) }
+        }
+    } elseif ($ci.Recommended -eq 'NO') {
+        Write-Status 'Composants Windows (WinSxS)' 'aucun nettoyage nécessaire' 'OK'
+    } else {
+        Write-Status 'Composants Windows (WinSxS)' 'résultat non reconnu' 'INFO'
+        Write-Sub 'Détails : C:\Windows\Logs\DISM\dism.log'
+    }
+    if ($null -ne $ci -and $null -ne $ci.ActualBytes) { Write-Sub ('Taille réelle : ' + (Format-Bytes $ci.ActualBytes)) }
+}
+
+# --- Windows.old : mesuré seulement, le retirer empêche de revenir à la version précédente de Windows
+$script:WinOld = $false
+$woPath = $null
+try { $woPath = Join-Path ([IO.Path]::GetPathRoot([Environment]::GetFolderPath('Windows'))) 'Windows.old' } catch { $woPath = $null }
+$wo = $null
+if ($woPath) { try { $wo = Get-Item -LiteralPath $woPath -Force -ErrorAction Stop } catch { $wo = $null } }
+if ($wo -and $wo.PSIsContainer -and -not ($wo.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    $wm = Measure-FolderBounded $woPath 15
+    $woTxt = Format-Bytes $wm.Bytes
+    if (-not $wm.Complete) { $woTxt = 'au moins ' + $woTxt }
+    Write-Status 'Windows.old (version précédente)' ('{0}, depuis le {1}' -f $woTxt, (Format-Date $wo.CreationTime)) 'INFO'
+    Write-Sub 'Le supprimer empêche de revenir à la version précédente de Windows.'
+    if ($wo.CreationTime -gt (Get-Date).AddDays(-10)) {
+        # Délai habituel de retour en arrière après une mise à niveau : JARVIS n'oriente pas vers la suppression
+        Write-Sub 'Mise à niveau récente : garde-le au moins 10 jours, le temps de vérifier que tout fonctionne.'
+    } else {
+        $script:WinOld = $true
+        Write-Sub 'Pour le retirer : Paramètres > Système > Stockage > Fichiers temporaires.'
+    }
+}
+
+# --- Total : seulement ce qui sera proposé
+$cleanProp = Get-CleanProposal $script:CleanTargets $CleanMinBytes $isAdmin
+$allTxt = Format-Bytes $cleanProp.Bytes
+if (@($cleanProp.Items | Where-Object { $_.Key -eq 'Components' }).Count -gt 0) { $allTxt += ' + composants Windows' }
+$unread = @($script:CleanTargets | Where-Object { -not $_.Ok }).Count
+if ($cleanProp.Bytes -gt 5GB) { Write-Status 'Espace récupérable' $allTxt 'WARN' }
+elseif (-not $isAdmin) { Write-Status 'Espace récupérable' ($allTxt + '  (sans droits admin)') 'INFO' }
+elseif ($unread -gt 0) { Write-Status 'Espace récupérable' ($allTxt + '  (certaines mesures impossibles)') 'INFO' }
+else { Write-Status 'Espace récupérable' $allTxt 'OK' }
+if (-not $isAdmin) { Write-Sub 'Sans droits admin, seuls %TEMP%, la corbeille et les vidages d''applications sont proposés' }
+if ($script:CleanUser) {
+    Write-Sub ('%TEMP% et vidages d''applications : ceux du compte ' + $script:CleanUser + ', pas de ta session')
+}
 
 # ==================================================================
 # [12] BIOS
@@ -5822,14 +6866,23 @@ if ($script:WUCount -gt 0) {
     if ($a -eq '1' -and $isAdmin) { Install-WindowsUpdates }
     elseif ($a -eq '2') { Open-WindowsUpdateGuided }
 }
-if ($script:TempMB -gt 500) {
-    if (Read-YesNo ("   >> Nettoyer les fichiers temporaires de plus de 24 h ({0:N0} Mo au total) ?" -f $script:TempMB)) {
-        $tot = 0
-        foreach ($p in @($env:TEMP, (Join-Path $env:windir 'Temp'))) {
-            $r = Clear-TempFolder $p 24
-            if ($r.Ok) { $tot += $r.FreedMB } else { Write-Host ('   [!] ' + $r.Reason) -ForegroundColor Yellow }
-        }
-        Write-Action 'OK' ("Nettoyage : {0:N0} Mo libérés (fichiers récents ou verrouillés conservés)" -f $tot)
+$cleanProp = Get-CleanProposal $script:CleanTargets $CleanMinBytes $isAdmin
+if (@($cleanProp.Items).Count -gt 0) {
+    Write-Host ''
+    $cpTxt = Format-Bytes $cleanProp.Bytes
+    if (@($cleanProp.Items | Where-Object { $_.Key -eq 'Components' }).Count -gt 0) { $cpTxt += ' + composants Windows' }
+    Write-Host ('   NETTOYAGE : ' + $cpTxt + ' récupérables') -ForegroundColor Cyan
+    Write-Host '   Suppressions définitives : une question par élément, réponse par défaut non.' -ForegroundColor DarkGray
+    foreach ($t in @($cleanProp.Items)) { Invoke-CleanTarget $t }
+}
+if ($script:WinOld) {
+    Write-Host ''
+    Write-Host '   [i] Windows.old : ancienne version de Windows, gardée pour pouvoir y revenir. J.A.R.V.I.S. n''y touche pas.' -ForegroundColor DarkGray
+    if (Read-YesNo '   >> Ouvrir Paramètres > Stockage pour le retirer toi-même ?') {
+        Write-Host '   Dans la fenêtre qui s''ouvre : Fichiers temporaires, coche « Installation(s) précédente(s) de Windows »,' -ForegroundColor Cyan
+        Write-Host '   puis « Supprimer les fichiers ». Après cela, revenir à la version précédente ne sera plus possible.' -ForegroundColor Cyan
+        try { Start-Process 'ms-settings:storagesense' -ErrorAction Stop }
+        catch { Write-Host '   [!] Ouverture impossible : Démarrer > Paramètres > Système > Stockage.' -ForegroundColor Yellow }
     }
 }
 
