@@ -1,5 +1,5 @@
 ﻿<#
-    J.A.R.V.I.S. // Check-up système v3.16
+    J.A.R.V.I.S. // Check-up système v3.17
     -----------------------------------------------------------------
     Modules :
       [01] Système        : version Windows, uptime, redémarrage en attente
@@ -97,7 +97,7 @@ param(
 # ------------------------------------------------------------------
 # Identité du programme et emplacement
 # ------------------------------------------------------------------
-$JarvisVersion = '3.16'
+$JarvisVersion = '3.17'
 $JarvisSelf = $env:JARVIS_SELF                     # défini par JARVIS.cmd
 if (-not $JarvisSelf) { $JarvisSelf = $PSCommandPath }  # lancement direct du .ps1
 $JarvisHome = $null
@@ -198,6 +198,7 @@ $script:ChkdskFix   = New-Object System.Collections.Generic.List[string]
 $script:DeepMode    = $false
 $script:SpinState   = ''         # fin du dernier Invoke-Spinner : DONE, TIMEOUT, STOPPED ou FAILED
 $script:ConModeSaved = $null     # mode de la console au lancement (sélection à la souris remise en partant)
+$script:ConFontSaved = $null     # police de l'ancienne console au lancement, quand JARVIS l'a agrandie
 $script:StoreItems  = @()        # applications du Microsoft Store à mettre à jour (Pfn, Name)
 
 # ------------------------------------------------------------------
@@ -227,7 +228,7 @@ function Show-Banner {
         foreach ($l in $plain) { Write-Host $l -ForegroundColor Cyan; Pause-Ms 70 }
         Write-Host ''
         Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-        Write-Host '      module check-up v3.16' -ForegroundColor DarkGray
+        Write-Host '      module check-up v3.17' -ForegroundColor DarkGray
         Write-Host ''
         return
     }
@@ -247,7 +248,7 @@ function Show-Banner {
     }
     Write-Host ''
     Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-    Write-Host '      module check-up v3.16' -ForegroundColor DarkGray
+    Write-Host '      module check-up v3.17' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -1287,6 +1288,37 @@ function Get-RestoredPlacement($Rect, [int]$WorkLeft, [int]$WorkTop, [int]$WorkR
     return [pscustomobject]@{ X = $x; Y = $y; W = $w; H = $h }
 }
 
+function Get-ClassicConsolePlacement([int]$CurX, [int]$CurY, [int]$CurW, [int]$CurH, [int]$WorkLeft, [int]$WorkTop, [int]$WorkRight, [int]$WorkBottom) {
+    # Ancienne console de Windows ouverte sans fenêtre précédente à reprendre (raccourci lancé en administrateur) :
+    # mêmes proportions que la fenêtre validée par Thomas pendant les essais du 19/11/2026 (1 200 x 1 053 pixels
+    # pour une zone libre de 2 560 x 1 392), jamais plus petite que la fenêtre actuelle, toujours dans l'écran.
+    # $null s'il n'y a rien à faire. Fonction pure, testée en T1.
+    $ww = $WorkRight - $WorkLeft
+    $wh = $WorkBottom - $WorkTop
+    if ($ww -le 0 -or $wh -le 0 -or $CurW -le 0 -or $CurH -le 0) { return $null }
+    $w = [int][math]::Round($ww * 1200 / 2560)
+    $h = [int][math]::Round($wh * 1053 / 1392)
+    if ($w -lt $CurW) { $w = $CurW }
+    if ($h -lt $CurH) { $h = $CurH }
+    if ($w -eq $CurW -and $h -eq $CurH) { return $null }
+    return (Get-RestoredPlacement ([pscustomobject]@{ X = $CurX; Y = $CurY; W = $w; H = $h }) $WorkLeft $WorkTop $WorkRight $WorkBottom)
+}
+
+function Get-ConsoleFontPlan([int]$CurrentHeight, [int]$Family, [string]$Face) {
+    # Police à essayer dans l'ancienne console : nom, famille et hauteurs, de la plus grande à la plus petite, ou
+    # $null s'il n'y a rien à faire. 20 pixels donne à peu près l'affichage de Windows Terminal (mesuré le
+    # 19/11/2026 dans une fenêtre de 1 200 x 1 053 : Consolas 16 = 145 x 63, 18 = 145 x 56, 20 = 129 x 50).
+    # Police bitmap (bit 0x4 de la famille absent) : c'est « Terminal » 8 x 12 que l'ancienne console prend après
+    # le « chcp 65001 » de JARVIS.cmd (relevé le 19/11/2026), d'où des lettres minuscules ; elle est remplacée
+    # par Consolas, présente sur tout Windows. Police TrueType : même police, seulement plus grande.
+    # Fonction pure, testée en T1.
+    if ($CurrentHeight -le 0) { return $null }
+    if (($Family -band 0x4) -eq 0) { return [pscustomobject]@{ Face = 'Consolas'; Family = 0x36; Heights = @(20, 18, 16) } }
+    $hs = @(@(20, 18) | Where-Object { $_ -gt $CurrentHeight })
+    if ($hs.Count -eq 0) { return $null }
+    return [pscustomobject]@{ Face = $Face; Family = $Family; Heights = $hs }
+}
+
 function Initialize-NativeWin {
     # Fonctions de Windows pour lire et placer la fenêtre (chargées une seule fois)
     if ('JarvisNative.Win' -as [type]) { return $true }
@@ -1306,6 +1338,11 @@ function Initialize-NativeWin {
 [DllImport("user32.dll")] public static extern IntPtr MonitorFromPoint(POINT pt, uint flags);
 [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr hmon, ref MONITORINFO mi);
 [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hwnd, System.Text.StringBuilder name, int max);
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] public struct FONTEX { public uint cbSize; public uint nFont; public short Width; public short Height; public int Family; public int Weight; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string Face; }
+[DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int which);
+[DllImport("kernel32.dll")] public static extern bool GetCurrentConsoleFontEx(IntPtr h, bool maxWindow, ref FONTEX font);
+[DllImport("kernel32.dll")] public static extern bool SetCurrentConsoleFontEx(IntPtr h, bool maxWindow, ref FONTEX font);
 '@
         return $true
     } catch { return $false }
@@ -1357,6 +1394,79 @@ function Set-ConsoleRect([string]$Text) {
         # 0x14 : ordre d'empilement inchangé, fenêtre non activée
         return [JarvisNative.Win]::SetWindowPos($win, [IntPtr]::Zero, $pl.X, $pl.Y, $pl.W, $pl.H, 0x14)
     } catch { return $false }
+}
+
+function Set-ConsoleClassicSize {
+    # Ancienne console de Windows (classe ConsoleWindowClass). Windows Terminal ne s'ouvre pas pour une application
+    # lancée en administrateur : les raccourcis de JARVIS ouvrent donc cette console, à ses réglages d'origine
+    # (relevé le 19/11/2026 : 993 x 639 pixels, que Set-ConsoleTall laissait tels quels). Elle prend les proportions
+    # de la fenêtre des essais (Get-ClassicConsolePlacement). $false si ce n'est pas elle ou si rien n'a été fait.
+    try {
+        $win = Get-JarvisWindow
+        if ($win -eq [IntPtr]::Zero) { return $false }
+        $cls = New-Object System.Text.StringBuilder 64
+        $null = [JarvisNative.Win]::GetClassName($win, $cls, 64)
+        if ($cls.ToString() -ne 'ConsoleWindowClass') { return $false }
+        $wr = New-Object JarvisNative.Win+RECT
+        if (-not [JarvisNative.Win]::GetWindowRect($win, [ref]$wr)) { return $false }
+        $mi = New-Object JarvisNative.Win+MONITORINFO
+        $mi.cbSize = [Runtime.InteropServices.Marshal]::SizeOf($mi)
+        if (-not [JarvisNative.Win]::GetMonitorInfo([JarvisNative.Win]::MonitorFromWindow($win, 2), [ref]$mi)) { return $false }
+        $pl = Get-ClassicConsolePlacement $wr.Left $wr.Top ($wr.Right - $wr.Left) ($wr.Bottom - $wr.Top) $mi.rcWork.Left $mi.rcWork.Top $mi.rcWork.Right $mi.rcWork.Bottom
+        if ($null -eq $pl) { return $false }
+        # 0x14 : ordre d'empilement inchangé, fenêtre non activée
+        return [JarvisNative.Win]::SetWindowPos($win, [IntPtr]::Zero, $pl.X, $pl.Y, $pl.W, $pl.H, 0x14)
+    } catch { return $false }
+}
+
+function Set-ConsoleFontBigger {
+    # Ancienne console seulement (demande de Thomas le 19/11/2026 : « la taille de la police un poil plus grande ») :
+    # police agrandie pour cette fenêtre (rien n'est changé dans les réglages de Windows), la fenêtre gardant sa
+    # taille. Une taille est gardée si JARVIS dispose encore d'au moins 110 colonnes, sinon la suivante est essayée,
+    # sinon la police d'origine est remise. La police d'origine est retenue pour être remise en partant.
+    try {
+        $win = Get-JarvisWindow
+        if ($win -eq [IntPtr]::Zero) { return $false }
+        $cls = New-Object System.Text.StringBuilder 64
+        $null = [JarvisNative.Win]::GetClassName($win, $cls, 64)
+        if ($cls.ToString() -ne 'ConsoleWindowClass') { return $false }
+        $out = [JarvisNative.Win]::GetStdHandle(-11)
+        $orig = New-Object JarvisNative.Win+FONTEX
+        $orig.cbSize = [Runtime.InteropServices.Marshal]::SizeOf($orig)
+        if (-not [JarvisNative.Win]::GetCurrentConsoleFontEx($out, $false, [ref]$orig)) { return $false }
+        $plan = Get-ConsoleFontPlan $orig.Height $orig.Family $orig.Face
+        if ($null -eq $plan) { return $false }
+        $wr = New-Object JarvisNative.Win+RECT
+        if (-not [JarvisNative.Win]::GetWindowRect($win, [ref]$wr)) { return $false }
+        $script:ConFontSaved = $orig
+        $steps = @($plan.Heights | ForEach-Object { [pscustomobject]@{ Face = $plan.Face; Family = $plan.Family; Width = 0; Height = $_; Last = $false } })
+        $steps += [pscustomobject]@{ Face = $orig.Face; Family = $orig.Family; Width = $orig.Width; Height = [int]$orig.Height; Last = $true }
+        foreach ($s in $steps) {
+            # Structure neuve à chaque essai : la police d'origine retenue ne doit jamais être modifiée
+            $f = New-Object JarvisNative.Win+FONTEX
+            $f.cbSize = $orig.cbSize; $f.Family = $s.Family; $f.Weight = $orig.Weight; $f.Face = $s.Face
+            $f.Width = [int16]$s.Width
+            $f.Height = [int16]$s.Height
+            if (-not [JarvisNative.Win]::SetCurrentConsoleFontEx($out, $false, [ref]$f)) { continue }
+            # La console garde ses colonnes et ses lignes en changeant de police : la fenêtre reprend sa taille
+            $null = [JarvisNative.Win]::SetWindowPos($win, [IntPtr]::Zero, $wr.Left, $wr.Top, ($wr.Right - $wr.Left), ($wr.Bottom - $wr.Top), 0x14)
+            Start-Sleep -Milliseconds 100
+            if ($s.Last) { $script:ConFontSaved = $null; return $false }
+            if ([Console]::WindowWidth -ge 110) { return $true }
+        }
+        return $false
+    } catch { return $false }
+}
+
+function Restore-ConsoleFont {
+    # Police d'origine remise en partant (utile si JARVIS a été lancé dans une console déjà ouverte)
+    if ($null -eq $script:ConFontSaved) { return }
+    try {
+        $o = $script:ConFontSaved
+        $f = New-Object JarvisNative.Win+FONTEX
+        $f.cbSize = $o.cbSize; $f.Family = $o.Family; $f.Weight = $o.Weight; $f.Face = $o.Face; $f.Width = $o.Width; $f.Height = $o.Height
+        $null = [JarvisNative.Win]::SetCurrentConsoleFontEx([JarvisNative.Win]::GetStdHandle(-11), $false, [ref]$f)
+    } catch { $script:ConFontSaved = $null }
 }
 
 function Set-ConsoleTall {
@@ -4397,6 +4507,33 @@ function Invoke-SelfTestAnalyzers {
         Assert-True ($null -eq (Get-RestoredPlacement $null 0 0 2560 1400)) 'texte illisible accepté'
         '9/9 cas'
     }
+    Test-Case 'Fenêtre : ancienne console aux proportions des essais' {
+        # Relevé du PC de Thomas : raccourci administrateur, 993 x 639 à (1304,340), zone libre 2 560 x 1 392
+        $p = Get-ClassicConsolePlacement 1304 340 993 639 0 0 2560 1392
+        Assert-True ($null -ne $p -and $p.W -eq 1200 -and $p.H -eq 1053 -and $p.X -eq 1304 -and $p.Y -eq 339) ('écran de Thomas : {0} {1} {2} {3}' -f $p.X, $p.Y, $p.W, $p.H)
+        # Écran 1920 x 1080 : hauteur proportionnelle, largeur actuelle gardée (jamais rétrécie)
+        $q = Get-ClassicConsolePlacement 200 150 993 639 0 0 1920 1040
+        Assert-True ($null -ne $q -and $q.W -eq 993 -and $q.H -eq 787 -and $q.Y -eq 150) ('écran 1920 : {0} {1} {2} {3}' -f $q.X, $q.Y, $q.W, $q.H)
+        # Petit portable 1366 x 768 : la fenêtre d'origine est déjà plus grande que les proportions, rien à faire
+        Assert-True ($null -eq (Get-ClassicConsolePlacement 100 50 993 639 0 0 1366 728)) 'fenêtre rétrécie sur un petit écran'
+        Assert-True ($null -eq (Get-ClassicConsolePlacement 0 0 993 639 0 0 0 0)) 'écran illisible accepté'
+        # Second écran à gauche (coordonnées négatives) : la fenêtre reste dans sa zone
+        $r = Get-ClassicConsolePlacement -1800 900 993 639 -2560 0 0 1392
+        Assert-True ($null -ne $r -and $r.X + $r.W -le 0 -and $r.Y + $r.H -le 1392) ('second écran : {0} {1} {2} {3}' -f $r.X, $r.Y, $r.W, $r.H)
+        '5/5 cas'
+    }
+    Test-Case 'Console : police essayée' {
+        # Relevés du 19/11/2026 : « Terminal » 8 x 12, famille 0x30 (bitmap) après chcp 65001 ; Consolas 16, famille 0x36
+        $b = Get-ConsoleFontPlan 12 0x30 'Terminal'
+        Assert-True ($null -ne $b -and $b.Face -eq 'Consolas' -and $b.Family -eq 0x36 -and (@($b.Heights) -join ',') -eq '20,18,16') 'police bitmap : Consolas 20, 18, 16 attendus'
+        $c = Get-ConsoleFontPlan 16 0x36 'Consolas'
+        Assert-True ($null -ne $c -and $c.Face -eq 'Consolas' -and (@($c.Heights) -join ',') -eq '20,18') 'Consolas 16 : 20 puis 18 attendus'
+        $d = Get-ConsoleFontPlan 18 0x36 'Lucida Console'
+        Assert-True ($null -ne $d -and $d.Face -eq 'Lucida Console' -and (@($d.Heights) -join ',') -eq '20') 'police TrueType gardée, seulement plus grande'
+        Assert-True ($null -eq (Get-ConsoleFontPlan 20 0x36 'Consolas')) 'police déjà assez grande agrandie'
+        Assert-True ($null -eq (Get-ConsoleFontPlan 0 0x36 'Consolas')) 'police illisible changée'
+        '5/5 cas'
+    }
     Test-Case 'Console : sélection à la souris coupée puis remise' {
         # Mode réel de l'ancienne console de Windows : 0x1F7 (sélection à la souris active)
         Assert-True ((Get-NoQuickEditMode 0x1F7) -eq 0x1B7) ('mode sans sélection mal calculé : 0x{0:X}' -f (Get-NoQuickEditMode 0x1F7))
@@ -5247,7 +5384,11 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 try {
 $placed = $false
 if ($WinRect) { $placed = Set-ConsoleRect $WinRect }
-if (-not $placed) { $null = Set-ConsoleTall }
+if (-not $placed) {
+    $null = Set-ConsoleClassicSize
+    $null = Set-ConsoleFontBigger
+    $null = Set-ConsoleTall
+}
 Clear-Host
 Show-Banner
 if ($Name) { $Name = [string](Get-SafeName $Name) }
@@ -6992,6 +7133,7 @@ Read-Answer '   [Entrée pour fermer]' | Out-Null
 } finally {
     try { [Console]::TreatControlCAsInput = $false } catch {}
     $null = Set-QuickEdit $false
+    Restore-ConsoleFont
     $null = Set-NoSleep $false
     if ($script:JarvisMutex) { try { $script:JarvisMutex.ReleaseMutex() } catch {} }
 }
