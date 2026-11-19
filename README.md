@@ -1,6 +1,6 @@
 # J.A.R.V.I.S.
 
-**Check-up et mise à jour de Windows en un seul fichier**, avec une interface terminal façon « hacker » : logo ASCII, barres de progression, statuts `[ OK ]` `[WARN]` `[FAIL]` `[INFO]`.
+**Check-up et mise à jour de Windows en un seul fichier**, avec une interface en mode terminal : logo ASCII, barres de progression, statuts `[ OK ]` `[WARN]` `[FAIL]` `[INFO]`.
 
 JARVIS contrôle l'état du PC (mises à jour, pilotes, sécurité, disques, journaux d'erreurs…), explique ce qu'il trouve en français et propose les corrections. **Rien n'est modifié sans ta confirmation.**
 
