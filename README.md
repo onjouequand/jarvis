@@ -26,7 +26,7 @@ Lien permanent, il donne toujours la dernière version publiée. Toutes les vers
 | 08 | Ressources | processeur, mémoire, programmes gourmands, démarrage, batterie |
 | 09 | Réseau | passerelle, latence Internet, DNS |
 | 10 | Journaux (7 jours) | arrêts brutaux, écrans bleus, erreurs matérielles et disque |
-| 11 | Nettoyage | fichiers temporaires, corbeille, caches de Windows Update et de l'optimisation de livraison, vidages mémoire de plus de 30 jours, anciens composants de Windows (scan complet), dossier Windows.old (mesuré seulement) |
+| 11 | Nettoyage | fichiers temporaires, corbeille, caches de Windows Update et de l'optimisation de livraison, vidages mémoire de plus de 30 jours, anciens composants de Windows (scan complet, seulement si le nettoyage automatique de Windows ne passe plus), dossier Windows.old (mesuré seulement) |
 | 12 | BIOS | carte mère, version et date, page de support du fabricant (JARVIS n'installe pas de BIOS) |
 | 13 | Intégrité (scan complet) | DISM, SFC /scannow, CHKDSK |
 

@@ -1,6 +1,6 @@
 <# : JARVIS.cmd - fichier hybride batch + PowerShell. Ne pas modifier ce fichier.
 @echo off
-rem JARVIS-SHA256=1a36f186093ce17e527d0c820d5c8a5c23850021b010b9f6eab3b3b0bbfdfc72
+rem JARVIS-SHA256=1d4ac1f7c8db1f5f8c81ddfe76d84a5fcdd53a55b592402cca96fcfacdaf1ed6
 setlocal
 chcp 65001 >nul
 set "JARVIS_SELF=%~f0"
@@ -2449,6 +2449,50 @@ function Get-ComponentCleanupVerdict([string]$Text, $Code) {
     return 'UNKNOWN'
 }
 
+function Get-CleanupTaskVerdict($State, $LastRun, $LastResult, $Deadline, [datetime]$Now) {
+    # État de la tâche de Windows qui nettoie les composants (\Microsoft\Windows\Servicing\StartComponentCleanup).
+    # Relevé sur le PC de Thomas le 19/11/2026 : maintenance automatique tous les 7 jours (Period P7D), rattrapage
+    # forcé au bout de 14 (Deadline P14D). OK ou RUNNING : Windows fait ce nettoyage lui-même. DISABLED, NEVER,
+    # FAILED, LATE (pas de passage réussi depuis plus que son propre délai de rattrapage) : il ne le fait pas.
+    # UNKNOWN : lecture impossible. Fonction pure, testée en T1.
+    if ($null -eq $State -or [string]::IsNullOrWhiteSpace([string]$State)) { return 'UNKNOWN' }
+    if ([string]$State -eq 'Disabled') { return 'DISABLED' }
+    if ([string]$State -eq 'Running') { return 'RUNNING' }
+    $code = $null
+    if ($null -ne $LastResult) {
+        $v = [int64]$LastResult
+        if ($v -lt 0) { $v += 4294967296 }           # code rendu en entier signé
+        $code = '{0:X8}' -f $v
+    }
+    if ($code -eq '00041303') { return 'NEVER' }    # la tâche n'a encore jamais tourné
+    if ($code -eq '00041301') { return 'RUNNING' }  # en cours d'exécution
+    if ($null -eq $LastRun) { return 'NEVER' }
+    $lr = $null
+    try { $lr = [datetime]$LastRun } catch { return 'UNKNOWN' }
+    if ($lr.Year -lt 2000) { return 'NEVER' }       # date vide du planificateur (30/11/1999)
+    if ($null -eq $code) { return 'UNKNOWN' }
+    if ($code -ne '00000000') { return 'FAILED' }
+    if ($null -eq $Deadline) { return 'UNKNOWN' }
+    if (($Now - $lr) -gt [TimeSpan]$Deadline) { return 'LATE' }
+    return 'OK'
+}
+
+function Get-CleanupTaskState {
+    # Lecture, sans droits admin, de la tâche de Windows qui nettoie les composants. State = $null : illisible.
+    $r = [pscustomobject]@{ State = $null; LastRun = $null; LastResult = $null; Deadline = $null; Period = $null }
+    try {
+        $task = Get-ScheduledTask -TaskPath '\Microsoft\Windows\Servicing\' -TaskName 'StartComponentCleanup' -ErrorAction Stop
+        $ms = $task.Settings.MaintenanceSettings
+        if ($ms -and $ms.Deadline) { $r.Deadline = [Xml.XmlConvert]::ToTimeSpan([string]$ms.Deadline) }
+        if ($ms -and $ms.Period) { $r.Period = [Xml.XmlConvert]::ToTimeSpan([string]$ms.Period) }
+        $info = Get-ScheduledTaskInfo -InputObject $task -ErrorAction Stop
+        $r.LastRun = $info.LastRunTime
+        $r.LastResult = $info.LastTaskResult
+        $r.State = [string]$task.State
+    } catch { $r.State = $null }
+    return $r
+}
+
 function Invoke-ComponentAnalysis {
     # DISM /AnalyzeComponentStore (lecture seule, droits admin). $null si DISM n'a pas pu tourner jusqu'au bout.
     # Pas de -AskOnTimeout : arrêter une analyse ne touche à rien.
@@ -4472,6 +4516,30 @@ function Invoke-SelfTestAnalyzers {
         Assert-True ((Format-AgedText $m 'de plus de 24 h') -eq 'lecture impossible') 'lecture en échec affichée comme une taille'
         '14/14 cas'
     }
+    Test-Case 'Composants Windows : tâche de nettoyage de Windows' {
+        $now = [datetime]'2026-11-19 18:00'
+        $d14 = [TimeSpan]::FromDays(14)
+        $cases = @(
+            @('Ready', [datetime]'2026-11-16 04:27', 0, $d14, 'OK'),              # relevé du PC de Thomas
+            @('Disabled', [datetime]'2026-11-16 04:27', 0, $d14, 'DISABLED'),
+            @('Running', [datetime]'2026-11-16 04:27', 267009, $d14, 'RUNNING'),
+            @('Ready', [datetime]'2026-11-16 04:27', 267009, $d14, 'RUNNING'),    # 0x41301
+            @('Ready', [datetime]'1999-11-30 00:00', 267011, $d14, 'NEVER'),      # 0x41303
+            @('Ready', [datetime]'1999-11-30 00:00', 0, $d14, 'NEVER'),
+            @('Ready', [datetime]'2026-11-16 04:27', -2147024891, $d14, 'FAILED'),  # 0x80070005 en entier signé
+            @('Ready', [datetime]'2026-11-16 04:27', 2147942405, $d14, 'FAILED'),   # 0x80070005 en entier non signé
+            @('Ready', [datetime]'2026-10-20 04:27', 0, $d14, 'LATE'),
+            @('Ready', [datetime]'2026-11-16 04:27', 0, $null, 'UNKNOWN'),
+            @($null, [datetime]'2026-11-16 04:27', 0, $d14, 'UNKNOWN'),
+            @('Ready', [datetime]'2026-11-16 04:27', $null, $d14, 'UNKNOWN')
+        )
+        foreach ($c in $cases) {
+            $got = Get-CleanupTaskVerdict $c[0] $c[1] $c[2] $c[3] $now
+            Assert-True ($got -eq $c[4]) ('{0} / {1} / {2} -> {3}, attendu {4}' -f $c[0], $c[1], $c[2], $got, $c[4])
+        }
+        Assert-True ([Xml.XmlConvert]::ToTimeSpan('P14D') -eq $d14) 'délai de rattrapage « P14D » mal lu'
+        '{0}/{0} cas' -f ($cases.Count + 1)
+    }
     Test-Case 'Mode ASCII : conversion des glyphes' {
         $got = Convert-Glyph '█░┌─┐…'
         Assert-True ($got -eq '#.+-+...') "obtenu $got"
@@ -4739,6 +4807,14 @@ function Invoke-SelfTest {
             $txt += ', dossier ' + (Format-Bytes $d.Bytes)
         }
         $txt
+    }
+    Test-Case 'Composants Windows : tâche de nettoyage lisible' {
+        $s = Get-CleanupTaskState
+        $v = Get-CleanupTaskVerdict $s.State $s.LastRun $s.LastResult $s.Deadline (Get-Date)
+        Assert-True ($v -ne 'UNKNOWN') 'tâche StartComponentCleanup de Windows illisible'
+        $per = 'inconnue'
+        if ($null -ne $s.Period) { $per = '{0:N0} j' -f $s.Period.TotalDays }
+        ('{0}, dernier passage {1}, période {2}' -f $v, (Format-Date $s.LastRun), $per)
     }
     Test-Case 'Composants Windows : analyse (1-5 min)' {
         $ci = Invoke-ComponentAnalysis
@@ -6482,8 +6558,30 @@ if ($dSysBytes -gt 0) {
 }
 $script:CleanTargets += New-CleanTarget 'Dumps' 'Vidages mémoire de plus de 30 jours' $dProp ($dApp.Ok -or $dSysOk) $false
 
-# --- Composants Windows (scan complet) : DISM dit si un nettoyage est utile
+# --- Composants Windows (scan complet). Windows les nettoie lui-même (tâche StartComponentCleanup de la
+# maintenance automatique) : JARVIS ne regarde plus loin que si cette tâche ne fait pas son travail. Raison : le
+# 19/11/2026, un nettoyage lancé par JARVIS trois jours après celui de Windows a fini en 2 s sans rien retirer
+# (CBS.log : rien de changé depuis le dernier passage, travail sauté).
+$ctask = $null
+$ctv = $null
 if ($script:DeepMode) {
+    $ctask = Get-CleanupTaskState
+    $ctv = Get-CleanupTaskVerdict $ctask.State $ctask.LastRun $ctask.LastResult $ctask.Deadline (Get-Date)
+}
+if ($script:DeepMode -and ($ctv -eq 'OK' -or $ctv -eq 'RUNNING')) {
+    $every = ''
+    if ($null -ne $ctask.Period -and $ctask.Period.TotalDays -ge 1) { $every = ' tous les {0:N0} jours' -f $ctask.Period.TotalDays }
+    Write-Status 'Composants Windows (WinSxS)' ('nettoyés par Windows' + $every) 'OK'
+    if ($ctv -eq 'RUNNING') { Write-Sub 'Nettoyage de Windows en cours en ce moment, rien à faire de ton côté' }
+    else { Write-Sub ('Dernier passage : ' + (Format-Date $ctask.LastRun) + ', rien à faire de ton côté') }
+} elseif ($script:DeepMode) {
+    switch ($ctv) {
+        'DISABLED' { $ctWhy = 'tâche désactivée' }
+        'NEVER'    { $ctWhy = 'tâche jamais lancée' }
+        'FAILED'   { $ctWhy = 'dernier passage en échec ({0})' -f (Format-Date $ctask.LastRun) }
+        'LATE'     { $ctWhy = 'pas de passage réussi depuis le {0}' -f (Format-Date $ctask.LastRun) }
+        default    { $ctWhy = 'état de la tâche illisible' }
+    }
     $script:ComponentInfo = Invoke-ComponentAnalysis
     $ci = $script:ComponentInfo
     if ($null -eq $ci) {
@@ -6498,8 +6596,7 @@ if ($script:DeepMode) {
         $ciTxt = 'nettoyage conseillé par Windows'
         if ($null -ne $ci.Reclaimable) { $ciTxt += (' ({0} paquet(s) remplacé(s))' -f $ci.Reclaimable) }
         Write-Status 'Composants Windows (WinSxS)' $ciTxt 'INFO'
-        # Sauvegardes de composants remplacés : le nettoyage ne peut pas libérer plus. Trop peu : pas de question
-        # (Windows fait aussi ce nettoyage de lui-même, par une tâche planifiée).
+        # Sauvegardes de composants remplacés : le nettoyage ne peut pas libérer plus. Trop peu : pas de question.
         if ($null -ne $ci.BackupBytes -and $ci.BackupBytes -lt $CleanMinBytes) {
             Write-Sub ('Gain trop faible pour être proposé : ' + (Format-Bytes $ci.BackupBytes) + ' au plus')
         } else {
@@ -6513,6 +6610,7 @@ if ($script:DeepMode) {
         Write-Sub 'Détails : C:\Windows\Logs\DISM\dism.log'
     }
     if ($null -ne $ci -and $null -ne $ci.ActualBytes) { Write-Sub ('Taille réelle : ' + (Format-Bytes $ci.ActualBytes)) }
+    Write-Sub ('Nettoyage automatique de Windows : ' + $ctWhy)
 }
 
 # --- Windows.old : mesuré seulement, le retirer empêche de revenir à la version précédente de Windows
