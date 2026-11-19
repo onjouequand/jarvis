@@ -1,6 +1,6 @@
 <# : JARVIS.cmd - fichier hybride batch + PowerShell. Ne pas modifier ce fichier.
 @echo off
-rem JARVIS-SHA256=e5ff60bb7c29b62af42eec2bf7e374181f0b9d7fdfdb36c28ad6d0d9a9e05990
+rem JARVIS-SHA256=daba66174fbe124ddf1dd346c0c4cc586e2f35dbc41b90ceba4030515315705b
 setlocal
 chcp 65001 >nul
 set "JARVIS_SELF=%~f0"
@@ -12,7 +12,7 @@ if "%JARVIS_RC%"=="4" pause
 exit /b %JARVIS_RC%
 #>
 <#
-    J.A.R.V.I.S. // Check-up système v3.11
+    J.A.R.V.I.S. // Check-up système v3.12
     -----------------------------------------------------------------
     Modules :
       [01] Système        : version Windows, uptime, redémarrage en attente
@@ -107,7 +107,7 @@ param(
 # ------------------------------------------------------------------
 # Identité du programme et emplacement
 # ------------------------------------------------------------------
-$JarvisVersion = '3.11'
+$JarvisVersion = '3.12'
 $JarvisSelf = $env:JARVIS_SELF                     # défini par JARVIS.cmd
 if (-not $JarvisSelf) { $JarvisSelf = $PSCommandPath }  # lancement direct du .ps1
 $JarvisHome = $null
@@ -195,6 +195,7 @@ $script:WUCount     = 0
 $script:WUManual    = 0
 $script:WGItems     = @()
 $script:WGCount     = 0
+$script:WGSkipIds   = @()      # applications que winget refuse de mettre à jour (exclues de la vérification)
 $script:TempMB      = 0
 $script:NeedRestore = $false
 $script:ChkdskFix   = New-Object System.Collections.Generic.List[string]
@@ -227,7 +228,7 @@ function Show-Banner {
         foreach ($l in $plain) { Write-Host $l -ForegroundColor Cyan; Pause-Ms 70 }
         Write-Host ''
         Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-        Write-Host '      module check-up v3.11' -ForegroundColor DarkGray
+        Write-Host '      module check-up v3.12' -ForegroundColor DarkGray
         Write-Host ''
         return
     }
@@ -247,7 +248,7 @@ function Show-Banner {
     }
     Write-Host ''
     Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-    Write-Host '      module check-up v3.11' -ForegroundColor DarkGray
+    Write-Host '      module check-up v3.12' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -2497,11 +2498,12 @@ if ($NoWinget) {
     $wgUnknown = ${function:Get-WingetUnknownCount}.ToString()
     $wg = Invoke-Spinner 'Analyse des paquets installés' {
         param($ParserText, $UnknownText)
-        # La liste de référence est celle de « winget upgrade » : c'est elle qui décide de ce que winget
-        # acceptera de mettre à jour. Le module (s'il est là) ne sert qu'à compléter noms, identifiants
-        # et versions tronqués. Constaté le 19/11/2026 : le module annonçait Epson Scan 2 (version
-        # « Unknown », que winget refuse de mettre à jour) et oubliait Hytale Launcher.
-        $out = [pscustomobject]@{ Mode = 'text'; Items = @(); Unknown = 0; UnknownNames = @(); Error = $null }
+        # Liste de départ : « winget upgrade ». Le module (s'il est là) complète noms, identifiants et
+        # versions tronqués, et écarte ce que winget refusera d'installer (IsUpdateAvailable faux).
+        # Constaté le 19/11/2026 : Epson Scan 2 (version « Unknown ») et Hytale Launcher (installé pour
+        # tous les utilisateurs, winget ne propose qu'une installation par utilisateur) étaient proposés
+        # puis refusés par winget ; le module, lui, savait que Hytale n'était pas applicable.
+        $out = [pscustomobject]@{ Mode = 'text'; Items = @(); Unknown = 0; UnknownNames = @(); NotApplicable = @(); Error = $null }
         if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
             $out.Error = 'NOWINGET'
             return $out
@@ -2516,8 +2518,10 @@ if ($NoWinget) {
                 $all = @(Get-WinGetPackage)
                 $out.Mode = 'text+module'
                 $ell = [string][char]0x2026
+                $keep = @()
                 foreach ($it in $out.Items) {
                     $p = $null
+                    $cliId = [string]$it.Id
                     if ($it.Id.EndsWith($ell)) {
                         $pre = $it.Id.TrimEnd([char]0x2026)
                         $p = $all | Where-Object { ([string]$_.Id).StartsWith($pre, [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
@@ -2530,8 +2534,14 @@ if ($NoWinget) {
                         $it.Installed = [string]$p.InstalledVersion
                         $av = [string]($p.AvailableVersions | Select-Object -First 1)
                         if ($av) { $it.Available = $av }
+                        if (-not $p.IsUpdateAvailable) {
+                            $out.NotApplicable += [pscustomobject]@{ Name = $it.Name; Ids = @($it.Id, $cliId) }
+                            continue
+                        }
                     }
+                    $keep += $it
                 }
+                $out.Items = $keep
                 $out.UnknownNames = @($all | Where-Object { $_.IsUpdateAvailable -and [string]$_.InstalledVersion -eq 'Unknown' } |
                                       ForEach-Object { [string]$_.Name })
             }
@@ -2571,6 +2581,12 @@ if ($NoWinget) {
             if (@($wg.UnknownNames).Count -gt 0) { $names = ' : ' + (Cut (@($wg.UnknownNames) -join ', ') 60) }
             Write-Status 'Version non détectable par winget' ([string]$wg.Unknown + $names) 'INFO'
             Write-Sub 'winget ne peut pas les mettre à jour : passe par l''application elle-même ou le site de l''éditeur si besoin'
+        }
+        $script:WGSkipIds = @(@($wg.NotApplicable) | ForEach-Object { $_.Ids } | Where-Object { $_ })
+        if (@($wg.NotApplicable).Count -gt 0) {
+            # Nouvelle version existante mais pas pour ce type d'installation : winget la refuserait
+            Write-Status 'Non mises à jour par winget' (Cut ((@($wg.NotApplicable) | ForEach-Object { $_.Name }) -join ', ') 60) 'INFO'
+            Write-Sub 'Leur nouvelle version ne convient pas à leur installation : mets-les à jour depuis l''application elle-même'
         }
     }
 }
@@ -3153,7 +3169,8 @@ if ($script:WGCount -gt 0) {
     $a = Read-Answer ("   >> Mettre à jour les {0} application(s) avec winget ? [o/N]" -f $script:WGCount)
     if ($a -match '^[oOyY]') {
         Write-Host ''
-        $okList = @(); $koList = @()
+        $okList = @(); $koList = @(); $naList = @()
+        $skip = @($script:WGSkipIds)
         $targets = @($script:WGItems | Where-Object { $_.Id })
         if ($targets.Count -eq 0) {
             # Identifiants illisibles : repli sur la mise à jour globale
@@ -3165,24 +3182,35 @@ if ($script:WGCount -gt 0) {
                 & winget upgrade --id $it.Id --exact --accept-source-agreements --accept-package-agreements --disable-interactivity
                 $rc = $LASTEXITCODE
                 if ($rc -eq 0) { $okList += $it.Name }
-                else {
-                    $why = 'code 0x{0:X8}' -f $rc
-                    if (('{0:X8}' -f $rc) -eq '8A15002B') { $why = 'aucune mise à jour applicable (l''application se met peut-être à jour elle-même)' }
-                    $koList += ('{0} : {1}' -f $it.Name, $why)
+                elseif (('{0:X8}' -f $rc) -eq '8A15002B') {
+                    # « Aucune mise à niveau applicable » : la nouvelle version ne convient pas à cette installation.
+                    # Ce n'est pas une panne : l'application doit se mettre à jour par elle-même.
+                    $naList += $it.Name
+                    $skip += $it.Id
+                } else {
+                    $koList += ('{0} : code 0x{1:X8}' -f $it.Name, $rc)
                 }
             }
         }
         Write-Host ''
         Write-Host '   >> Vérification du résultat...' -ForegroundColor DarkCyan
         $raw2 = (& winget upgrade --accept-source-agreements --disable-interactivity 2>&1) | Out-String
-        $left = @(ConvertFrom-WingetText $raw2)
+        $leftAll = @(ConvertFrom-WingetText $raw2)
+        $left = @($leftAll | Where-Object { $skip -notcontains $_.Id })
         foreach ($n in $okList) { Write-Host ('   [ OK ] ' + $n) -ForegroundColor Green }
         foreach ($n in $koList) { Write-Host ('   [FAIL] ' + $n) -ForegroundColor Red }
+        foreach ($n in $naList) {
+            Write-Host ('   [INFO] ' + $n + ' : winget n''a pas de version adaptée à cette installation.') -ForegroundColor Cyan
+            Write-Host '          Mets-la à jour depuis l''application elle-même (souvent automatique à son ouverture).' -ForegroundColor DarkGray
+        }
         if ($left.Count -gt 0) {
             Write-Host ("   [!] {0} application(s) toujours en retard :" -f $left.Count) -ForegroundColor Yellow
             foreach ($l in $left) { Write-Host ('       - ' + (Cut $l.Name 60) + '  ' + $l.Installed + ' -> ' + $l.Available) -ForegroundColor Yellow }
-            Write-Host '       Cause fréquente : l''application est ouverte, ou elle se met à jour elle-même (launchers de jeux).' -ForegroundColor DarkGray
+            Write-Host '       Cause fréquente : l''application était ouverte pendant la mise à jour.' -ForegroundColor DarkGray
             Write-Host '       Ferme-la puis relance JARVIS, ou mets-la à jour depuis l''application.' -ForegroundColor DarkGray
+        } elseif ($leftAll.Count -gt 0) {
+            # Seules restent des applications que winget refuse de mettre à jour (signalées ci-dessus)
+            Write-Host '   >> Vérifié : tout ce que winget peut mettre à jour est à jour.' -ForegroundColor Green
         } elseif (Test-WingetNoUpgrade $raw2) {
             Write-Host '   >> Vérifié : toutes les applications sont à jour.' -ForegroundColor Green
         } else {
