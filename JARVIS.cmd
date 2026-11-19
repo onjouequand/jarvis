@@ -1,6 +1,6 @@
 <# : JARVIS.cmd - fichier hybride batch + PowerShell. Ne pas modifier ce fichier.
 @echo off
-rem JARVIS-SHA256=17d098736fc886a889a277e8e0560e457edeed8988649fc521edf9beed6327fa
+rem JARVIS-SHA256=e5ff60bb7c29b62af42eec2bf7e374181f0b9d7fdfdb36c28ad6d0d9a9e05990
 setlocal
 chcp 65001 >nul
 set "JARVIS_SELF=%~f0"
@@ -12,7 +12,7 @@ if "%JARVIS_RC%"=="4" pause
 exit /b %JARVIS_RC%
 #>
 <#
-    J.A.R.V.I.S. // Check-up système v3.10
+    J.A.R.V.I.S. // Check-up système v3.11
     -----------------------------------------------------------------
     Modules :
       [01] Système        : version Windows, uptime, redémarrage en attente
@@ -46,7 +46,11 @@ exit /b %JARVIS_RC%
     est remplacé (mise à jour) ; les anciens emplacements (C:\Outils\JARVIS,
     %LOCALAPPDATA%\Programs\JARVIS) sont migrés puis nettoyés.
     Rapports et profil : %LOCALAPPDATA%\JARVIS (accès direct via le menu [R]).
-    Mise à jour : lancer le nouveau JARVIS.cmd. Il détecte la version installée
+    Mise à jour en ligne : au menu, J.A.R.V.I.S. demande à GitHub (3 s au plus,
+    rien n'est affiché si le PC est hors ligne) s'il existe une version plus
+    récente ; si oui, le menu [U] l'affiche, la télécharge, contrôle son
+    empreinte et l'installe. Aussi : JARVIS.cmd -Update.
+    Mise à jour manuelle : lancer le nouveau JARVIS.cmd. Il détecte la version installée
     (registre Windows), propose la mise à jour si la sienne est plus récente,
     refuse de remplacer une version plus récente, et ne remplace jamais un
     JARVIS en cours d'exécution.
@@ -72,6 +76,7 @@ exit /b %JARVIS_RC%
                 -Install    installe sans poser la question
                 -InstallDir "C:\chemin"  dossier d'installation
                 -Uninstall  désinstalle J.A.R.V.I.S.
+                -Update     cherche et installe la dernière version publiée
 
     Compatibilité : Windows 10 et 11, PC fixe ou portable, Intel / AMD /
     NVIDIA / Realtek / MediaTek / Qualcomm, Defender ou antivirus tiers,
@@ -94,6 +99,7 @@ param(
     [switch]$SelfTest,
     [switch]$Install,
     [switch]$Uninstall,
+    [switch]$Update,
     [string]$InstallDir = '',
     [string]$Name = ''
 )
@@ -101,7 +107,7 @@ param(
 # ------------------------------------------------------------------
 # Identité du programme et emplacement
 # ------------------------------------------------------------------
-$JarvisVersion = '3.10'
+$JarvisVersion = '3.11'
 $JarvisSelf = $env:JARVIS_SELF                     # défini par JARVIS.cmd
 if (-not $JarvisSelf) { $JarvisSelf = $PSCommandPath }  # lancement direct du .ps1
 $JarvisHome = $null
@@ -114,6 +120,8 @@ $pf = $env:ProgramW6432
 if (-not $pf) { $pf = $env:ProgramFiles }
 $DefaultInstallDir = Join-Path $pf 'JARVIS'
 $ReportRoot = Join-Path $env:LOCALAPPDATA 'JARVIS\Rapports'
+$JarvisRepo = 'onjouequand/jarvis'                 # dépôt GitHub des versions publiées
+$JarvisReleasePage = 'https://github.com/' + $JarvisRepo + '/releases/latest'
 $LegacyDirs = @('C:\Outils\JARVIS', (Join-Path $env:LOCALAPPDATA 'Programs\JARVIS'))
 $CfgDir   = Join-Path $env:APPDATA 'JARVIS'
 $CfgFile  = Join-Path $CfgDir 'config.json'
@@ -219,7 +227,7 @@ function Show-Banner {
         foreach ($l in $plain) { Write-Host $l -ForegroundColor Cyan; Pause-Ms 70 }
         Write-Host ''
         Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-        Write-Host '      module check-up v3.10' -ForegroundColor DarkGray
+        Write-Host '      module check-up v3.11' -ForegroundColor DarkGray
         Write-Host ''
         return
     }
@@ -239,7 +247,7 @@ function Show-Banner {
     }
     Write-Host ''
     Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-    Write-Host '      module check-up v3.10' -ForegroundColor DarkGray
+    Write-Host '      module check-up v3.11' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -543,7 +551,7 @@ function Resolve-InstallDir([string]$Dir) {
         }
     }
     if (Test-Path -LiteralPath $d) {
-        $allowed = @('JARVIS.cmd', '.jarvis-install', 'jarvis-checkup.ps1', 'Rapports')
+        $allowed = @('JARVIS.cmd', '.jarvis-install', 'jarvis-checkup.ps1', 'Rapports', '.jarvis-update.cmd')
         $other = @(Get-ChildItem -LiteralPath $d -Force | Where-Object { $allowed -notcontains $_.Name })
         if ($other.Count -gt 0) { $r.Reason = 'le dossier existe déjà et contient d''autres fichiers'; return $r }
     }
@@ -581,19 +589,27 @@ function Set-NoSleep([bool]$On) {
     } catch { return $false }
 }
 
+function Get-Sha256Hex([byte[]]$Bytes) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    return (-join ($sha.ComputeHash($Bytes) | ForEach-Object { $_.ToString('x2') }))
+}
+
+function Get-JarvisCmdState([string]$Text) {
+    # Contenu d'un JARVIS.cmd : l'empreinte SHA-256 du code correspond-elle à celle de l'en-tête ?
+    # 'OK', 'MODIFIED' (modifié ou tronqué) ou 'NOHASH' (pas d'empreinte)
+    if ($Text -notmatch 'JARVIS-SHA256=([0-9a-f]{64})') { return 'NOHASH' }
+    $expected = $Matches[1]
+    $e = $Text.IndexOf([string][char]10 + '#' + '>')
+    if ($e -lt 0) { return 'MODIFIED' }
+    $h = Get-Sha256Hex ([Text.Encoding]::UTF8.GetBytes($Text.Substring($e + 3)))
+    if ($h -eq $expected) { return 'OK' }
+    return 'MODIFIED'
+}
+
 function Test-JarvisIntegrity {
     # Compare l'empreinte SHA-256 du code avec celle inscrite dans l'en-tête de JARVIS.cmd
     if ($JarvisSelf -notlike '*.cmd') { return 'NOHASH' }
-    $t = [IO.File]::ReadAllText($JarvisSelf, [Text.Encoding]::UTF8)
-    if ($t -notmatch 'JARVIS-SHA256=([0-9a-f]{64})') { return 'NOHASH' }
-    $expected = $Matches[1]
-    $e = $t.IndexOf([string][char]10 + '#' + '>')
-    if ($e -lt 0) { return 'MODIFIED' }
-    $b = $t.Substring($e + 3)
-    $sha = [Security.Cryptography.SHA256]::Create()
-    $h = -join ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($b)) | ForEach-Object { $_.ToString('x2') })
-    if ($h -eq $expected) { return 'OK' }
-    return 'MODIFIED'
+    return (Get-JarvisCmdState ([IO.File]::ReadAllText($JarvisSelf, [Text.Encoding]::UTF8)))
 }
 
 function Confirm-DeepScan {
@@ -706,7 +722,8 @@ function Install-WingetModule {
 function Invoke-WingetModuleOffer {
     Write-Host ''
     Write-Host '   MODULE WINGET (facultatif)' -ForegroundColor Cyan
-    Write-Host '   Module officiel Microsoft : versions détaillées et lecture plus fiable des mises à jour.' -ForegroundColor Gray
+    Write-Host '   Module officiel Microsoft : noms et versions complets (winget coupe parfois les colonnes),' -ForegroundColor Gray
+    Write-Host '   et noms des applications dont winget ne connaît pas la version.' -ForegroundColor Gray
     Write-Host '   Sans lui, JARVIS fonctionne normalement.' -ForegroundColor Gray
     Write-Host '   [O] Installer maintenant (Internet requis)' -ForegroundColor Gray
     Write-Host '   [N] Non, pas maintenant' -ForegroundColor Gray
@@ -982,12 +999,12 @@ function Compare-JarvisVersion([string]$A, [string]$B) {
     try { return ([version]$A).CompareTo([version]$B) } catch { return 0 }
 }
 
-function Register-Jarvis([string]$Dir, [string]$Cmd) {
+function Register-Jarvis([string]$Dir, [string]$Cmd, [string]$Version = $JarvisVersion) {
     # Inscription dans « Applications installées » de Windows (désinstallation possible depuis Paramètres)
     New-Item -Path $RegKey -Force -ErrorAction Stop | Out-Null
     $str = [ordered]@{
         DisplayName     = 'J.A.R.V.I.S. (check-up système)'
-        DisplayVersion  = $JarvisVersion
+        DisplayVersion  = $Version
         Publisher       = 'J.A.R.V.I.S.'
         InstallLocation = $Dir
         DisplayIcon     = (Join-Path $env:windir 'System32\shell32.dll') + ',15'
@@ -1001,8 +1018,11 @@ function Register-Jarvis([string]$Dir, [string]$Cmd) {
     }
 }
 
-function Install-Jarvis([string]$TargetDir) {
-    if ($JarvisSelf -notlike '*.cmd') {
+function Install-Jarvis {
+    # Par défaut installe cette copie ; la mise à jour en ligne passe le fichier téléchargé
+    # (-Source), sa version (-Version) et -Quiet (aucune question, raccourcis existants conservés)
+    param([string]$TargetDir, [string]$Source = $JarvisSelf, [string]$Version = $JarvisVersion, [switch]$Quiet)
+    if ($Source -notlike '*.cmd') {
         Write-Host '   [!] Installation possible uniquement depuis JARVIS.cmd.' -ForegroundColor Yellow
         return $null
     }
@@ -1026,28 +1046,30 @@ function Install-Jarvis([string]$TargetDir) {
     $marker = Join-Path $dir '.jarvis-install'
     if (Test-Path -LiteralPath $marker) {
         $old = (Get-Content -LiteralPath $marker | Where-Object { $_ -like 'version=*' }) -replace '^version=', ''
-        Write-Host ("   >> Version {0} trouvée : mise à jour vers {1}." -f $old, $JarvisVersion) -ForegroundColor Cyan
+        Write-Host ("   >> Version {0} trouvée : mise à jour vers {1}." -f $old, $Version) -ForegroundColor Cyan
     }
     $dest = Join-Path $dir 'JARVIS.cmd'
     try {
         New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null
         Show-Bar 'Dossier d''installation'
         $same = $false
-        try { $same = ((Resolve-Path -LiteralPath $JarvisSelf).Path -eq (Join-Path (Resolve-Path -LiteralPath $dir).Path 'JARVIS.cmd')) } catch {}
+        try { $same = ((Resolve-Path -LiteralPath $Source).Path -eq (Join-Path (Resolve-Path -LiteralPath $dir).Path 'JARVIS.cmd')) } catch {}
         if (-not $same) {
-            # Copie dans un fichier temporaire, vérification, puis remplacement : jamais de fichier à moitié écrit
+            # Copie dans un fichier temporaire, vérification, puis remplacement : jamais de fichier à moitié écrit.
+            # Remplacer le JARVIS.cmd en cours d'exécution est sans risque : l'en-tête batch, que cmd.exe relit
+            # après la fin de PowerShell, a toujours la même longueur (seule l'empreinte change).
             $tmp = $dest + '.new'
-            Copy-Item -LiteralPath $JarvisSelf -Destination $tmp -Force -ErrorAction Stop
-            $h1 = (Get-FileHash -LiteralPath $JarvisSelf -Algorithm SHA256).Hash
+            Copy-Item -LiteralPath $Source -Destination $tmp -Force -ErrorAction Stop
+            $h1 = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash
             $h2 = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash
             if ($h1 -ne $h2) { Remove-Item -LiteralPath $tmp -Force; throw 'copie corrompue' }
             Move-Item -LiteralPath $tmp -Destination $dest -Force -ErrorAction Stop
         }
         Unblock-File -LiteralPath $dest
-        Set-Content -LiteralPath $marker -Value @("version=$JarvisVersion", ("date={0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm'))) -ErrorAction Stop
+        Set-Content -LiteralPath $marker -Value @("version=$Version", ("date={0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm'))) -ErrorAction Stop
         if (-not (Test-Path -LiteralPath $dest)) { throw 'copie absente après installation' }
         Show-Bar 'Copie de J.A.R.V.I.S.'
-        Register-Jarvis $dir $dest
+        Register-Jarvis $dir $dest $Version
         Show-Bar 'Inscription dans Windows'
         $weakW = @(Get-WeakWriters @($dir, $dest))
         if ($weakW.Count -gt 0) {
@@ -1064,8 +1086,10 @@ function Install-Jarvis([string]$TargetDir) {
     } catch {
         Write-Host ("   [!] Raccourci menu Démarrer non créé : {0}" -f $_.Exception.Message) -ForegroundColor Yellow
     }
-    $a = Read-Answer '   >> Ajouter aussi un raccourci sur le Bureau ? [O/n]'
-    if (-not (Test-No $a)) {
+    $wantDesk = $false
+    if ($Quiet) { $wantDesk = (Test-Path -LiteralPath $DeskLnk) }
+    else { $wantDesk = -not (Test-No (Read-Answer '   >> Ajouter aussi un raccourci sur le Bureau ? [O/n]')) }
+    if ($wantDesk) {
         try {
             New-JarvisShortcut $DeskLnk $dest $dir
             Show-Bar 'Raccourci Bureau'
@@ -1073,10 +1097,12 @@ function Install-Jarvis([string]$TargetDir) {
             Write-Host '   [!] Raccourci Bureau refusé (Accès contrôlé aux dossiers ?). Le menu Démarrer suffit.' -ForegroundColor Yellow
         }
     }
-    Invoke-LegacyCleanup $dest
-    Write-Host ''
-    Type-Line ("   >> Installation terminée : {0}" -f $dir) 'Green'
-    Type-Line '   >> Pour le relancer : menu Démarrer, tape « JARVIS ».' 'Cyan'
+    if (-not $Quiet) {
+        Invoke-LegacyCleanup $dest
+        Write-Host ''
+        Type-Line ("   >> Installation terminée : {0}" -f $dir) 'Green'
+        Type-Line '   >> Pour le relancer : menu Démarrer, tape « JARVIS ».' 'Cyan'
+    }
     return $dest
 }
 
@@ -1131,6 +1157,198 @@ function Uninstall-Jarvis {
 }
 
 # ------------------------------------------------------------------
+# Mise à jour en ligne (versions publiées sur GitHub)
+# ------------------------------------------------------------------
+function Get-JarvisReleaseInfo([string]$Json, [string]$Repo) {
+    # Lecture de la réponse de l'API GitHub (releases/latest) : version, adresse et empreinte de JARVIS.cmd
+    $r = [pscustomobject]@{ Ok = $false; Version = $null; Url = $null; Sha256 = $null; Size = [int64]0; Notes = ''; Reason = '' }
+    $o = $null
+    try { $o = $Json | ConvertFrom-Json -ErrorAction Stop } catch {}
+    if ($null -eq $o -or $o -is [string]) { $r.Reason = 'réponse de GitHub illisible'; return $r }
+    if ($o.draft -or $o.prerelease) { $r.Reason = 'version de test, ignorée'; return $r }
+    $tag = [string]$o.tag_name
+    if ($tag -notmatch '^[vV]?(\d{1,4}\.\d{1,4}(\.\d{1,4})?)$') { $r.Reason = 'numéro de version publié invalide : ' + (Cut $tag 20); return $r }
+    $r.Version = $Matches[1]
+    $asset = @($o.assets) | Where-Object { $_ -and [string]$_.name -eq 'JARVIS.cmd' } | Select-Object -First 1
+    if (-not $asset) { $r.Reason = 'fichier JARVIS.cmd absent de la version publiée'; return $r }
+    $url = [string]$asset.browser_download_url
+    $prefix = 'https://github.com/' + $Repo + '/releases/download/'
+    if (-not $url.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or $url -match '\s|\.\.') {
+        $r.Reason = 'adresse de téléchargement inattendue'; return $r
+    }
+    $d = [string]$asset.digest
+    if ($d) {
+        if ($d -notmatch '^sha256:([0-9a-fA-F]{64})$') { $r.Reason = 'empreinte publiée illisible'; return $r }
+        $r.Sha256 = $Matches[1].ToLower()
+    }
+    $r.Size = [int64]$asset.size
+    $r.Notes = [string]$o.body
+    $r.Url = $url
+    $r.Ok = $true
+    return $r
+}
+
+function Test-JarvisPackage([byte[]]$Bytes, $Info, [string]$CurrentVersion) {
+    # Contrôle d'un JARVIS.cmd téléchargé avant installation : $null si tout est bon, sinon la raison du refus
+    if ($null -eq $Bytes -or $Bytes.Length -lt 1000) { return 'fichier vide ou incomplet' }
+    if ($Bytes.Length -gt 5MB) { return 'fichier anormalement gros' }
+    if ($Info.Size -gt 0 -and $Bytes.Length -ne $Info.Size) { return 'taille différente de celle annoncée par GitHub' }
+    if ($Info.Sha256 -and (Get-Sha256Hex $Bytes) -ne $Info.Sha256) { return 'empreinte différente de celle publiée sur GitHub' }
+    $t = [Text.Encoding]::UTF8.GetString($Bytes)
+    if (-not $t.StartsWith('<# : JARVIS.cmd')) { return 'ce n''est pas un fichier JARVIS' }
+    if ((Get-JarvisCmdState $t) -ne 'OK') { return 'fichier modifié ou incomplet (empreinte interne fausse)' }
+    if ($t -notmatch '\$JarvisVersion = ''([0-9.]+)''') { return 'version introuvable dans le fichier' }
+    $v = $Matches[1]
+    if ($v -ne $Info.Version) { return ('version du fichier (v{0}) différente de la version publiée (v{1})' -f $v, $Info.Version) }
+    if ((Compare-JarvisVersion $v $CurrentVersion) -le 0) { return ('v{0} n''est pas plus récente que v{1}' -f $v, $CurrentVersion) }
+    return $null
+}
+
+function Get-ReleaseNotesLines([string]$Body, [int]$Max = 6) {
+    # Nouveautés affichables : caractères de contrôle retirés (aucune séquence d'échappement console), lignes coupées
+    $out = @()
+    foreach ($l in ("$Body" -split "`n")) {
+        $t = ($l -replace '[\x00-\x1F\x7F-\x9F]', '').Trim()
+        $t = ($t -replace '^[#*>\-\s]+', '').Trim()
+        if (-not $t) { continue }
+        $out += (Cut $t 88)
+        if ($out.Count -ge $Max) { break }
+    }
+    return $out
+}
+
+function Get-JarvisHttpClient {
+    if ($script:JarvisHttp) { return $script:JarvisHttp }
+    Add-Type -AssemblyName System.Net.Http -ErrorAction Stop
+    # TLS 1.2 exigé par GitHub : ajouté seulement si Windows n'a pas déjà la main sur le choix du protocole
+    $sp = [Net.ServicePointManager]::SecurityProtocol
+    if ([int]$sp -ne 0 -and -not ($sp -band [Net.SecurityProtocolType]::Tls12)) {
+        [Net.ServicePointManager]::SecurityProtocol = $sp -bor [Net.SecurityProtocolType]::Tls12
+    }
+    $c = New-Object System.Net.Http.HttpClient
+    $c.Timeout = [TimeSpan]::FromSeconds(90)
+    $c.DefaultRequestHeaders.UserAgent.ParseAdd('JARVIS-checkup/' + $JarvisVersion)
+    $script:JarvisHttp = $c
+    return $c
+}
+
+function Start-JarvisUpdateCheck {
+    # Lance la question à GitHub en arrière-plan : le résultat est lu plus tard, au menu
+    $s = [pscustomobject]@{ Task = $null; Clock = [Diagnostics.Stopwatch]::StartNew() }
+    try { $s.Task = (Get-JarvisHttpClient).GetAsync('https://api.github.com/repos/' + $JarvisRepo + '/releases/latest') } catch {}
+    return $s
+}
+
+function Get-JarvisUpdateResult($Check, [int]$MaxMs) {
+    # Status : NEW (plus récente), UPTODATE, NONE (rien de publié), OFFLINE, ERROR
+    $r = [pscustomobject]@{ Status = 'ERROR'; Info = $null; Detail = '' }
+    if ($null -eq $Check -or $null -eq $Check.Task) { $r.Detail = 'vérification impossible sur ce PC'; return $r }
+    $left = $MaxMs - [int]$Check.Clock.ElapsedMilliseconds
+    if ($left -lt 0) { $left = 0 }
+    $done = $false
+    try { $done = $Check.Task.Wait($left) } catch { $done = $true }
+    if (-not $done) { $r.Status = 'OFFLINE'; $r.Detail = 'pas de réponse de GitHub'; return $r }
+    if ([string]$Check.Task.Status -ne 'RanToCompletion') { $r.Status = 'OFFLINE'; $r.Detail = 'GitHub injoignable (connexion Internet ?)'; return $r }
+    $resp = $Check.Task.Result
+    $code = [int]$resp.StatusCode
+    if ($code -eq 404) { $r.Status = 'NONE'; $r.Detail = 'aucune version publiée'; return $r }
+    if ($code -ne 200) { $r.Detail = 'réponse de GitHub : code ' + $code; return $r }
+    $json = $null
+    try { $json = $resp.Content.ReadAsStringAsync().Result } catch {}
+    $info = Get-JarvisReleaseInfo $json $JarvisRepo
+    if (-not $info.Ok) { $r.Detail = $info.Reason; return $r }
+    $r.Info = $info
+    if ((Compare-JarvisVersion $info.Version $JarvisVersion) -gt 0) { $r.Status = 'NEW' } else { $r.Status = 'UPTODATE' }
+    return $r
+}
+
+function Get-JarvisDownload([string]$Url, [int]$TimeoutSec = 90) {
+    # Téléchargement en mémoire avec indicateur d'attente ; $null en cas d'échec
+    $task = $null
+    try { $task = (Get-JarvisHttpClient).GetByteArrayAsync($Url) } catch { return $null }
+    $frames = @('|', '/', '-', '\')
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $k = 0
+    $label = 'Téléchargement de la nouvelle version'
+    while (-not $task.IsCompleted -and $sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        Write-Host ("`r   [{0}] {1} ... {2:00}s   " -f $frames[$k % 4], $label, [math]::Floor($sw.Elapsed.TotalSeconds)) -NoNewline -ForegroundColor DarkCyan
+        $k++
+        Start-Sleep -Milliseconds 150
+    }
+    Write-Host ("`r" + (' ' * ($label.Length + 30)) + "`r") -NoNewline
+    if ([string]$task.Status -ne 'RanToCompletion') { return $null }
+    return ,$task.Result
+}
+
+function Invoke-JarvisSelfUpdate($Info) {
+    Write-Host ''
+    Write-Host '   MISE À JOUR DE J.A.R.V.I.S.' -ForegroundColor Cyan
+    Write-Host ("   Version installée : v{0}   //   version disponible : v{1}" -f $JarvisVersion, $Info.Version) -ForegroundColor Gray
+    $notes = @(Get-ReleaseNotesLines $Info.Notes 6)
+    if ($notes.Count -gt 0) {
+        Write-Host '   Nouveautés :' -ForegroundColor Gray
+        foreach ($n in $notes) { Write-Host ('     - ' + $n) -ForegroundColor DarkGray }
+    }
+    if (-not $JarvisInstalled) {
+        Write-Host '   [!] Cette copie n''est pas installée : télécharge la nouvelle version ici :' -ForegroundColor Yellow
+        Write-Host ('       ' + $JarvisReleasePage) -ForegroundColor Yellow
+        return
+    }
+    if (-not $isAdmin) {
+        Write-Host '   >> Validation administrateur requise pour remplacer le programme installé.' -ForegroundColor Cyan
+        if (Start-Elevated $JarvisSelf '-Update') { exit }
+        return
+    }
+    $a = Read-Answer ("   >> Installer la v{0} maintenant ? [O/n]" -f $Info.Version)
+    if (Test-No $a) { Write-Host '   >> Mise à jour reportée. Elle reste proposée au menu.' -ForegroundColor DarkGray; return }
+
+    $bytes = Get-JarvisDownload $Info.Url
+    if ($null -eq $bytes) {
+        Write-Host '   [!] Téléchargement impossible (connexion coupée ou trop lente). Rien n''a été modifié.' -ForegroundColor Yellow
+        return
+    }
+    $why = Test-JarvisPackage $bytes $Info $JarvisVersion
+    if ($why) {
+        Write-Host ('   [!] Mise à jour refusée : ' + $why + '.') -ForegroundColor Red
+        Write-Host ('       Rien n''a été modifié. Si cela se reproduit, préviens la personne qui t''a donné JARVIS.') -ForegroundColor Yellow
+        return
+    }
+    $hash = Get-Sha256Hex $bytes
+    $src = 'empreinte interne'
+    if ($Info.Sha256) { $src = 'empreinte publiée sur GitHub et empreinte interne' }
+    Write-Host ('   [ OK ] Fichier contrôlé : ' + $src + ' conformes.') -ForegroundColor Green
+
+    # Fichier posé dans le dossier d'installation (modifiable par les seuls administrateurs), revérifié, puis installé
+    $stage = Join-Path $JarvisHome '.jarvis-update.cmd'
+    $dest = $null
+    try {
+        [IO.File]::WriteAllBytes($stage, $bytes)
+        if ((Get-FileHash -LiteralPath $stage -Algorithm SHA256).Hash.ToLower() -ne $hash) { throw 'fichier altéré après écriture' }
+        $dest = Install-Jarvis -TargetDir $JarvisHome -Source $stage -Version $Info.Version -Quiet
+    } catch {
+        Write-Host ('   [!] Mise à jour impossible : ' + $_.Exception.Message) -ForegroundColor Red
+    } finally {
+        if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Force }
+    }
+    if (-not $dest) {
+        Write-Host ("   >> La v{0} reste en place, elle fonctionne normalement." -f $JarvisVersion) -ForegroundColor Yellow
+        return
+    }
+    # Vérification finale : le fichier installé est bien celui qui a été contrôlé
+    $okFile = ((Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash.ToLower() -eq $hash)
+    $okReg = ([string](Get-ItemProperty -LiteralPath $RegKey).DisplayVersion -eq $Info.Version)
+    if (-not ($okFile -and $okReg)) {
+        Write-Host '   [!] Installation incomplète : relance la mise à jour depuis le menu [U].' -ForegroundColor Red
+        return
+    }
+    Write-Host ''
+    Type-Line ("   >> Mise à jour terminée : v{0} installée et vérifiée." -f $Info.Version) 'Green'
+    $a = Read-Answer '   >> Entrée pour lancer la nouvelle version (Échap pour fermer)'
+    if ($null -ne $a) { $null = Start-Elevated $dest '' }
+    exit
+}
+
+# ------------------------------------------------------------------
 # Analyseurs de résultats (testés par l'auto-test)
 # ------------------------------------------------------------------
 function Get-SfcVerdict([string]$Text) {
@@ -1161,7 +1379,9 @@ function Get-ChkdskVerdict($Code) {
 
 function ConvertFrom-WingetText {
     param([string]$Raw)
-    $lines = $Raw -split "`n" | ForEach-Object { ($_ -split "`r")[-1].TrimEnd() }
+    # Fin de ligne Windows retirée d'abord, puis seul le texte après le dernier retour chariot est gardé
+    # (animation de progression). Sans le TrimEnd, chaque ligne CRLF devenait vide : liste toujours vide.
+    $lines = $Raw -split "`n" | ForEach-Object { ($_.TrimEnd("`r") -split "`r")[-1].TrimEnd() }
     $start = -1
     for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^\s*-{10,}\s*$') { $start = $i; break } }
     if ($start -lt 1) { return }
@@ -1186,9 +1406,19 @@ function ConvertFrom-WingetText {
     }
 }
 
+function Get-WingetUnknownCount {
+    # Applications dont winget ne connaît pas la version installée (exclues de « winget upgrade »,
+    # qui refuse de les mettre à jour sans --include-unknown) : nombre lu dans la dernière ligne
+    param([string]$Raw)
+    if ($Raw -match '(?m)^\s*(\d+)\s+package\(s\)[^\r\n]*--include-unknown') { return [int]$Matches[1] }
+    return 0
+}
+
 function Test-WingetNoUpgrade([string]$Raw) {
-    # Message explicite de winget : aucune mise à jour (français ou anglais)
-    return ($Raw -match 'Aucune mise . niveau disponible|No available upgrade found|Aucun package install. ne correspond|No installed package found')
+    # Message explicite de winget : aucune mise à jour (français ou anglais), ou seulement des
+    # applications de version inconnue (winget n'affiche alors ni tableau ni « aucune mise à niveau »)
+    if ($Raw -match 'Aucune mise . niveau disponible|No available upgrade found|Aucun package install. ne correspond|No installed package found') { return $true }
+    return ($Raw -notmatch '(?m)^\s*-{10,}\s*$' -and (Get-WingetUnknownCount $Raw) -gt 0)
 }
 
 function Get-AvState($ProductState) {
@@ -1329,10 +1559,37 @@ function Invoke-SelfTest {
         Assert-True ($r[1].Name -eq '7-Zip' -and $r[1].Id -eq '7zip.7zip') 'deuxième ligne mal lue'
         '2 paquets, identifiants et versions lus'
     }
+    Test-Case 'winget : sortie réelle avec fins de ligne Windows' {
+        # Sortie capturée le 19/11/2026 (winget 1.29, français) : lignes terminées par CRLF
+        $fmt = '{0,-16}{1,-22}{2,-19}{3,-19}{4}'
+        $raw = "   - `r   \ `r`r`n" + ($fmt -f 'Nom', 'ID', 'Version', 'Disponible', 'Source') + "`r`n" + ('-' * 82) + "`r`n" +
+               ($fmt -f 'Hytale Launcher', 'HypixelStudios.Hytale', '2026.05.14-26cebac', '2026.11.16-1726018', 'winget') + "`r`n" +
+               "1 mises à niveau disponibles.`r`n" +
+               "1 package(s) a(ont) des numéros de version qui ne peuvent pas être déterminés. Utilisez --include-unknown pour afficher tous les résultats.`r`n"
+        $r = @(ConvertFrom-WingetText $raw)
+        Assert-True ($r.Count -eq 1) ("{0} paquet(s), attendu 1" -f $r.Count)
+        Assert-True ($r[0].Id -eq 'HypixelStudios.Hytale' -and $r[0].Available -eq '2026.11.16-1726018') ('ligne mal lue : ' + $r[0].Id)
+        Assert-True ((Get-WingetUnknownCount $raw) -eq 1) 'version inconnue non comptée'
+        Assert-True (-not (Test-WingetNoUpgrade $raw)) 'conclu « à jour » alors qu''une mise à jour existe'
+        '1 paquet + 1 version inconnue'
+    }
     Test-Case 'winget : détection « aucune mise à jour »' {
         Assert-True (Test-WingetNoUpgrade 'Aucune mise à niveau disponible.') 'message FR non reconnu'
         Assert-True (Test-WingetNoUpgrade 'No available upgrade found.') 'message EN non reconnu'
         Assert-True (-not (Test-WingetNoUpgrade 'texte illisible')) 'faux positif'
+        # Seule une application de version inconnue reste (cas Epson Scan 2 en v3.10) : rien à mettre à jour
+        $unkFr = '1 package(s) a(ont) des numéros de version qui ne peuvent pas être déterminés. Utilisez --include-unknown pour afficher tous les résultats.'
+        Assert-True (Test-WingetNoUpgrade $unkFr) 'version inconnue seule non reconnue (FR)'
+        $withTable = "Nom ID Version Disponible Source`n" + ('-' * 40) + "`nGit Git.Git 2.40 2.47 winget`n" + $unkFr
+        Assert-True (-not (Test-WingetNoUpgrade $withTable)) 'tableau présent mais conclu « à jour »'
+        '5/5 cas'
+    }
+    Test-Case 'winget : applications de version inconnue' {
+        $en = '2 package(s) have version numbers that cannot be determined. Use --include-unknown to see all results.'
+        $fr = "1 mises à niveau disponibles.`r`n1 package(s) a(ont) des numéros de version qui ne peuvent pas être déterminés. Utilisez --include-unknown pour afficher tous les résultats.`r`n"
+        Assert-True ((Get-WingetUnknownCount $en) -eq 2) 'message EN mal lu'
+        Assert-True ((Get-WingetUnknownCount $fr) -eq 1) 'message FR mal lu'
+        Assert-True ((Get-WingetUnknownCount 'Aucune mise à niveau disponible.') -eq 0) 'faux positif'
         '3/3 cas'
     }
     Test-Case 'winget : aucune mise à jour' {
@@ -1377,6 +1634,61 @@ function Invoke-SelfTest {
         Assert-True ((Get-FirstNameFromFull 'JEAN-PIERRE Martin') -eq 'Jean-Pierre') 'JEAN-PIERRE Martin'
         Assert-True ($null -eq (Get-FirstNameFromFull '  ')) 'vide'
         '3/3 cas'
+    }
+    Test-Case 'Mise à jour : lecture de la version publiée' {
+        $base = 'https://github.com/' + $JarvisRepo + '/releases/download/v9.1/JARVIS.cmd'
+        $mk = {
+            param($Tag, $Name, $Url, $Digest)
+            $a = @{ name = $Name; browser_download_url = $Url; size = 1234 }
+            if ($Digest) { $a.digest = $Digest }
+            (@{ tag_name = $Tag; draft = $false; prerelease = $false; body = 'notes'; assets = @($a) } | ConvertTo-Json -Depth 4)
+        }
+        $ok = Get-JarvisReleaseInfo (& $mk 'v9.1' 'JARVIS.cmd' $base ('sha256:' + ('AB' * 32))) $JarvisRepo
+        Assert-True ($ok.Ok -and $ok.Version -eq '9.1' -and $ok.Sha256 -eq ('ab' * 32) -and $ok.Size -eq 1234) ('version valide refusée : ' + $ok.Reason)
+        Assert-True ((Get-JarvisReleaseInfo (& $mk '9.1' 'JARVIS.cmd' $base $null) $JarvisRepo).Ok) 'numéro sans « v » ou sans empreinte refusé'
+        Assert-True (-not (Get-JarvisReleaseInfo (& $mk 'latest' 'JARVIS.cmd' $base $null) $JarvisRepo).Ok) 'numéro invalide accepté'
+        Assert-True (-not (Get-JarvisReleaseInfo (& $mk 'v9.1' 'autre.exe' $base $null) $JarvisRepo).Ok) 'fichier absent accepté'
+        Assert-True (-not (Get-JarvisReleaseInfo (& $mk 'v9.1' 'JARVIS.cmd' 'https://exemple.com/JARVIS.cmd' $null) $JarvisRepo).Ok) 'adresse étrangère acceptée'
+        Assert-True (-not (Get-JarvisReleaseInfo (& $mk 'v9.1' 'JARVIS.cmd' $base 'md5:1234') $JarvisRepo).Ok) 'empreinte illisible acceptée'
+        Assert-True (-not (Get-JarvisReleaseInfo 'pas du JSON' $JarvisRepo).Ok) 'réponse illisible acceptée'
+        '7/7 cas'
+    }
+    Test-Case 'Mise à jour : contrôle du fichier téléchargé' {
+        # Faux JARVIS.cmd fabriqué comme build.py : en-tête avec empreinte du code qui suit la ligne de fermeture
+        $mkPkg = {
+            param($Ver, [switch]$Tamper)
+            $body = "`r`n" + '$JarvisVersion = ''' + $Ver + "'`r`n" + ('# remplissage' * 120) + "`r`n"
+            $h = Get-Sha256Hex ([Text.Encoding]::UTF8.GetBytes($body))
+            $txt = '<# : JARVIS.cmd test' + "`r`nrem JARVIS-SHA256=" + $h + "`r`n" + '#' + '>' + $body
+            if ($Tamper) { $txt = $txt.Replace('remplissage', 'remplissagE') }
+            ,([Text.Encoding]::UTF8.GetBytes($txt))
+        }
+        $b = & $mkPkg '9.1'
+        $info = [pscustomobject]@{ Version = '9.1'; Size = [int64]$b.Length; Sha256 = (Get-Sha256Hex $b) }
+        $why = Test-JarvisPackage $b $info '3.11'
+        Assert-True ($null -eq $why) ('fichier valide refusé : ' + $why)
+        Assert-True ((Get-JarvisCmdState ([Text.Encoding]::UTF8.GetString($b))) -eq 'OK') 'empreinte interne mal calculée'
+        $t = & $mkPkg '9.1' -Tamper
+        $infoT = [pscustomobject]@{ Version = '9.1'; Size = [int64]$t.Length; Sha256 = $null }
+        Assert-True ($null -ne (Test-JarvisPackage $t $infoT '3.11')) 'fichier modifié accepté'
+        $infoBad = [pscustomobject]@{ Version = '9.1'; Size = [int64]$b.Length; Sha256 = ('0' * 64) }
+        Assert-True ($null -ne (Test-JarvisPackage $b $infoBad '3.11')) 'empreinte publiée différente acceptée'
+        $infoV = [pscustomobject]@{ Version = '9.2'; Size = [int64]$b.Length; Sha256 = $null }
+        Assert-True ($null -ne (Test-JarvisPackage $b $infoV '3.11')) 'version différente de la version publiée acceptée'
+        Assert-True ($null -ne (Test-JarvisPackage $b $info '9.1')) 'version identique acceptée'
+        Assert-True ($null -ne (Test-JarvisPackage $b $info '10.0')) 'rétrogradation acceptée'
+        $short = [byte[]]$b[0..($b.Length - 50)]
+        Assert-True ($null -ne (Test-JarvisPackage $short ([pscustomobject]@{ Version = '9.1'; Size = 0; Sha256 = $null }) '3.11')) 'fichier tronqué accepté'
+        '8/8 cas'
+    }
+    Test-Case 'Mise à jour : nouveautés affichées sans danger' {
+        $esc = [string][char]27
+        $l = @(Get-ReleaseNotesLines ("## Nouveautés`r`n- winget corrigé " + $esc + "[31mrouge`r`n`r`n* " + ('x' * 200) + "`n1`n2`n3`n4`n5") 6)
+        Assert-True ($l.Count -eq 6) ("{0} lignes, attendu 6" -f $l.Count)
+        Assert-True ($l[0] -eq 'Nouveautés') ('titre mal nettoyé : ' + $l[0])
+        Assert-True (-not ($l -join '').Contains($esc)) 'séquence d''échappement console conservée'
+        Assert-True ($l[2].Length -le 88) 'ligne trop longue non coupée'
+        '4/4 cas'
     }
     Test-Case 'Mode ASCII : conversion des glyphes' {
         $got = Convert-Glyph '█░┌─┐…'
@@ -1521,6 +1833,16 @@ function Invoke-SelfTest {
     Test-Case 'Réseau : résolution DNS' {
         $null = Resolve-DnsName 'www.microsoft.com' -DnsOnly -QuickTimeout -ErrorAction Stop
         'résolu'
+    }
+    Test-Case 'Mise à jour en ligne (GitHub)' {
+        $u = Get-JarvisUpdateResult (Start-JarvisUpdateCheck) 15000
+        switch ($u.Status) {
+            'NEW'      { 'v' + $u.Info.Version + ' disponible (installée : v' + $JarvisVersion + ')' }
+            'UPTODATE' { 'à jour (dernière publiée : v' + $u.Info.Version + ')' }
+            'NONE'     { 'SKIP:aucune version publiée sur GitHub' }
+            'OFFLINE'  { 'SKIP:' + $u.Detail }
+            default    { throw $u.Detail }
+        }
     }
 
     # ---------------- T4 : écriture et affichage
@@ -1790,6 +2112,26 @@ if ($Uninstall) {
     exit
 }
 
+if ($Update) {
+    Write-Host '   >> Recherche d''une nouvelle version sur GitHub...' -ForegroundColor DarkCyan
+    $upd = Get-JarvisUpdateResult (Start-JarvisUpdateCheck) 15000
+    switch ($upd.Status) {
+        'NEW'      { Invoke-JarvisSelfUpdate $upd.Info }
+        'UPTODATE' { Write-Host ("   [ OK ] J.A.R.V.I.S. est à jour (v{0})." -f $JarvisVersion) -ForegroundColor Green }
+        'NONE'     { Write-Host '   [INFO] Aucune version publiée en ligne pour l''instant.' -ForegroundColor Cyan }
+        default    {
+            Write-Host ('   [!] Vérification impossible : ' + $upd.Detail + '.') -ForegroundColor Yellow
+            Write-Host '       Vérifie la connexion Internet, puis relance.' -ForegroundColor DarkGray
+        }
+    }
+    Read-Answer '   [Entrée pour fermer]' | Out-Null
+    exit
+}
+
+# Recherche d'une nouvelle version en arrière-plan, lue au menu (3 s au plus, silencieuse si hors ligne)
+$script:UpdateCheck = $null
+if (-not ($Quick -or $Deep -or $SelfTest)) { $script:UpdateCheck = Start-JarvisUpdateCheck }
+
 if (-not $JarvisInstalled -and $JarvisSelf -like '*.cmd') {
     $inst = Get-InstalledJarvis
     $choice = 'install'
@@ -1906,6 +2248,11 @@ if ($SelfTest) {
     Write-Host '   [1] Scan rapide    ~2-5 min    état, mises à jour, pilotes, sécurité, journaux' -ForegroundColor Gray
     Write-Host '   [2] Scan complet   ~20-60 min  tout le scan rapide + DISM, SFC /scannow, CHKDSK' -ForegroundColor Gray
     Write-Host '   [3] Auto-test      ~1-2 min    vérifie que JARVIS fonctionne correctement sur ce PC' -ForegroundColor Gray
+    $upd = Get-JarvisUpdateResult $script:UpdateCheck 3000
+    $showU = ($upd.Status -eq 'NEW')
+    if ($showU) {
+        Write-Host ("   [U] Mise à jour    ~1 min      v{0} disponible : nouveautés et installation" -f $upd.Info.Version) -ForegroundColor Green
+    }
     $showM = Test-ShowWingetOffer
     if ($showM) { Write-Host '   [M] Module winget  ~1-3 min    facultatif : versions détaillées des mises à jour d''applications' -ForegroundColor Gray }
     if ($JarvisInstalled) { Write-Host '   [4] Désinstaller J.A.R.V.I.S.' -ForegroundColor DarkGray }
@@ -1913,6 +2260,7 @@ if ($SelfTest) {
     Write-Host '   [Échap] Quitter' -ForegroundColor DarkGray
     $buildKeys = {
         $k = @('1', '2', '3')
+        if ($showU) { $k += 'U' }
         if ($showM) { $k += 'M' }
         if ($JarvisInstalled) { $k += '4' }
         $k += 'R'
@@ -1921,11 +2269,14 @@ if ($SelfTest) {
     $prompt = & $buildKeys
     $m = Read-Answer $prompt
     if ($null -eq $m) { exit }
-    while ($m -match '^[rR]$' -or ($showM -and $m -match '^[mM]$')) {
+    while ($m -match '^[rR]$' -or ($showM -and $m -match '^[mM]$') -or ($showU -and $m -match '^[uU]$')) {
         if ($m -match '^[rR]$') {
             $rd = Get-ReportDir
             if ($rd) { Start-Process -FilePath 'explorer.exe' -ArgumentList ('"{0}"' -f $rd) }
             else { Write-Host '   [!] Aucun dossier de rapports accessible.' -ForegroundColor Yellow }
+        } elseif ($m -match '^[uU]$') {
+            Invoke-JarvisSelfUpdate $upd.Info      # ne revient ici qu'en cas d'annulation ou d'échec
+            Write-Host ''
         } else {
             Invoke-WingetModuleOffer
             $showM = Test-ShowWingetOffer
@@ -2143,35 +2494,50 @@ if ($NoWinget) {
     Write-Status 'winget' 'vérification sautée (-NoWinget)' 'INFO'
 } else {
     $wgParser = ${function:ConvertFrom-WingetText}.ToString()
+    $wgUnknown = ${function:Get-WingetUnknownCount}.ToString()
     $wg = Invoke-Spinner 'Analyse des paquets installés' {
-        param($ParserText)
-        $out = [pscustomobject]@{ Mode = 'none'; Items = @(); Error = $null }
-        try {
-            if (Get-Module -ListAvailable -Name Microsoft.WinGet.Client) {
-                Import-Module Microsoft.WinGet.Client -ErrorAction Stop
-                $pk = @(Get-WinGetPackage | Where-Object { $_.IsUpdateAvailable })
-                $out.Mode = 'module'
-                $out.Items = @($pk | ForEach-Object {
-                    [pscustomobject]@{
-                        Name      = [string]$_.Name
-                        Id        = [string]$_.Id
-                        Installed = [string]$_.InstalledVersion
-                        Available = [string]($_.AvailableVersions | Select-Object -First 1)
-                    }
-                })
-                return $out
-            }
-        } catch {}
+        param($ParserText, $UnknownText)
+        # La liste de référence est celle de « winget upgrade » : c'est elle qui décide de ce que winget
+        # acceptera de mettre à jour. Le module (s'il est là) ne sert qu'à compléter noms, identifiants
+        # et versions tronqués. Constaté le 19/11/2026 : le module annonçait Epson Scan 2 (version
+        # « Unknown », que winget refuse de mettre à jour) et oubliait Hytale Launcher.
+        $out = [pscustomobject]@{ Mode = 'text'; Items = @(); Unknown = 0; UnknownNames = @(); Error = $null }
         if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
             $out.Error = 'NOWINGET'
             return $out
         }
         try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
         $raw = & winget upgrade --accept-source-agreements --disable-interactivity 2>&1 | Out-String
-        $out.Mode = 'text'
         $out.Items = @(& ([scriptblock]::Create($ParserText)) $raw)
+        $out.Unknown = [int](& ([scriptblock]::Create($UnknownText)) $raw)
+        try {
+            if (Get-Module -ListAvailable -Name Microsoft.WinGet.Client) {
+                Import-Module Microsoft.WinGet.Client -ErrorAction Stop
+                $all = @(Get-WinGetPackage)
+                $out.Mode = 'text+module'
+                $ell = [string][char]0x2026
+                foreach ($it in $out.Items) {
+                    $p = $null
+                    if ($it.Id.EndsWith($ell)) {
+                        $pre = $it.Id.TrimEnd([char]0x2026)
+                        $p = $all | Where-Object { ([string]$_.Id).StartsWith($pre, [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+                    } elseif ($it.Id) {
+                        $p = $all | Where-Object { [string]$_.Id -eq $it.Id } | Select-Object -First 1
+                    }
+                    if ($p) {
+                        $it.Id = [string]$p.Id
+                        $it.Name = [string]$p.Name
+                        $it.Installed = [string]$p.InstalledVersion
+                        $av = [string]($p.AvailableVersions | Select-Object -First 1)
+                        if ($av) { $it.Available = $av }
+                    }
+                }
+                $out.UnknownNames = @($all | Where-Object { $_.IsUpdateAvailable -and [string]$_.InstalledVersion -eq 'Unknown' } |
+                                      ForEach-Object { [string]$_.Name })
+            }
+        } catch {}
         return $out
-    } 300 -ArgumentList $wgParser
+    } 300 -ArgumentList $wgParser, $wgUnknown
 
     if ($null -eq $wg) {
         Write-Status 'winget' 'délai dépassé (5 min)' 'WARN'
@@ -2198,6 +2564,13 @@ if ($NoWinget) {
                     Write-Sub (Cut $it.Name 90) 'Yellow'
                 }
             }
+        }
+        if ($wg.Unknown -gt 0) {
+            # winget ne connaît pas leur version installée : il refuse de les mettre à jour, inutile de les proposer
+            $names = ''
+            if (@($wg.UnknownNames).Count -gt 0) { $names = ' : ' + (Cut (@($wg.UnknownNames) -join ', ') 60) }
+            Write-Status 'Version non détectable par winget' ([string]$wg.Unknown + $names) 'INFO'
+            Write-Sub 'winget ne peut pas les mettre à jour : passe par l''application elle-même ou le site de l''éditeur si besoin'
         }
     }
 }
