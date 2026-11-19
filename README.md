@@ -17,8 +17,8 @@ Lien permanent, il donne toujours la dernière version publiée. Toutes les vers
 | N° | Section | Ce qui est vérifié |
 |---|---|---|
 | 01 | Système | version de Windows, fin de support de Windows 10, durée depuis le dernier démarrage, redémarrage en attente |
-| 02 | Windows Update | mises à jour importantes, à faire à l'écran, facultatives |
-| 03 | Applications | mises à jour disponibles via winget |
+| 02 | Windows Update | mises à jour importantes, à faire à l'écran, facultatives ; échecs d'installation des 30 derniers jours |
+| 03 | Applications | mises à jour disponibles via winget et le Microsoft Store |
 | 04 | Pilotes | Wi-Fi, Ethernet, Bluetooth, carte graphique, périphériques en erreur |
 | 05 | Bluetooth | service, adaptateur, économie d'énergie |
 | 06 | Sécurité | antivirus, Defender et ses protections, pare-feu, Secure Boot, TPM, point de restauration, réglages de sécurité de Windows (contrôle de compte, SmartScreen, Bureau à distance, ancien partage SMBv1, comptes, fichier hosts, proxy, activation) |
@@ -27,12 +27,12 @@ Lien permanent, il donne toujours la dernière version publiée. Toutes les vers
 | 09 | Réseau | passerelle, latence Internet, DNS |
 | 10 | Journaux (7 jours) | arrêts brutaux, écrans bleus, erreurs matérielles et disque |
 | 11 | Nettoyage | fichiers temporaires, cache Windows Update, corbeille |
-| 12 | BIOS | carte mère, version et date |
+| 12 | BIOS | carte mère, version et date, page de support du fabricant (JARVIS n'installe pas de BIOS) |
 | 13 | Intégrité (scan complet) | DISM, SFC /scannow, CHKDSK |
 
 Trois modes au menu : **scan rapide** (2 à 5 min, ne modifie rien), **scan complet** (20 à 60 min, ajoute la vérification des fichiers système de Windows) et **auto-test** (vérifie que JARVIS fonctionne correctement sur ce PC).
 
-En fin de scan, JARVIS propose, une par une et toujours avec confirmation : lancer une analyse antivirus rapide (si Microsoft Defender est ton antivirus), installer les mises à jour Windows, mettre à jour les applications, nettoyer les fichiers temporaires de plus de 24 h, réparer l'image Windows. Un rapport texte est enregistré dans `%LOCALAPPDATA%\JARVIS\Rapports`.
+En fin de scan, JARVIS propose, une par une et toujours avec confirmation : lancer une analyse antivirus rapide (si Microsoft Defender est ton antivirus), installer les mises à jour Windows, mettre à jour les applications (winget et Microsoft Store, chaque résultat vérifié), nettoyer les fichiers temporaires de plus de 24 h, réparer l'image Windows. Un rapport texte est enregistré dans `%LOCALAPPDATA%\JARVIS\Rapports`.
 
 ## Installation et mises à jour
 
@@ -46,7 +46,7 @@ Windows 10 ou 11, PC fixe ou portable, Windows PowerShell 5.1 (déjà présent d
 
 ## Sécurité et confidentialité
 
-- **Aucune donnée personnelle n'est envoyée.** Les seules connexions sont celles des outils de Windows (Windows Update, winget), un test de latence vers `1.1.1.1`, une résolution DNS de `www.microsoft.com`, et la question à GitHub sur la dernière version publiée (GitHub voit alors l'adresse IP, comme pour toute visite).
+- **Aucune donnée personnelle n'est envoyée.** Les seules connexions sont celles des outils de Windows (Windows Update, winget, Microsoft Store), un test de latence vers `1.1.1.1`, une résolution DNS de `www.microsoft.com`, et la question à GitHub sur la dernière version publiée (GitHub voit alors l'adresse IP, comme pour toute visite).
 - **Fichier abîmé ou incomplet détecté** : `JARVIS.cmd` contient l'empreinte SHA-256 de son propre code. S'il a été abîmé ou tronqué (téléchargement interrompu, par exemple), il refuse de démarrer. Ce contrôle détecte un accident, il ne protège pas contre une modification volontaire du fichier.
 - **Installation réservée aux administrateurs** : JARVIS refuse de s'installer dans un dossier que n'importe quel programme peut modifier. Le dossier proposé, `C:\Program Files\JARVIS`, convient toujours.
 - **Mises à jour contrôlées** : un fichier téléchargé n'est installé que si sa taille, l'empreinte publiée par GitHub, son empreinte interne et son numéro de version sont tous conformes. Si l'installation échoue en cours de route, l'ancienne version est remise en place.

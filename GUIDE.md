@@ -52,6 +52,8 @@ Quand une nouvelle version existe, la ligne **[U] Mise à jour** apparaît en ve
 | « PowerShell est en mode restreint » | Ton PC bloque ce genre d'outil (souvent un PC d'entreprise ou le « Contrôle intelligent des applications ») : JARVIS ne peut pas fonctionner dessus. |
 | « J.A.R.V.I.S. est déjà en cours d'exécution » | Une autre fenêtre JARVIS est ouverte : ferme-la d'abord. |
 | Une question à laquelle tu ne sais pas répondre | Appuie sur **Échap** : c'est toujours « non ». |
+| « plus longtemps que prévu » pendant l'installation des mises à jour Windows | Appuie sur **Entrée** : JARVIS attend encore 30 minutes. L'arrêter en cours de route peut abîmer Windows. |
+| Une application du Microsoft Store « pas installée, l'application tournait encore » | Ferme-la complètement (y compris son icône près de l'horloge), puis relance JARVIS ou ouvre **Microsoft Store > Bibliothèque > Obtenir les mises à jour**. |
 | « Choix non reconnu » ou « Réponse non comprise » | Tape une des touches affichées entre crochets, puis **Entrée**. |
 | « Dossier refusé : dossier modifiable sans droits administrateur » | Appuie sur **Entrée** pour accepter le dossier proposé (`C:\Program Files\JARVIS`). |
 | La mise à jour **[U]** est refusée à cause du dossier d'installation | Ton JARVIS est installé hors de `Program Files`. Retélécharge-le avec le lien de l'étape 1, lance-le, choisis **1** (Mettre à jour), puis appuie sur **Entrée** au dossier proposé : il se réinstalle au bon endroit, sans rien perdre. |

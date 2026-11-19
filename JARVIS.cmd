@@ -1,6 +1,6 @@
 <# : JARVIS.cmd - fichier hybride batch + PowerShell. Ne pas modifier ce fichier.
 @echo off
-rem JARVIS-SHA256=3a68f4f19c58a0a5dd55e3cc9dc2aa976321abb9eec7cb868a4e0cd26ec1953e
+rem JARVIS-SHA256=f435b6fff04b47a0242db0110885478cbb4ec149cf69d91a91a4b22ec2dfeeba
 setlocal
 chcp 65001 >nul
 set "JARVIS_SELF=%~f0"
@@ -12,7 +12,7 @@ if "%JARVIS_RC%"=="4" pause
 exit /b %JARVIS_RC%
 #>
 <#
-    J.A.R.V.I.S. // Check-up système v3.14
+    J.A.R.V.I.S. // Check-up système v3.15
     -----------------------------------------------------------------
     Modules :
       [01] Système        : version Windows, uptime, redémarrage en attente
@@ -107,7 +107,7 @@ param(
 # ------------------------------------------------------------------
 # Identité du programme et emplacement
 # ------------------------------------------------------------------
-$JarvisVersion = '3.14'
+$JarvisVersion = '3.15'
 $JarvisSelf = $env:JARVIS_SELF                     # défini par JARVIS.cmd
 if (-not $JarvisSelf) { $JarvisSelf = $PSCommandPath }  # lancement direct du .ps1
 $JarvisHome = $null
@@ -201,6 +201,8 @@ $script:NeedRestore = $false
 $script:DefenderScan = $false    # Defender est l'antivirus en service : analyse rapide proposable
 $script:ChkdskFix   = New-Object System.Collections.Generic.List[string]
 $script:DeepMode    = $false
+$script:SpinState   = ''         # fin du dernier Invoke-Spinner : DONE, TIMEOUT ou STOPPED
+$script:StoreItems  = @()        # applications du Microsoft Store à mettre à jour (Pfn, Name)
 
 # ------------------------------------------------------------------
 # Rendu terminal
@@ -229,7 +231,7 @@ function Show-Banner {
         foreach ($l in $plain) { Write-Host $l -ForegroundColor Cyan; Pause-Ms 70 }
         Write-Host ''
         Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-        Write-Host '      module check-up v3.14' -ForegroundColor DarkGray
+        Write-Host '      module check-up v3.15' -ForegroundColor DarkGray
         Write-Host ''
         return
     }
@@ -249,7 +251,7 @@ function Show-Banner {
     }
     Write-Host ''
     Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-    Write-Host '      module check-up v3.14' -ForegroundColor DarkGray
+    Write-Host '      module check-up v3.15' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -352,26 +354,50 @@ function Invoke-Spinner {
         [string]$Label,
         [scriptblock]$ScriptBlock,
         [int]$TimeoutSec = 300,
-        [object[]]$ArgumentList
+        [object[]]$ArgumentList,
+        # Travail qu'il vaut mieux ne pas interrompre (Windows Update) : au délai, jamais d'arrêt d'office.
+        # La question est posée, la réponse par défaut est d'attendre encore ; $StopRisk dit ce que l'arrêt risque.
+        [switch]$AskOnTimeout,
+        [string]$StopRisk = 'L''arrêter en cours de route peut abîmer Windows : le plus sûr est d''attendre.'
     )
+    # Retour $null : $script:SpinState dit pourquoi, TIMEOUT (délai dépassé) ou STOPPED (arrêté à la demande)
+    $script:SpinState = 'RUNNING'
     if ($ArgumentList) { $job = Start-Job -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList }
     else { $job = Start-Job -ScriptBlock $ScriptBlock }
     $frames = @('|', '/', '-', '\')
+    $blank = "`r" + (' ' * ($Label.Length + 30)) + "`r"
     $sw = [Diagnostics.Stopwatch]::StartNew()
+    $limit = [double]$TimeoutSec
+    $stopped = $false
     $k = 0
-    while ($job.State -eq 'Running' -and $sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+    while ($job.State -eq 'Running') {
+        if ($sw.Elapsed.TotalSeconds -ge $limit) {
+            if (-not $AskOnTimeout) { break }
+            Write-Host $blank -NoNewline
+            Write-Host ("   [!] {0} : en cours depuis {1:N0} min, plus longtemps que prévu." -f $Label, $sw.Elapsed.TotalMinutes) -ForegroundColor Yellow
+            Write-Host ('       ' + $StopRisk) -ForegroundColor Yellow
+            if (Read-YesNo '   >> L''arrêter quand même ?') { $stopped = $true; break }
+            Write-Host '   >> J''attends encore 30 minutes.' -ForegroundColor DarkGray
+            $limit = $sw.Elapsed.TotalSeconds + 1800
+            continue
+        }
         $f = $frames[$k % $frames.Count]; $k++
         $el = $sw.Elapsed
         Write-Host ("`r   [{0}] {1} ... {2:00}:{3:00}   " -f $f, $Label, [math]::Floor($el.TotalMinutes), $el.Seconds) -NoNewline -ForegroundColor DarkCyan
         Start-Sleep -Milliseconds 150
     }
-    Write-Host ("`r" + (' ' * ($Label.Length + 30)) + "`r") -NoNewline
+    Write-Host $blank -NoNewline
     if ($job.State -eq 'Running') {
         Stop-Job $job; Remove-Job $job -Force
+        $script:SpinState = 'TIMEOUT'
+        if ($stopped) { $script:SpinState = 'STOPPED' }
         return $null
     }
+    $failed = ($job.State -eq 'Failed')
     $res = Receive-Job $job | Select-Object -Last 1
     Remove-Job $job -Force
+    $script:SpinState = 'DONE'
+    if ($failed) { $script:SpinState = 'FAILED' }
     return $res
 }
 
@@ -1106,9 +1132,15 @@ function Install-WindowsUpdates {
         } catch {
             [pscustomobject]@{ Ok = $false; Count = 0; Ready = 0; Skipped = @(); Code = 0; Error = $_.Exception.Message }
         }
-    } 3600 -ArgumentList $filter
+    } 3600 -ArgumentList $filter -AskOnTimeout -StopRisk 'L''arrêter ne casse rien, mais le téléchargement serait à reprendre plus tard.'
 
-    if ($null -eq $dl) { Write-Status 'Téléchargement' 'délai dépassé (60 min)' 'WARN'; return }
+    if ($null -eq $dl) {
+        if ($script:SpinState -eq 'STOPPED') { Write-Status 'Téléchargement' 'arrêté à ta demande' 'WARN' }
+        elseif ($script:SpinState -eq 'TIMEOUT') { Write-Status 'Téléchargement' 'délai dépassé' 'WARN' }
+        else { Write-Status 'Téléchargement' 'arrêté sans réponse de Windows Update' 'WARN' }
+        Write-Sub 'Rien n''a été installé : reprends plus tard avec J.A.R.V.I.S. ou dans Windows Update'
+        return
+    }
     if (-not $dl.Ok) { Write-Status 'Téléchargement' ('échec : ' + (Cut $dl.Error 60)) 'WARN'; Open-WindowsUpdateGuided; return }
     foreach ($sk in @($dl.Skipped)) { Write-Sub ('Exclue, ' + (Cut $sk 90)) 'DarkGray' }
     if ($dl.Count -eq 0) {
@@ -1154,9 +1186,18 @@ function Install-WindowsUpdates {
         } catch {
             [pscustomobject]@{ Ok = $false; Results = @(); Reboot = $false; Error = $_.Exception.Message }
         }
-    } 3600 -ArgumentList $filter
+    } 3600 -ArgumentList $filter -AskOnTimeout -StopRisk ('Arrêter l''attente ne garantit pas l''arrêt de l''installation, et une installation coupée ' +
+                                                          'peut abîmer Windows : le plus sûr est d''attendre.')
 
-    if ($null -eq $ins) { Write-Status 'Installation' 'délai dépassé (60 min)' 'WARN'; return }
+    if ($null -eq $ins) {
+        # On ne sait pas si Windows Update poursuit ou abandonne l'installation une fois l'attente arrêtée
+        if ($script:SpinState -eq 'STOPPED') { Write-Status 'Installation' 'attente arrêtée à ta demande, résultat inconnu' 'WARN' }
+        elseif ($script:SpinState -eq 'TIMEOUT') { Write-Status 'Installation' 'délai dépassé, résultat inconnu' 'WARN' }
+        else { Write-Status 'Installation' 'arrêtée sans réponse de Windows Update, résultat inconnu' 'WARN' }
+        Write-Sub 'J.A.R.V.I.S. ne sait pas si Windows Update a continué. Ne force pas l''arrêt du PC, puis regarde'
+        Write-Sub 'Paramètres > Windows Update > Historique des mises à jour, et redémarre si Windows le demande'
+        return
+    }
     if (-not $ins.Ok) { Write-Status 'Installation' ('échec : ' + (Cut $ins.Error 60)) 'WARN'; Open-WindowsUpdateGuided; return }
     foreach ($x in @($ins.Results)) {
         if ($x.Code -eq 2) { Write-Sub ('Installée : ' + (Cut $x.Title 80)) 'Green' }
@@ -1893,6 +1934,181 @@ function Get-WuInstallSummary([int[]]$Codes) {
     return $r
 }
 
+function Get-WuHistoryKey([string]$Title, [string]$UpdateId) {
+    # Même mise à jour d'une tentative à l'autre : numéro KB du titre (les définitions de Defender changent
+    # de version dans leur titre, pas de numéro KB), sinon identifiant de la mise à jour, sinon le titre.
+    if ($Title -match '\b(KB\d{6,8})\b') { return $Matches[1].ToUpperInvariant() }
+    if ($UpdateId) { return $UpdateId.ToLowerInvariant() }
+    return $Title
+}
+
+function Get-WuHistoryFailures {
+    # Historique de Windows Update (QueryHistory) : installations en échec (code de résultat 4) ou abandonnées
+    # (5) depuis $Since, sans réussite plus récente de la même mise à jour. Les applications du Microsoft Store
+    # (titre du type « 9NCBCSZSJRSB-SpotifyAB.SpotifyMusic ») sont comptées à part : le Store les reprend
+    # lui-même sans laisser de trace dans cet historique (constaté le 19/11/2026) et la section Store dit ce qui
+    # reste à faire. Entrées : objets Date, Operation (1 = installation), ResultCode, HResult, Title, UpdateId.
+    # Fonction pure, testée en T1.
+    # $Pending : mises à jour encore proposées (objets Title, UpdateId), ou $null si la recherche a échoué.
+    # Un échec qui n'est plus proposé (remplacé par une version plus récente, ou réussi sous un autre nom)
+    # compte dans Resolved : il n'y a plus rien à faire.
+    param([object[]]$Entries, [datetime]$Since, [object[]]$Pending = $null)
+    $r = [pscustomobject]@{ Failed = @(); Resolved = 0; Store = 0 }
+    $pendKeys = $null
+    if ($null -ne $Pending) {
+        $pendKeys = @{}
+        foreach ($p in @($Pending)) {
+            if ($null -eq $p) { continue }
+            $pendKeys[(Get-WuHistoryKey ([string]$p.Title) ([string]$p.UpdateId))] = $true
+            if ($p.UpdateId) { $pendKeys[([string]$p.UpdateId).ToLowerInvariant()] = $true }
+        }
+    }
+    $okLast = @{}
+    $fails = @()
+    foreach ($e in @($Entries)) {
+        if ($null -eq $e -or [int]$e.Operation -ne 1) { continue }
+        $k = Get-WuHistoryKey ([string]$e.Title) ([string]$e.UpdateId)
+        if ([int]$e.ResultCode -in 2, 3) {
+            if (-not $okLast.ContainsKey($k) -or [datetime]$e.Date -gt $okLast[$k]) { $okLast[$k] = [datetime]$e.Date }
+        } elseif ([int]$e.ResultCode -in 4, 5 -and [datetime]$e.Date -ge $Since) {
+            $fails += [pscustomobject]@{ Key = $k; Entry = $e }
+        }
+    }
+    $seen = @{}
+    $list = @()
+    foreach ($f in @($fails | Sort-Object { [datetime]$_.Entry.Date } -Descending)) {
+        if ($seen.ContainsKey($f.Key)) { continue }
+        $seen[$f.Key] = $true
+        $t = [string]$f.Entry.Title
+        if ($t -cmatch '^[0-9A-Z]{12}-') { $r.Store++; continue }
+        if ($okLast.ContainsKey($f.Key) -and $okLast[$f.Key] -gt [datetime]$f.Entry.Date) { $r.Resolved++; continue }
+        if ($null -ne $pendKeys -and -not $pendKeys.ContainsKey($f.Key) -and -not $pendKeys.ContainsKey(([string]$f.Entry.UpdateId).ToLowerInvariant())) {
+            $r.Resolved++; continue
+        }
+        $list += [pscustomobject]@{ Title = $t; Code = ('0x{0:X8}' -f [int]$f.Entry.HResult); Date = [datetime]$f.Entry.Date }
+    }
+    $r.Failed = $list
+    return $r
+}
+
+function Get-WuErrorHint([string]$Code) {
+    # Explication courte des codes d'échec les plus fréquents (codes publics de Windows Update et du
+    # magasin de composants). $null : code sans explication, il est affiché seul.
+    switch -Regex ($Code) {
+        '^0x(80073712|800F0831|800F081F)$' { return 'fichiers de Windows abîmés : le scan complet [2], en administrateur, les vérifie et propose une réparation' }
+        '^0x80070070$' { return 'espace disque insuffisant : libère de la place sur le disque C:' }
+        '^0x800F0922$' { return 'souvent un VPN actif ou une partition réservée de Windows trop pleine' }
+        '^0x(80240034|8024402C|80072EE2|80072EFD)$' { return 'téléchargement impossible : vérifie la connexion Internet' }
+        '^0x8024000B$' { return 'opération annulée (souvent par un arrêt ou un redémarrage du PC)' }
+    }
+    return $null
+}
+
+function Split-NativeOutput {
+    # Sortie d'un exécutable capturée par « 2>&1 » : texte normal et messages d'erreur (stderr, que
+    # PowerShell 5.1 rend sous forme d'ErrorRecord) séparés, pour que l'analyse ne lise que le texte de
+    # l'outil. Autonome (n'appelle aucune autre fonction de JARVIS) : passée telle quelle aux jobs. T1.
+    param([object[]]$Lines)
+    $o = New-Object System.Text.StringBuilder
+    $e = New-Object System.Text.StringBuilder
+    foreach ($l in @($Lines)) {
+        if ($null -eq $l) { continue }
+        if ($l -is [System.Management.Automation.ErrorRecord]) { [void]$e.Append($l.ToString()).Append("`r`n") }
+        else { [void]$o.Append([string]$l).Append("`r`n") }
+    }
+    return [pscustomobject]@{ Out = $o.ToString(); Err = $e.ToString().Trim() }
+}
+
+function Get-StoreAppLabel([string]$Pfn, $StartNames) {
+    # Nom lisible d'une application du Store : nom du menu Démarrer (identifiant « famille!App »), sinon le
+    # nom du paquet sans l'éditeur (« SpotifyAB.SpotifyMusic_zpdnekdrzrea0 » donne « SpotifyMusic »). T1.
+    if (-not $Pfn) { return '' }
+    if ($StartNames -and $StartNames.ContainsKey($Pfn)) { return [string]$StartNames[$Pfn] }
+    $name = ($Pfn -split '_')[0]
+    $parts = @($name -split '\.')
+    if ($parts.Count -gt 1) { $name = ($parts[1..($parts.Count - 1)] -join '.') }
+    # « XboxIdentityProvider » devient « Xbox Identity Provider »
+    return ($name -creplace '(?<=[a-z])(?=[A-Z])', ' ')
+}
+
+function Get-StoreAutoVerdict([string]$Setting) {
+    # Mises à jour automatiques des applications du Store (AppInstallManager.AutoUpdateSetting). T1.
+    switch ($Setting) {
+        'Enabled' { return 'OK' }
+        'EnabledByPolicy' { return 'OK' }
+        'Disabled' { return 'WARN' }
+        'DisabledByPolicy' { return 'POLICY' }
+    }
+    return 'UNKNOWN'
+}
+
+function Get-StoreUpdateVerdict([string]$State, $StillListed) {
+    # Résultat d'une mise à jour lancée par le Store. $State : dernier état lu (Completed, Error, Canceled,
+    # NoUpdate quand le Store n'a rien à faire, autre = pas terminé). $StillListed : la nouvelle recherche la
+    # propose encore ($true), ne la propose plus ($false), ou n'a pas pu être faite ($null).
+    # « Completed » ne suffit pas : le 19/11/2026, le Store a répondu « Completed » en réinstallant la même
+    # version d'un composant ; la preuve est la nouvelle recherche. Fonction pure, testée en T1.
+    # PAUSED : le Store attend un geste (pause, batterie, Wi-Fi limité). WAITING : jamais démarrée par le Store.
+    # NOSTART : le Store n'a rien lancé alors que la mise à jour est toujours proposée.
+    if ($State -eq 'Error') { return 'FAIL' }
+    if ($State -eq 'Canceled') { return 'CANCELED' }
+    if ($State -like 'Paused*') { return 'PAUSED' }
+    if ($State -in @('ReadyToDownload', 'NotStarted')) { return 'WAITING' }
+    if ($State -notin @('Completed', 'NoUpdate')) { return 'PENDING' }
+    if ($null -eq $StillListed) { return 'UNVERIFIED' }
+    if ($StillListed -and $State -eq 'NoUpdate') { return 'NOSTART' }
+    if ($StillListed) { return 'NOTDONE' }
+    return 'OK'
+}
+
+function Get-BiosSearchName([string]$BoardProduct, [string]$SystemModel, [string]$From) {
+    # Nom à chercher sur la page de support : modèle du PC si le lien vient du fabricant du PC, sinon carte mère.
+    # Les textes de remplissage des PC montés (« To Be Filled By O.E.M. », « Default string ») sont écartés ;
+    # si le modèle du PC diffère de la carte (carte MSI « MS-7C02 »), les deux sont donnés. '' : rien d'utile. T1.
+    $filler = '^\s*$|To be filled|Default string|System Product Name|System manufacturer|O\.E\.M|Not Applicable'
+    $b = ([string]$BoardProduct).Trim()
+    $m = ([string]$SystemModel).Trim()
+    if ($b -match $filler) { $b = '' }
+    if ($m -match $filler) { $m = '' }
+    if ($From -ne 'System' -or -not $m) { return $b }
+    if (-not $b -or $b -eq $m) { return $m }
+    return ('{0} (carte mère {1})' -f $m, $b)
+}
+
+function Get-BiosSupportLink([string]$BoardMaker, [string]$SystemMaker, [string]$SystemModel) {
+    # Page de support du fabricant (adresses ouvertes dans un navigateur le 19/11/2026). Le fabricant du PC
+    # (portable, PC de marque) passe avant celui de la carte mère ; une machine virtuelle n'est pas un PC de
+    # marque. Rend Name, Url et From (System ou Board), ou $null si le fabricant n'est pas dans la table. T1.
+    $table = @(
+        @('Dell', 'Dell', 'https://www.dell.com/support/home/fr-fr'),
+        @('^(HP|Hewlett)', 'HP', 'https://support.hp.com/fr-fr/drivers'),
+        @('Lenovo', 'Lenovo', 'https://pcsupport.lenovo.com/fr/fr'),
+        @('Acer', 'Acer', 'https://www.acer.com/fr-fr/support'),
+        @('Samsung', 'Samsung', 'https://www.samsung.com/fr/support/'),
+        @('Medion', 'Medion', 'https://www.medion.com/fr/service/'),
+        @('Dynabook|Toshiba', 'Dynabook', 'https://fr.dynabook.com/support/'),
+        @('ASUS', 'ASUS', 'https://www.asus.com/fr/support/download-center/'),
+        @('Gigabyte', 'Gigabyte', 'https://www.gigabyte.com/fr/Support'),
+        @('Micro-Star|^MSI\b', 'MSI', 'https://fr.msi.com/support'),
+        @('ASRock', 'ASRock', 'https://www.asrock.com/support/index.fr.asp')
+    )
+    $sources = @()
+    if ($SystemModel -notmatch 'Virtual|VMware') {
+        if ($SystemMaker -match 'Microsoft' -and $SystemModel -match 'Surface') {
+            return [pscustomobject]@{ Name = 'Microsoft Surface'; Url = 'https://support.microsoft.com/fr-fr/surface'; From = 'System' }
+        }
+        $sources += , @('System', $SystemMaker)
+    }
+    $sources += , @('Board', $BoardMaker)
+    foreach ($s in $sources) {
+        if (-not $s[1]) { continue }
+        foreach ($t in $table) {
+            if ($s[1] -match $t[0]) { return [pscustomobject]@{ Name = $t[1]; Url = $t[2]; From = $s[0] } }
+        }
+    }
+    return $null
+}
+
 function Get-AvState($ProductState) {
     $hex = '{0:X6}' -f [int]$ProductState
     return [pscustomobject]@{
@@ -2172,6 +2388,199 @@ function Test-AppxInUseBetween([datetime]$From, [datetime]$To) {
     if (-not $r.Ok) { return $null }
     $limit = $To.AddSeconds(2)
     return (@($r.Events | Where-Object { $_.TimeCreated -le $limit -and (Test-AppxInUseMessage ([string]$_.Message)) }).Count -gt 0)
+}
+
+function Invoke-StoreQuery {
+    # Microsoft Store par l'API de Windows (AppInstallManager), sans droits admin. Autonome : passée aux jobs.
+    # Search : recherche seule des mises à jour (Items : Pfn, ProductId). Sans l'option ci-dessous, le Store
+    # lancerait aussitôt les téléchargements (valeur par défaut : vrai, relevé le 19/11/2026) ; si l'option
+    # n'existe pas (Windows 10 ancien), la recherche échoue au lieu d'installer. « winget --source msstore »
+    # ne voit pas les applications installées par le Store (relevé le même jour), d'où cette API.
+    # Update : met à jour les familles $Pfns et suit leur état (Items : Pfn, State, Code), $TimeoutSec au total.
+    param([string]$Mode, [string[]]$Pfns, [int]$TimeoutSec = 150)
+    $o = [pscustomobject]@{ Ok = $false; Auto = ''; Items = @(); Error = $null }
+    try {
+        Add-Type -AssemblyName System.Runtime.WindowsRuntime
+        $null = [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager, Windows.ApplicationModel.Store.Preview, ContentType = WindowsRuntime]
+        $asTask = @([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+            $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+        $itemType = [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem]
+        $m = New-Object Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager
+        $o.Auto = [string]$m.AutoUpdateSetting
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        if ($Mode -eq 'Search') {
+            $opt = New-Object Windows.ApplicationModel.Store.Preview.InstallControl.AppUpdateOptions
+            $opt.AutomaticallyDownloadAndInstallUpdateIfFound = $false
+            # Les mises à jour trouvées restent inscrites dans la file du Store à l'état ReadyToDownload, sans
+            # téléchargement (file identique avant, après et 20 s après une recherche, relevé le 19/11/2026)
+            $listType = [Collections.Generic.IReadOnlyList`1].MakeGenericType($itemType)
+            $task = $asTask.MakeGenericMethod($listType).Invoke($null, @($m.SearchForAllUpdatesAsync('', '', $opt)))
+            if (-not $task.Wait($TimeoutSec * 1000)) { throw 'le Microsoft Store ne répond pas' }
+            $o.Items = @(foreach ($i in $task.Result) { [pscustomobject]@{ Pfn = [string]$i.PackageFamilyName; ProductId = [string]$i.ProductId } })
+        } elseif ($Mode -eq 'Update') {
+            $run = @()
+            foreach ($p in @($Pfns)) {
+                $r = [pscustomobject]@{ Pfn = [string]$p; State = 'NotStarted'; Code = 0; Item = $null }
+                # Démarrage compris dans le délai total : au-delà, les suivantes restent « NotStarted »
+                $left = [int](($TimeoutSec - $sw.Elapsed.TotalSeconds) * 1000)
+                if ($left -gt 1000) {
+                    try {
+                        $task = $asTask.MakeGenericMethod($itemType).Invoke($null, @($m.UpdateAppByPackageFamilyNameAsync([string]$p)))
+                        if ($task.Wait([Math]::Min(120000, $left))) {
+                            $r.Item = $task.Result
+                            if ($null -eq $r.Item) { $r.State = 'NoUpdate' }
+                        }
+                    } catch {
+                        $r.State = 'Error'
+                        $r.Code = [int]$_.Exception.GetBaseException().HResult
+                    }
+                }
+                $run += $r
+            }
+            # États où l'attente s'arrête : fin, ou attente d'un geste de l'utilisateur (pause, batterie, Wi-Fi
+            # limité). « ReadyToDownload » est normal au départ : il ne compte qu'après 90 s.
+            $final = @('Completed', 'Error', 'Canceled', 'NoUpdate', 'Paused', 'PausedLowBattery', 'PausedWiFiRecommended', 'PausedWiFiRequired')
+            while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+                $busy = 0
+                foreach ($r in $run) {
+                    if ($null -eq $r.Item -or $final -contains $r.State) { continue }
+                    try {
+                        $st = $r.Item.GetCurrentStatus()
+                        $r.State = [string]$st.InstallState
+                        if ($null -ne $st.ErrorCode) { $r.Code = [int]$st.ErrorCode.HResult }
+                    } catch {
+                        # Élément retiré de la file ou service du Store relancé : état illisible, les autres continuent
+                        $r.State = 'Unknown'
+                        $r.Item = $null
+                        continue
+                    }
+                    if ($final -contains $r.State) { continue }
+                    if ($r.State -eq 'ReadyToDownload' -and $sw.Elapsed.TotalSeconds -gt 90) { continue }
+                    $busy++
+                }
+                if ($busy -eq 0) { break }
+                Start-Sleep -Milliseconds 1000
+            }
+            $o.Items = @($run | ForEach-Object { [pscustomobject]@{ Pfn = $_.Pfn; State = $_.State; Code = $_.Code } })
+        } else {
+            throw ('mode inconnu : ' + $Mode)
+        }
+        $o.Ok = $true
+    } catch {
+        $o.Error = [string]$_.Exception.GetBaseException().Message
+    }
+    return $o
+}
+
+function Get-StartAppNames {
+    # Noms affichés dans le menu Démarrer, par famille de paquets (identifiant « famille!App »)
+    $map = @{}
+    try {
+        foreach ($a in @(Get-StartApps -ErrorAction Stop)) {
+            $id = [string]$a.AppID
+            $k = $id.IndexOf('!')
+            if ($k -gt 0) {
+                $f = $id.Substring(0, $k)
+                if (-not $map.ContainsKey($f)) { $map[$f] = [string]$a.Name }
+            }
+        }
+    } catch { $map.Clear() }
+    return $map
+}
+
+function Get-AppxVersionMap {
+    # Version installée de chaque application du Store pour ce compte, par famille de paquets (la plus haute
+    # si la famille a plusieurs paquets). Vide si la liste est illisible.
+    $map = @{}
+    try {
+        foreach ($p in @(Get-AppxPackage -ErrorAction Stop)) {
+            $f = [string]$p.PackageFamilyName
+            if (-not $f) { continue }
+            $v = [string]$p.Version
+            if (-not $map.ContainsKey($f)) { $map[$f] = $v; continue }
+            $a = $null; $b = $null
+            if ([version]::TryParse($v, [ref]$a) -and [version]::TryParse([string]$map[$f], [ref]$b) -and $a -gt $b) { $map[$f] = $v }
+        }
+    } catch { $map.Clear() }
+    return $map
+}
+
+function Open-StoreLibraryGuided {
+    # Repli garanti : la page des mises à jour du Store, avec le mode d'emploi
+    try { Start-Process 'ms-windows-store://downloadsandupdates' -ErrorAction Stop } catch {
+        Write-Host '   [!] Le Microsoft Store n''a pas pu être ouvert : ouvre-le depuis le menu Démarrer.' -ForegroundColor Yellow
+    }
+    Write-Host ''
+    Write-Host '   DANS LE MICROSOFT STORE (page Bibliothèque) :' -ForegroundColor Cyan
+    Write-Host '   1. Clique sur « Obtenir les mises à jour » (en haut à droite).' -ForegroundColor Gray
+    Write-Host '   2. Ferme les applications concernées si le Store le demande, puis attends la fin.' -ForegroundColor Gray
+    Write-Host ''
+}
+
+function Update-StoreApps {
+    # Mise à jour des applications du Store trouvées pendant le scan, puis vérification par une nouvelle recherche
+    $q = ${function:Invoke-StoreQuery}.ToString()
+    $items = @($script:StoreItems)
+    $pfns = [string[]]@($items | ForEach-Object { $_.Pfn })
+    $before = Get-AppxVersionMap
+    $up = Invoke-Spinner 'Mise à jour par le Microsoft Store' {
+        param($QueryText, $List)
+        & ([scriptblock]::Create($QueryText)) -Mode 'Update' -Pfns $List -TimeoutSec 900
+    } 1020 -ArgumentList $q, $pfns
+    if ($null -eq $up -or -not $up.Ok) {
+        $why = 'pas de réponse du Store'
+        if ($up -and $up.Error) { $why = Cut $up.Error 60 }
+        Write-Action 'WARN' ('Microsoft Store : mise à jour impossible par J.A.R.V.I.S. (' + $why + ')')
+        Open-StoreLibraryGuided
+        return
+    }
+    Write-Host '   >> Vérification auprès du Microsoft Store...' -ForegroundColor DarkCyan
+    Start-Sleep -Seconds 5
+    $chk = Invoke-Spinner 'Nouvelle recherche dans le Microsoft Store' {
+        param($QueryText)
+        & ([scriptblock]::Create($QueryText)) -Mode 'Search' -TimeoutSec 150
+    } 180 -ArgumentList $q
+    $left = $null
+    if ($chk -and $chk.Ok) { $left = @(@($chk.Items) | ForEach-Object { [string]$_.Pfn }) }
+    $after = Get-AppxVersionMap
+    $notOk = 0
+    foreach ($s in $items) {
+        $state = 'NotStarted'; $code = 0
+        $r = @(@($up.Items) | Where-Object { $_.Pfn -eq $s.Pfn }) | Select-Object -First 1
+        if ($r) { $state = [string]$r.State; $code = [int]$r.Code }
+        $listed = $null
+        if ($null -ne $left) { $listed = ($left -contains $s.Pfn) }
+        $hex = '0x{0:X8}' -f $code
+        switch (Get-StoreUpdateVerdict $state $listed) {
+            'OK' {
+                # Constaté le 19/11/2026 : le Store peut cesser de proposer une mise à jour sans que la version
+                # change pour ce compte (composants Xbox) ; « vérifiée » seulement si la version a changé.
+                $v1 = [string]$before[$s.Pfn]; $v2 = [string]$after[$s.Pfn]
+                if ($v1 -and $v2 -and $v1 -ne $v2) { Write-Action 'OK' ('{0} : mise à jour vérifiée ({1} -> {2})' -f $s.Name, $v1, $v2) }
+                elseif ($v1 -and $v2) { Write-Action 'INFO' ('{0} : le Store ne la propose plus, version inchangée ({1})' -f $s.Name, $v2) }
+                else { Write-Action 'INFO' ($s.Name + ' : le Store ne la propose plus, version installée non lue') }
+            }
+            'FAIL' {
+                $notOk++
+                if (Test-AppxInUseMessage $hex) { Write-Action 'WARN' ($s.Name + ' : pas installée, l''application tournait encore (ferme-la puis réessaie)') }
+                elseif ($code -ne 0) { Write-Action 'FAIL' ('{0} : échec dans le Store (code {1})' -f $s.Name, $hex) }
+                else { Write-Action 'FAIL' ($s.Name + ' : échec dans le Store') }
+            }
+            'CANCELED' { $notOk++; Write-Action 'WARN' ($s.Name + ' : mise à jour annulée dans le Store') }
+            'PAUSED' { $notOk++; Write-Action 'WARN' ($s.Name + ' : en pause dans le Store (batterie, Wi-Fi limité ou pause demandée) : branche le secteur ou ouvre le Store') }
+            'WAITING' { $notOk++; Write-Action 'WARN' ($s.Name + ' : le Store ne l''a pas démarrée') }
+            'NOSTART' { $notOk++; Write-Action 'WARN' ($s.Name + ' : le Store n''a pas lancé la mise à jour, toujours proposée') }
+            'NOTDONE' { $notOk++; Write-Action 'WARN' ($s.Name + ' : le Store a répondu « terminé », mais propose toujours la mise à jour') }
+            'UNVERIFIED' { Write-Action 'INFO' ($s.Name + ' : le Store a répondu « terminé », résultat non vérifié') }
+            default { $notOk++; Write-Action 'INFO' ($s.Name + ' : pas terminée à temps, peut-être encore en cours dans le Store') }
+        }
+    }
+    if ($null -eq $left) {
+        Write-Action 'INFO' 'Nouvelle recherche dans le Store impossible : regarde dans Microsoft Store > Bibliothèque'
+    }
+    if ($notOk -gt 0) {
+        if (Read-YesNo '   >> Ouvrir la page des mises à jour du Microsoft Store ?') { Open-StoreLibraryGuided }
+    }
 }
 
 function Write-EventCount([string]$Label, [bool]$ReadOk, [int]$Count, [string]$BadState) {
@@ -3024,6 +3433,104 @@ function Invoke-SelfTestAnalyzers {
         Assert-True ($null -eq (Get-TallWindowPlacement 0 640 600 30 0 0)) 'écran sans hauteur accepté'
         '8/8 cas'
     }
+    Test-Case 'Windows Update : échecs de l''historique' {
+        $since = (Get-Date '2026-11-19 12:00').AddDays(-30)
+        $mk = { param($d, $rc, $t, $id, $hr) [pscustomobject]@{ Date = (Get-Date $d); Operation = 1; ResultCode = $rc; HResult = $hr; Title = $t; UpdateId = $id } }
+        $e = @(
+            (& $mk '2026-11-10' 4 '2026-11 Mise à jour cumulative (KB5132061) (26300.9974)' 'aaa' 0x800F0922),
+            (& $mk '2026-11-12' 2 '2026-11 Mise à jour cumulative (KB5132061) (26300.9980)' 'bbb' 0),
+            (& $mk '2026-11-15' 4 'Intel - Display - 31.0.101.5590' 'ccc' 0x80240034),
+            (& $mk '2026-11-16' 4 'Intel - Display - 31.0.101.5590' 'ccc' 0x80240034),
+            (& $mk '2026-10-22' 4 '9NCBCSZSJRSB-SpotifyAB.SpotifyMusic' 'ddd' 0x80240034),
+            (& $mk '2026-09-01' 4 'Ancien pilote' 'eee' 0x80070005),
+            (& $mk '2026-11-17' 2 'Pilote installé' 'fff' 0),
+            [pscustomobject]@{ Date = (Get-Date '2026-11-18'); Operation = 2; ResultCode = 4; HResult = 1; Title = 'Désinstallation ratée'; UpdateId = 'ggg' }
+        )
+        $r = Get-WuHistoryFailures $e $since
+        Assert-True (@($r.Failed).Count -eq 1) ('{0} échec(s) retenu(s), attendu 1 (même échec en double, réussi ensuite, hors période ou désinstallation comptés)' -f @($r.Failed).Count)
+        Assert-True ($r.Failed[0].Title -like 'Intel*' -and $r.Failed[0].Code -eq '0x80240034') ('échec mal lu : ' + $r.Failed[0].Code)
+        Assert-True ($r.Resolved -eq 1) 'échec suivi d''une réussite (même KB, autre version) non reconnu'
+        Assert-True ($r.Store -eq 1) 'application du Store non mise à part'
+        $r2 = Get-WuHistoryFailures @((& $mk '2026-11-12' 2 'X (KB5000001)' 'a' 0), (& $mk '2026-11-14' 4 'X (KB5000001)' 'b' 0x80070070)) $since
+        Assert-True (@($r2.Failed).Count -eq 1) 'nouvel échec après une réussite ignoré'
+        $r3 = Get-WuHistoryFailures @() $since
+        Assert-True (@($r3.Failed).Count -eq 0 -and $r3.Resolved -eq 0 -and $r3.Store -eq 0) 'historique vide mal lu'
+        # Recherche réussie : seul un échec encore proposé reste à faire (le pilote Intel a été remplacé)
+        $pend = @([pscustomobject]@{ Title = 'Autre mise à jour'; UpdateId = 'zzz' })
+        $r4 = Get-WuHistoryFailures $e $since $pend
+        Assert-True (@($r4.Failed).Count -eq 0 -and $r4.Resolved -eq 2) 'échec remplacé depuis compté comme à faire'
+        $r5 = Get-WuHistoryFailures $e $since @([pscustomobject]@{ Title = 'Intel - Display - 31.0.101.5590'; UpdateId = 'CCC' })
+        Assert-True (@($r5.Failed).Count -eq 1) 'échec toujours proposé non retenu (identifiant en majuscules)'
+        $r6 = Get-WuHistoryFailures $e $since @()
+        Assert-True (@($r6.Failed).Count -eq 0) 'aucune mise à jour proposée : échec retenu à tort'
+        Assert-True ((Get-WuErrorHint '0x800F0922') -match 'VPN') 'code 0x800F0922 sans explication'
+        Assert-True ((Get-WuErrorHint '0x80073712') -match 'scan complet') 'fichiers de Windows abîmés sans conseil'
+        Assert-True ($null -eq (Get-WuErrorHint '0x12345678')) 'code inconnu expliqué'
+        '12/12 cas'
+    }
+    Test-Case 'Microsoft Store : noms, réglage et résultat' {
+        $names = @{ 'SpotifyAB.SpotifyMusic_zpdnekdrzrea0' = 'Spotify' }
+        Assert-True ((Get-StoreAppLabel 'SpotifyAB.SpotifyMusic_zpdnekdrzrea0' $names) -eq 'Spotify') 'nom du menu Démarrer ignoré'
+        Assert-True ((Get-StoreAppLabel 'SPOTIFYAB.SPOTIFYMUSIC_zpdnekdrzrea0' $names) -eq 'Spotify') 'identifiant en majuscules non reconnu'
+        Assert-True ((Get-StoreAppLabel 'Microsoft.Xbox.TCUI_8wekyb3d8bbwe' @{}) -eq 'Xbox.TCUI') 'nom de repli mal formé'
+        Assert-True ((Get-StoreAppLabel 'Microsoft.XboxIdentityProvider_8wekyb3d8bbwe' @{}) -eq 'Xbox Identity Provider') 'nom de repli sans espaces'
+        Assert-True ((Get-StoreAppLabel 'Paquet_abc' $null) -eq 'Paquet') 'paquet sans éditeur'
+        Assert-True ((Get-StoreAppLabel '' $names) -eq '') 'identifiant vide'
+        Assert-True ((Get-StoreAutoVerdict 'Enabled') -eq 'OK' -and (Get-StoreAutoVerdict 'Disabled') -eq 'WARN') 'réglage automatique mal lu'
+        Assert-True ((Get-StoreAutoVerdict 'DisabledByPolicy') -eq 'POLICY' -and (Get-StoreAutoVerdict '') -eq 'UNKNOWN') 'stratégie ou valeur vide'
+        Assert-True ((Get-StoreUpdateVerdict 'Completed' $false) -eq 'OK') 'mise à jour vérifiée non reconnue'
+        Assert-True ((Get-StoreUpdateVerdict 'Completed' $true) -eq 'NOTDONE') '« Completed » cru alors que le Store la propose encore'
+        Assert-True ((Get-StoreUpdateVerdict 'Completed' $null) -eq 'UNVERIFIED') 'succès annoncé sans nouvelle recherche'
+        Assert-True ((Get-StoreUpdateVerdict 'Downloading' $false) -eq 'PENDING') 'téléchargement en cours pris pour un succès'
+        Assert-True ((Get-StoreUpdateVerdict 'Error' $false) -eq 'FAIL') 'erreur ignorée'
+        Assert-True ((Get-StoreUpdateVerdict 'NoUpdate' $false) -eq 'OK' -and (Get-StoreUpdateVerdict 'Canceled' $false) -eq 'CANCELED') 'rien à faire ou annulation'
+        Assert-True ((Get-StoreUpdateVerdict 'NoUpdate' $true) -eq 'NOSTART') 'mise à jour non lancée prise pour « terminé »'
+        Assert-True ((Get-StoreUpdateVerdict 'PausedLowBattery' $true) -eq 'PAUSED' -and (Get-StoreUpdateVerdict 'Paused' $null) -eq 'PAUSED') 'pause prise pour une attente normale'
+        Assert-True ((Get-StoreUpdateVerdict 'ReadyToDownload' $true) -eq 'WAITING' -and (Get-StoreUpdateVerdict 'NotStarted' $true) -eq 'WAITING') 'mise à jour jamais démarrée'
+        Assert-True ((Get-StoreUpdateVerdict 'Unknown' $false) -eq 'PENDING') 'état illisible pris pour un succès'
+        '18/18 cas'
+    }
+    Test-Case 'winget : erreurs séparées du texte analysé' {
+        # Même tableau que la sortie réelle du 19/11/2026, avec un message d'erreur (stderr) au milieu
+        $fmt = '{0,-16}{1,-22}{2,-19}{3,-19}{4}'
+        $er = [System.Management.Automation.ErrorRecord]::new([Exception]::new('Échec lors de la recherche dans la source : msstore'), 'NativeCommandError', 'NotSpecified', $null)
+        $lines = @(($fmt -f 'Nom', 'ID', 'Version', 'Disponible', 'Source'), ('-' * 82), $er,
+                   ($fmt -f 'Hytale Launcher', 'HypixelStudios.Hytale', '2026.05.14-26cebac', '2026.11.16-1726018', 'winget'),
+                   '1 mises à niveau disponibles.')
+        $sp = Split-NativeOutput -Lines $lines
+        Assert-True ($sp.Out -notmatch 'msstore') 'message d''erreur mêlé au texte analysé'
+        Assert-True ($sp.Err -eq 'Échec lors de la recherche dans la source : msstore') ('message d''erreur perdu : ' + $sp.Err)
+        Assert-True ($sp.Out.EndsWith("1 mises à niveau disponibles.`r`n")) 'lignes non terminées par CRLF'
+        $r = @(ConvertFrom-WingetText $sp.Out)
+        Assert-True ($r.Count -eq 1 -and $r[0].Id -eq 'HypixelStudios.Hytale') ('tableau mal lu après séparation : {0} paquet(s)' -f $r.Count)
+        $sp2 = Split-NativeOutput -Lines @()
+        Assert-True ($sp2.Out -eq '' -and $sp2.Err -eq '') 'sortie vide'
+        '5/5 cas'
+    }
+    Test-Case 'BIOS : page de support du fabricant' {
+        $g = Get-BiosSupportLink 'Gigabyte Technology Co., Ltd.' 'Gigabyte Technology Co., Ltd.' 'Z790 AORUS ELITE DDR4'
+        Assert-True ($g -and $g.Name -eq 'Gigabyte') 'Gigabyte non reconnu'
+        $d = Get-BiosSupportLink 'Dell Inc.' 'Dell Inc.' 'Latitude 5420'
+        Assert-True ($d -and $d.Name -eq 'Dell' -and $d.From -eq 'System') 'PC Dell'
+        $a = Get-BiosSupportLink 'ASUSTeK COMPUTER INC.' 'System manufacturer' 'System Product Name'
+        Assert-True ($a -and $a.Name -eq 'ASUS' -and $a.From -eq 'Board') 'carte ASUS dans un PC monté'
+        $m = Get-BiosSupportLink 'Micro-Star International Co., Ltd.' 'To Be Filled By O.E.M.' 'To Be Filled By O.E.M.'
+        Assert-True ($m -and $m.Name -eq 'MSI') 'carte MSI'
+        $h = Get-BiosSupportLink 'HP' 'HP' 'HP Pavilion Laptop 15-eh1xxx'
+        Assert-True ($h -and $h.Name -eq 'HP') 'PC HP'
+        Assert-True ($null -eq (Get-BiosSupportLink 'Microsoft Corporation' 'Microsoft Corporation' 'Virtual Machine')) 'machine virtuelle prise pour un PC de marque'
+        $s = Get-BiosSupportLink 'Microsoft Corporation' 'Microsoft Corporation' 'Surface Laptop 5'
+        Assert-True ($s -and $s.Name -eq 'Microsoft Surface') 'Surface'
+        Assert-True ($null -eq (Get-BiosSupportLink 'Fabricant inconnu' '' '')) 'fabricant inconnu'
+        Assert-True ($null -eq (Get-BiosSupportLink '' '' '')) 'aucun fabricant'
+        Assert-True (@(@($g, $d, $a, $m, $h, $s) | Where-Object { [string]$_.Url -notmatch '^https://[a-z0-9.-]+/' }).Count -eq 0) 'adresse non https'
+        Assert-True ((Get-BiosSearchName 'Z790 AORUS ELITE DDR4' 'Z790 AORUS ELITE DDR4' 'System') -eq 'Z790 AORUS ELITE DDR4') 'carte et PC du même nom'
+        Assert-True ((Get-BiosSearchName 'B450 TOMAHAWK MAX (MS-7C02)' 'MS-7C02' 'System') -eq 'MS-7C02 (carte mère B450 TOMAHAWK MAX (MS-7C02))') 'modèle du PC différent de la carte'
+        Assert-True ((Get-BiosSearchName 'PRIME B550-PLUS' 'System Product Name' 'System') -eq 'PRIME B550-PLUS') 'texte de remplissage cherché'
+        Assert-True ((Get-BiosSearchName 'X570 Steel Legend' 'To Be Filled By O.E.M.' 'Board') -eq 'X570 Steel Legend') 'carte mère ignorée'
+        Assert-True ((Get-BiosSearchName 'Default string' 'Default string' 'System') -eq '') 'aucun nom utile'
+        '15/15 cas'
+    }
     Test-Case 'Mode ASCII : conversion des glyphes' {
         $got = Convert-Glyph '█░┌─┐…'
         Assert-True ($got -eq '#.+-+...') "obtenu $got"
@@ -3144,6 +3651,24 @@ function Invoke-SelfTest {
         $null = New-Object -ComObject Microsoft.Update.Session -ErrorAction Stop
         $null = New-Object -ComObject Microsoft.Update.AutoUpdate -ErrorAction Stop
         'agents accessibles'
+    }
+    Test-Case 'Windows Update : historique' {
+        $se = (New-Object -ComObject Microsoft.Update.Session -ErrorAction Stop).CreateUpdateSearcher()
+        $n = [int]$se.GetTotalHistoryCount()
+        if ($n -eq 0) { return 'historique vide' }
+        $h = @($se.QueryHistory(0, [Math]::Min($n, 50)))
+        Assert-True ($h.Count -gt 0) 'historique annoncé mais illisible'
+        Assert-True ($null -ne $h[0].Date -and $null -ne $h[0].ResultCode) 'entrée sans date ni résultat'
+        "$n entrée(s)"
+    }
+    Test-Case 'Microsoft Store : recherche (sans installer)' {
+        $r = Invoke-Spinner 'recherche Store' {
+            param($QueryText)
+            & ([scriptblock]::Create($QueryText)) -Mode 'Search' -TimeoutSec 150
+        } 180 -ArgumentList ${function:Invoke-StoreQuery}.ToString()
+        Assert-True ($null -ne $r) 'délai dépassé'
+        Assert-True ($r.Ok) ('recherche impossible : ' + $r.Error)
+        ('{0} mise(s) à jour proposée(s), mises à jour automatiques : {1}' -f @($r.Items).Count, $r.Auto)
     }
     Test-Case 'winget' {
         if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { return 'SKIP:non installé' }
@@ -3965,6 +4490,7 @@ $wu = Invoke-Spinner 'Interrogation des serveurs Microsoft' {
         foreach ($u in $r.Updates) {
             $list += [pscustomobject]@{
                 Title  = [string]$u.Title
+                UpdateId = [string]$u.Identity.UpdateID
                 Driver = ($u.Type -eq 2)
                 Optional = [bool]$u.BrowseOnly
                 Interactive = [bool]$u.InstallationBehavior.CanRequestUserInput
@@ -4009,33 +4535,86 @@ if ($null -eq $wu) {
     }
 }
 
+# Historique des 30 derniers jours : installations en échec jamais réussies depuis
+$wuh = Invoke-Spinner 'Lecture de l''historique des mises à jour' {
+    try {
+        $se = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher()
+        $n = [int]$se.GetTotalHistoryCount()
+        $rows = @()
+        if ($n -gt 0) {
+            $lim = (Get-Date).AddDays(-30)
+            foreach ($e in $se.QueryHistory(0, [Math]::Min($n, 500))) {
+                if ($null -eq $e.Date) { continue }
+                # Dates rendues en heure UTC (11 h 52 dans l'historique = 12 h 52 dans le journal Système, relevé le 19/11/2026)
+                $d = [DateTime]::SpecifyKind([datetime]$e.Date, [DateTimeKind]::Utc).ToLocalTime()
+                if ($d -lt $lim) { continue }
+                $rows += [pscustomobject]@{ Date = $d; Operation = [int]$e.Operation; ResultCode = [int]$e.ResultCode
+                                            HResult = [int]$e.HResult; Title = [string]$e.Title; UpdateId = [string]$e.UpdateIdentity.UpdateID }
+            }
+        }
+        [pscustomobject]@{ Ok = $true; Entries = $rows; Error = $null }
+    } catch {
+        [pscustomobject]@{ Ok = $false; Entries = @(); Error = $_.Exception.Message }
+    }
+} 60
+
+if ($null -eq $wuh -or -not $wuh.Ok) {
+    Write-Status 'Échecs d''installation (30 j)' 'historique illisible' 'INFO'
+} else {
+    $pend = $null
+    if ($null -ne $wu -and $wu.Ok) { $pend = @($wu.Updates) }
+    $hf = Get-WuHistoryFailures @($wuh.Entries) ((Get-Date).AddDays(-30)) $pend
+    $nf = @($hf.Failed).Count
+    if ($nf -eq 0) {
+        Write-Status 'Échecs d''installation (30 j)' 'aucun' 'OK'
+    } else {
+        $nfTxt = "{0} mise(s) à jour jamais réussie(s) depuis" -f $nf
+        if ($null -ne $pend) { $nfTxt = "{0} mise(s) à jour en échec, toujours proposée(s)" -f $nf }
+        Write-Status 'Échecs d''installation (30 j)' $nfTxt 'WARN'
+        foreach ($f in @($hf.Failed)) {
+            Write-Sub ("{0}  {1}  (code {2})" -f (Format-Date $f.Date), (Cut $f.Title 58), $f.Code) 'Yellow'
+            $hint = Get-WuErrorHint $f.Code
+            if ($hint) { Write-Sub ('  ' + $hint) }
+        }
+        Write-Sub 'Windows Update les retente seul. Si l''échec revient, note le code et cherche-le sur support.microsoft.com'
+    }
+    if ($hf.Resolved -gt 0) { Write-Sub ("{0} autre(s) échec(s), réussi(s) ou remplacé(s) depuis : rien à faire" -f $hf.Resolved) }
+    if ($hf.Store -gt 0) { Write-Sub ("{0} échec(s) d'applications du Microsoft Store, non comptés ici : voir la section suivante" -f $hf.Store) }
+}
+
 # ==================================================================
-# [03] APPLICATIONS (winget)
+# [03] APPLICATIONS (winget et Microsoft Store)
 # ==================================================================
-Write-Section '03' 'Applications (winget)'
+Write-Section '03' 'Applications (winget et Store)'
 
 if ($NoWinget) {
     Write-Status 'winget' 'vérification sautée (-NoWinget)' 'INFO'
 } else {
     $wgParser = ${function:ConvertFrom-WingetText}.ToString()
     $wgUnknown = ${function:Get-WingetUnknownCount}.ToString()
+    $wgSplit = ${function:Split-NativeOutput}.ToString()
     $wg = Invoke-Spinner 'Analyse des paquets installés' {
-        param($ParserText, $UnknownText)
+        param($ParserText, $UnknownText, $SplitText)
         # Liste de départ : « winget upgrade ». Le module (s'il est là) complète noms, identifiants et
         # versions tronqués, et écarte ce que winget refusera d'installer (IsUpdateAvailable faux).
         # Constaté le 19/11/2026 : Epson Scan 2 (version « Unknown ») et Hytale Launcher (installé pour
         # tous les utilisateurs, winget ne propose qu'une installation par utilisateur) étaient proposés
         # puis refusés par winget ; le module, lui, savait que Hytale n'était pas applicable.
         $out = [pscustomobject]@{ Mode = 'text'; Items = @(); Unknown = 0; UnknownNames = @(); NotApplicable = @(); Error = $null
-                                  Raw = ''; Code = $null; Parsed = 0 }
+                                  Raw = ''; Err = ''; Code = $null; Parsed = 0 }
         if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
             $out.Error = 'NOWINGET'
             return $out
         }
         try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
-        $raw = & winget upgrade --accept-source-agreements --disable-interactivity 2>&1 | Out-String
+        $lines = @(& winget upgrade --accept-source-agreements --disable-interactivity 2>&1)
+        $wgCode = $LASTEXITCODE
+        # Messages d'erreur (stderr) mis à part : seul le texte normal de winget est analysé
+        $sp = & ([scriptblock]::Create($SplitText)) -Lines $lines
+        $raw = $sp.Out
+        $out.Err = [string]$sp.Err
         # Texte brut et code de retour renvoyés aussi : « aucune mise à jour » ne s'affiche que si winget le dit
-        $out.Code = $LASTEXITCODE
+        $out.Code = $wgCode
         $out.Raw = [string]$raw
         $out.Items = @(& ([scriptblock]::Create($ParserText)) $raw)
         $out.Parsed = @($out.Items).Count
@@ -4075,7 +4654,7 @@ if ($NoWinget) {
             }
         } catch {}
         return $out
-    } 300 -ArgumentList $wgParser, $wgUnknown
+    } 300 -ArgumentList $wgParser, $wgUnknown, $wgSplit
 
     if ($null -eq $wg) {
         Write-Status 'winget' 'délai dépassé (5 min)' 'WARN'
@@ -4100,6 +4679,7 @@ if ($NoWinget) {
             $first = @(([string]$wg.Raw -split "`n") | ForEach-Object { (Remove-ControlChars $_).Trim() } |
                        Where-Object { $_ -and $_ -notmatch '^[\\|/\-\s]+$' } | Select-Object -First 1)
             if ($first.Count -gt 0) { Write-Sub ('winget a répondu : ' + (Cut $first[0] 70)) }
+            if ($wg.Err) { Write-Sub ('Message d''erreur de winget : ' + (Cut (Remove-ControlChars (([string]$wg.Err -split "`r?`n")[0])) 60)) }
             if ($null -ne $wg.Code -and [int]$wg.Code -ne 0) { Write-Sub ('Code de retour de winget : 0x{0:X8}' -f [int]$wg.Code) }
             Write-Sub 'Vérifie la connexion Internet puis relance le scan'
         } elseif ($items.Count -eq 0) {
@@ -4130,6 +4710,48 @@ if ($NoWinget) {
             Write-Status 'Non mises à jour par winget' (Cut ((@($wg.NotApplicable) | ForEach-Object { $_.Name }) -join ', ') 60) 'INFO'
             Write-Sub 'Leur nouvelle version ne convient pas à leur installation : mets-les à jour depuis l''application elle-même'
         }
+    }
+}
+
+$stQuery = ${function:Invoke-StoreQuery}.ToString()
+$stq = Invoke-Spinner 'Recherche des mises à jour du Microsoft Store' {
+    param($QueryText)
+    & ([scriptblock]::Create($QueryText)) -Mode 'Search' -TimeoutSec 150
+} 180 -ArgumentList $stQuery
+if ($null -eq $stq -or -not $stq.Ok) {
+    $why = 'pas de réponse'
+    if ($script:SpinState -eq 'TIMEOUT') { $why = 'délai dépassé' }
+    if ($stq -and $stq.Error) { $why = Cut $stq.Error 45 }
+    Write-Status 'Applications du Store' ('lecture impossible (' + $why + ')') 'INFO'
+    Write-Sub 'Vérifie toi-même : Microsoft Store > Bibliothèque > Obtenir les mises à jour'
+} elseif (-not (Test-SameAccount ([string](Get-CimInstance Win32_ComputerSystem).UserName) ([Environment]::UserName))) {
+    # Le Store est propre à chaque compte : après une élévation sous un autre compte, ce serait le sien
+    Write-Status 'Applications du Store' 'non lues : J.A.R.V.I.S. tourne sous un autre compte que le tien' 'INFO'
+    Write-Sub 'Vérifie toi-même : Microsoft Store > Bibliothèque > Obtenir les mises à jour'
+} else {
+    $startNames = Get-StartAppNames
+    $wgNames = @(@($script:WGItems) | ForEach-Object { [string]$_.Name })
+    $sItems = @()
+    foreach ($i in @($stq.Items)) {
+        $lbl = Remove-ControlChars (Get-StoreAppLabel ([string]$i.Pfn) $startNames)
+        if (-not $lbl -or $wgNames -contains $lbl) { continue }   # déjà proposée par winget
+        $sItems += [pscustomobject]@{ Pfn = [string]$i.Pfn; Name = $lbl }
+    }
+    $script:StoreItems = $sItems
+    if ($sItems.Count -eq 0) {
+        Write-Status 'Applications du Store' 'aucune mise à jour' 'OK'
+    } else {
+        Write-Status 'Applications du Store' ("{0} à mettre à jour" -f $sItems.Count) 'WARN'
+        foreach ($s in $sItems) { Write-Sub (Cut $s.Name 90) 'Yellow' }
+    }
+    switch (Get-StoreAutoVerdict ([string]$stq.Auto)) {
+        'OK' { Write-Status 'Mises à jour auto. du Store' 'activées' 'OK' }
+        'WARN' {
+            Write-Status 'Mises à jour auto. du Store' 'désactivées' 'WARN'
+            Write-Sub 'Pour les réactiver : Microsoft Store > ta photo de profil > Paramètres > Mises à jour des applications'
+        }
+        'POLICY' { Write-Status 'Mises à jour auto. du Store' 'désactivées par une stratégie (PC géré)' 'INFO' }
+        default { Write-Status 'Mises à jour auto. du Store' 'réglage illisible' 'INFO' }
     }
 }
 
@@ -4743,7 +5365,27 @@ if (-not $bios) {
     elseif ($bAge -gt 365) { Write-Status 'Version BIOS' "$bTxt  (> 1 an)" 'WARN' }
     else { Write-Status 'Version BIOS' $bTxt 'OK' }
 }
-Write-Sub ("Dernière version : site du fabricant > Support > {0}" -f $board.Product)
+$csys = $null
+try { $csys = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop } catch { $csys = $null }
+$sysMaker = ''; $sysModel = ''
+if ($csys) { $sysMaker = [string]$csys.Manufacturer; $sysModel = [string]$csys.Model }
+$bLink = Get-BiosSupportLink ([string]$board.Manufacturer) $sysMaker $sysModel
+$bFrom = 'Board'
+if ($bLink) { $bFrom = $bLink.From }
+$bModel = Remove-ControlChars (Get-BiosSearchName ([string]$board.Product) $sysModel $bFrom)
+if ($bLink) {
+    Write-Sub ("Dernière version : {0}" -f $bLink.Url)
+    if ($bModel) { Write-Sub ("puis cherche « {0} » et la rubrique BIOS" -f (Cut $bModel 60)) }
+    else { Write-Sub 'puis cherche le modèle de ton PC et la rubrique BIOS' }
+} elseif ($bModel) {
+    Write-Sub ("Dernière version : site du fabricant > Support > {0}" -f (Cut $bModel 60))
+} else {
+    Write-Sub 'Dernière version : site du fabricant de ton PC ou de sa carte mère, rubrique Support'
+}
+if ($bios -and $null -ne $bAge -and $bAge -gt 365) {
+    Write-Sub 'J.A.R.V.I.S. n''installe pas de BIOS : une mise à jour ratée peut rendre le PC inutilisable.'
+    Write-Sub 'Ne le mets à jour que si le fabricant le conseille ou pour régler un problème.'
+}
 
 # ==================================================================
 # [13] INTÉGRITÉ WINDOWS (mode complet)
@@ -4941,7 +5583,7 @@ if ($script:WGCount -gt 0) {
         }
         Write-Host ''
         Write-Host '   >> Vérification du résultat...' -ForegroundColor DarkCyan
-        $raw2 = (& winget upgrade --accept-source-agreements --disable-interactivity 2>&1) | Out-String
+        $raw2 = (Split-NativeOutput -Lines @(& winget upgrade --accept-source-agreements --disable-interactivity 2>&1)).Out
         $leftAll = @(ConvertFrom-WingetText $raw2)
         $left = @($leftAll | Where-Object { $skip -notcontains $_.Id })
         $verif = Get-WingetScanState $raw2 $leftAll.Count
@@ -4991,6 +5633,14 @@ if ($script:WGCount -gt 0) {
             Write-Action 'WARN' 'Vérification impossible : la réponse de winget n''a pas pu être lue'
             Write-Host '          Relance un scan pour contrôler.' -ForegroundColor DarkGray
         }
+    }
+}
+if (@($script:StoreItems).Count -gt 0) {
+    Write-Host ('   [i] Applications du Microsoft Store concernées : ' + (Cut ((@($script:StoreItems) | ForEach-Object { $_.Name }) -join ', ') 80)) -ForegroundColor DarkGray
+    Write-Host '       Une application ouverte ne peut pas être mise à jour : ferme-les avant de valider.' -ForegroundColor DarkGray
+    if (Read-YesNo ("   >> Mettre à jour les {0} application(s) du Microsoft Store ?" -f @($script:StoreItems).Count)) {
+        Write-Host ''
+        Update-StoreApps
     }
 }
 if ($script:WUCount -eq 0 -and $script:WUManual -gt 0) {
