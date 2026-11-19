@@ -88,7 +88,9 @@ param(
     [switch]$Uninstall,
     [switch]$Update,
     [string]$InstallDir = '',
-    [string]$Name = ''
+    [string]$Name = '',
+    # Interne : place et taille de la fenêtre d'avant une relance de cette même version (Format-WinRect)
+    [string]$WinRect = ''
 )
 
 # ------------------------------------------------------------------
@@ -827,15 +829,43 @@ function Get-TallWindowPlacement([int]$Top, [int]$Height, [int]$ClientHeight, [i
     return [pscustomobject]@{ Top = $newTop; Height = $newH }
 }
 
-function Set-ConsoleTall {
-    # Agrandit la fenêtre en hauteur (30 lignes d'origine : le scan défile trop vite pour être lu).
-    # Marche dans Windows Terminal comme dans la console classique : c'est la fenêtre elle-même qui est
-    # redimensionnée, largeur et position horizontale inchangées. Rien n'est fait si la fenêtre est
-    # agrandie en plein écran, réduite, invisible (sortie redirigée) ou déjà assez haute.
+function Format-WinRect([int]$X, [int]$Y, [int]$W, [int]$H) {
+    # Place et taille d'une fenêtre écrites pour l'argument -WinRect (exemple : R226_234_1200_1053). Le texte
+    # commence par une lettre (une coordonnée négative serait prise pour un nom de paramètre) et n'a pas de
+    # virgule (l'en-tête de JARVIS.cmd en ferait une liste). Fonction pure, testée en T1.
+    return ('R{0}_{1}_{2}_{3}' -f $X, $Y, $W, $H)
+}
+
+function ConvertFrom-WinRect([string]$Text) {
+    # Lecture stricte du texte de Format-WinRect : X, Y, W, H, ou $null. Fonction pure, testée en T1.
+    if ($Text -notmatch '^R(-?\d{1,5})_(-?\d{1,5})_(\d{1,5})_(\d{1,5})$') { return $null }
+    return [pscustomobject]@{ X = [int]$Matches[1]; Y = [int]$Matches[2]; W = [int]$Matches[3]; H = [int]$Matches[4] }
+}
+
+function Get-RestoredPlacement($Rect, [int]$WorkLeft, [int]$WorkTop, [int]$WorkRight, [int]$WorkBottom) {
+    # Place et taille reprises d'une fenêtre précédente ($Rect : X, Y, W, H), ramenées dans la zone libre de
+    # l'écran (hors barre des tâches). $null si la taille est absurde. Fonction pure, testée en T1.
+    if ($null -eq $Rect) { return $null }
+    $ww = $WorkRight - $WorkLeft
+    $wh = $WorkBottom - $WorkTop
+    $x = [int]$Rect.X; $y = [int]$Rect.Y; $w = [int]$Rect.W; $h = [int]$Rect.H
+    if ($ww -le 0 -or $wh -le 0 -or $w -lt 200 -or $h -lt 150) { return $null }
+    if ($w -gt $ww) { $w = $ww }
+    if ($h -gt $wh) { $h = $wh }
+    if ($x + $w -gt $WorkRight) { $x = $WorkRight - $w }
+    if ($x -lt $WorkLeft) { $x = $WorkLeft }
+    if ($y + $h -gt $WorkBottom) { $y = $WorkBottom - $h }
+    if ($y -lt $WorkTop) { $y = $WorkTop }
+    return [pscustomobject]@{ X = $x; Y = $y; W = $w; H = $h }
+}
+
+function Initialize-NativeWin {
+    # Fonctions de Windows pour lire et placer la fenêtre (chargées une seule fois)
+    if ('JarvisNative.Win' -as [type]) { return $true }
     try {
-        if (-not ('JarvisNative.Win' -as [type])) {
-            Add-Type -Namespace JarvisNative -Name Win -MemberDefinition @'
+        Add-Type -Namespace JarvisNative -Name Win -MemberDefinition @'
 [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+[StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
 [StructLayout(LayoutKind.Sequential)] public struct MONITORINFO { public int cbSize; public RECT rcMonitor; public RECT rcWork; public uint dwFlags; }
 [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
 [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
@@ -845,18 +875,71 @@ function Set-ConsoleTall {
 [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
 [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
 [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+[DllImport("user32.dll")] public static extern IntPtr MonitorFromPoint(POINT pt, uint flags);
 [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr hmon, ref MONITORINFO mi);
 [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
 '@
-        }
+        return $true
+    } catch { return $false }
+}
+
+function Get-JarvisWindow {
+    # Fenêtre réellement affichée, ou zéro. Dans Windows Terminal, la fenêtre de console est cachée : la vraie
+    # fenêtre est son propriétaire. Rien si elle est invisible (sortie redirigée), en plein écran ou réduite.
+    if (-not (Initialize-NativeWin)) { return [IntPtr]::Zero }
+    $con = [JarvisNative.Win]::GetConsoleWindow()
+    if ($con -eq [IntPtr]::Zero) { return [IntPtr]::Zero }
+    $win = [JarvisNative.Win]::GetAncestor($con, 3)
+    if ($win -eq [IntPtr]::Zero) { $win = $con }
+    if (-not [JarvisNative.Win]::IsWindowVisible($win)) { return [IntPtr]::Zero }
+    if ([JarvisNative.Win]::IsZoomed($win) -or [JarvisNative.Win]::IsIconic($win)) { return [IntPtr]::Zero }
+    return $win
+}
+
+function Get-WinRectArg {
+    # Argument ajouté à une relance de cette même version (administrateur, installation) : la nouvelle fenêtre
+    # reprend la place et la taille de celle-ci. Constaté le 19/11/2026 : relancé en administrateur depuis
+    # Windows Terminal, JARVIS s'ouvre dans l'ancienne console de Windows, 50 lignes mais une police plus
+    # petite (839 pixels de haut au lieu de 1 053) ; Set-ConsoleTall la jugeait assez haute. '' : rien à transmettre.
+    try {
+        $win = Get-JarvisWindow
+        if ($win -eq [IntPtr]::Zero) { return '' }
+        $wr = New-Object JarvisNative.Win+RECT
+        if (-not [JarvisNative.Win]::GetWindowRect($win, [ref]$wr)) { return '' }
+        return (' -WinRect ' + (Format-WinRect $wr.Left $wr.Top ($wr.Right - $wr.Left) ($wr.Bottom - $wr.Top)))
+    } catch { return '' }
+}
+
+function Set-ConsoleRect([string]$Text) {
+    # Reprend la place et la taille transmises par -WinRect, sur l'écran où était la fenêtre d'avant.
+    # $false si rien n'a été fait (texte illisible, fenêtre invisible, en plein écran ou réduite).
+    try {
+        $rect = ConvertFrom-WinRect $Text
+        if ($null -eq $rect) { return $false }
+        $win = Get-JarvisWindow
+        if ($win -eq [IntPtr]::Zero) { return $false }
+        $pt = New-Object JarvisNative.Win+POINT
+        $pt.X = $rect.X + [int]($rect.W / 2)
+        $pt.Y = $rect.Y + [int]($rect.H / 2)
+        $mi = New-Object JarvisNative.Win+MONITORINFO
+        $mi.cbSize = [Runtime.InteropServices.Marshal]::SizeOf($mi)
+        if (-not [JarvisNative.Win]::GetMonitorInfo([JarvisNative.Win]::MonitorFromPoint($pt, 2), [ref]$mi)) { return $false }
+        $pl = Get-RestoredPlacement $rect $mi.rcWork.Left $mi.rcWork.Top $mi.rcWork.Right $mi.rcWork.Bottom
+        if ($null -eq $pl) { return $false }
+        # 0x14 : ordre d'empilement inchangé, fenêtre non activée
+        return [JarvisNative.Win]::SetWindowPos($win, [IntPtr]::Zero, $pl.X, $pl.Y, $pl.W, $pl.H, 0x14)
+    } catch { return $false }
+}
+
+function Set-ConsoleTall {
+    # Agrandit la fenêtre en hauteur (30 lignes d'origine : le scan défile trop vite pour être lu).
+    # Marche dans Windows Terminal comme dans la console classique : c'est la fenêtre elle-même qui est
+    # redimensionnée, largeur et position horizontale inchangées. Rien n'est fait si la fenêtre est
+    # agrandie en plein écran, réduite, invisible (sortie redirigée) ou déjà assez haute.
+    try {
         $rows = [Console]::WindowHeight
-        $con = [JarvisNative.Win]::GetConsoleWindow()
-        if ($con -eq [IntPtr]::Zero) { return $false }
-        # Dans Windows Terminal, la fenêtre de console est cachée : la vraie fenêtre est son propriétaire
-        $win = [JarvisNative.Win]::GetAncestor($con, 3)
-        if ($win -eq [IntPtr]::Zero) { $win = $con }
-        if (-not [JarvisNative.Win]::IsWindowVisible($win)) { return $false }
-        if ([JarvisNative.Win]::IsZoomed($win) -or [JarvisNative.Win]::IsIconic($win)) { return $false }
+        $win = Get-JarvisWindow
+        if ($win -eq [IntPtr]::Zero) { return $false }
         $wr = New-Object JarvisNative.Win+RECT
         $cr = New-Object JarvisNative.Win+RECT
         if (-not [JarvisNative.Win]::GetWindowRect($win, [ref]$wr)) { return $false }
@@ -3518,6 +3601,24 @@ function Invoke-SelfTestAnalyzers {
         Assert-True ((Get-BiosSearchName 'Default string' 'Default string' 'System') -eq '') 'aucun nom utile'
         '15/15 cas'
     }
+    Test-Case 'Fenêtre : place reprise après une relance' {
+        $t = Format-WinRect -8 234 1200 1053
+        Assert-True ($t -eq 'R-8_234_1200_1053') ('texte mal formé : ' + $t)
+        $r = ConvertFrom-WinRect $t
+        Assert-True ($null -ne $r -and $r.X -eq -8 -and $r.Y -eq 234 -and $r.W -eq 1200 -and $r.H -eq 1053) 'aller-retour du texte'
+        Assert-True ($null -eq (ConvertFrom-WinRect '226,234,1200,1053')) 'virgules acceptées'
+        Assert-True ($null -eq (ConvertFrom-WinRect 'R1_2_3_4; calc')) 'texte en trop accepté'
+        Assert-True ($null -eq (ConvertFrom-WinRect '')) 'texte vide accepté'
+        # Écran 2560x1440, barre des tâches de 40 pixels : fenêtre reprise telle quelle
+        $p = Get-RestoredPlacement (ConvertFrom-WinRect 'R226_234_1200_1053') 0 0 2560 1400
+        Assert-True ($null -ne $p -and $p.X -eq 226 -and $p.Y -eq 234 -and $p.W -eq 1200 -and $p.H -eq 1053) 'place modifiée à tort'
+        # Fenêtre collée au bord gauche (bordure invisible à -8) et trop haute pour un écran de 768
+        $q = Get-RestoredPlacement (ConvertFrom-WinRect 'R-8_100_1200_1053') 0 0 1366 728
+        Assert-True ($null -ne $q -and $q.X -eq 0 -and $q.Y -eq 0 -and $q.H -eq 728) 'fenêtre hors de l''écran'
+        Assert-True ($null -eq (Get-RestoredPlacement (ConvertFrom-WinRect 'R0_0_100_80') 0 0 2560 1400)) 'fenêtre minuscule acceptée'
+        Assert-True ($null -eq (Get-RestoredPlacement $null 0 0 2560 1400)) 'texte illisible accepté'
+        '9/9 cas'
+    }
     Test-Case 'Mode ASCII : conversion des glyphes' {
         $got = Convert-Glyph '█░┌─┐…'
         Assert-True ($got -eq '#.+-+...') "obtenu $got"
@@ -4106,7 +4207,9 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 
 try {
-$null = Set-ConsoleTall
+$placed = $false
+if ($WinRect) { $placed = Set-ConsoleRect $WinRect }
+if (-not $placed) { $null = Set-ConsoleTall }
 Clear-Host
 Show-Banner
 if ($Name) { $Name = [string](Get-SafeName $Name) }
@@ -4219,6 +4322,7 @@ if (-not $JarvisInstalled -and $JarvisSelf -like '*.cmd') {
         # Program Files exige les droits administrateur : relance élevée en mode installation
         $ia = '-Install'
         if ($InstallDir) { $ia += " -InstallDir `"$InstallDir`"" }
+        $ia += Get-WinRectArg
         Write-Host '   >> Validation administrateur requise pour installer dans Program Files.' -ForegroundColor Cyan
         if (Start-Elevated $JarvisSelf $ia) { exit }
         Write-Host '   >> Installation annulée. Lancement sans installation.' -ForegroundColor DarkGray
@@ -4232,7 +4336,8 @@ if (-not $JarvisInstalled -and $JarvisSelf -like '*.cmd') {
         if ($dest) {
             Write-Host ''
             if (Read-YesNo '   >> Lancer J.A.R.V.I.S. maintenant ?' -DefaultYes) {
-                if (-not (Start-Elevated $dest '')) {
+                # Version tout juste installée, donc la même : elle connaît -WinRect
+                if (-not (Start-Elevated $dest ((Get-WinRectArg).Trim()))) {
                     Write-Host '   >> Lance J.A.R.V.I.S. plus tard depuis le menu Démarrer.' -ForegroundColor DarkGray
                     Start-Sleep -Seconds 3
                 }
@@ -4257,6 +4362,7 @@ if (-not $isAdmin -and -not $NoElevate) {
         if ($NoWinget) { $argList += ' -NoWinget' }
         if ($Quick)    { $argList += ' -Quick' }
         if ($Deep)     { $argList += ' -Deep' }
+        $argList += Get-WinRectArg
         $okUac = $false
         if ($JarvisSelf -like '*.cmd') { $okUac = Start-Elevated $JarvisSelf $argList.Trim() }
         else { $okUac = Start-Elevated 'powershell.exe' ("-NoProfile -ExecutionPolicy Bypass -File `"$JarvisSelf`"" + $argList) }
