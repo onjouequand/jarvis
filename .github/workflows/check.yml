@@ -1,0 +1,36 @@
+# Contrôle automatique à chaque envoi : la source passe tools/check.ps1 sous Windows PowerShell 5.1,
+# et le JARVIS.cmd du dépôt est bien celui que build.py fabrique à partir de la source.
+name: Controle
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  controle:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PSScriptAnalyzer
+        shell: powershell
+        run: |
+          [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+          Save-Module -Name PSScriptAnalyzer -Repository PSGallery -Path .modules -Force
+
+      - name: Controle de la source
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\check.ps1 -RequireAnalyzer
+
+      - name: Fabrication
+        shell: powershell
+        run: python build.py
+
+      - name: JARVIS.cmd du depot = JARVIS.cmd fabrique
+        shell: powershell
+        run: |
+          git diff --exit-code -- JARVIS.cmd
+          if ($LASTEXITCODE -ne 0) { Write-Host 'JARVIS.cmd ne correspond pas a la source : lance python build.py avant le commit.'; exit 1 }

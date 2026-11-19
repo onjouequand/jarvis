@@ -1,6 +1,6 @@
 <# : JARVIS.cmd - fichier hybride batch + PowerShell. Ne pas modifier ce fichier.
 @echo off
-rem JARVIS-SHA256=daba66174fbe124ddf1dd346c0c4cc586e2f35dbc41b90ceba4030515315705b
+rem JARVIS-SHA256=61ccbc8aec63e8d9480f06e09c2c0f6826145bfa19e6601ec95699be5de21962
 setlocal
 chcp 65001 >nul
 set "JARVIS_SELF=%~f0"
@@ -1177,7 +1177,8 @@ function Get-JarvisReleaseInfo([string]$Json, [string]$Repo) {
     if (-not $url.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or $url -match '\s|\.\.') {
         $r.Reason = 'adresse de téléchargement inattendue'; return $r
     }
-    $d = [string]$asset.digest
+    $d = ''
+    if ($asset.PSObject.Properties['digest']) { $d = [string]$asset.digest }
     if ($d) {
         if ($d -notmatch '^sha256:([0-9a-fA-F]{64})$') { $r.Reason = 'empreinte publiée illisible'; return $r }
         $r.Sha256 = $Matches[1].ToLower()
@@ -1460,39 +1461,10 @@ function Get-SfcPath {
 # ------------------------------------------------------------------
 # Auto-test
 # ------------------------------------------------------------------
-function Invoke-SelfTest {
-    $results = New-Object System.Collections.Generic.List[object]
-    $log = New-Object System.Collections.Generic.List[string]
-
-    function Add-Result([string]$Name, [string]$State, [string]$Detail, [double]$Ms) {
-        $results.Add([pscustomobject]@{ Name = $Name; State = $State; Detail = $Detail })
-        $col = @{ PASS = 'Green'; FAIL = 'Red'; SKIP = 'DarkGray' }[$State]
-        Write-Host '   ' -NoNewline
-        Write-Host ('[{0}]' -f $State) -NoNewline -ForegroundColor $col
-        Write-Host (' {0,-42}' -f (Cut $Name 42)) -NoNewline -ForegroundColor Gray
-        Write-Host ('{0,7:N0} ms  ' -f $Ms) -NoNewline -ForegroundColor DarkGray
-        Write-Host $Detail -ForegroundColor White
-        $log.Add(('[{0}] {1,-42} {2,7:N0} ms  {3}' -f $State, $Name, $Ms, $Detail))
-    }
-    function Assert-True([bool]$Cond, [string]$Msg) { if (-not $Cond) { throw $Msg } }
-    function Test-Case([string]$Name, [scriptblock]$Body, [switch]$NeedAdmin) {
-        if ($NeedAdmin -and -not $isAdmin) { Add-Result $Name 'SKIP' 'droits admin requis' 0; return }
-        $sw = [Diagnostics.Stopwatch]::StartNew()
-        try {
-            $r = & $Body | Select-Object -Last 1
-            $sw.Stop()
-            if ($r -is [string] -and $r.StartsWith('SKIP:')) { Add-Result $Name 'SKIP' $r.Substring(5) $sw.Elapsed.TotalMilliseconds }
-            else { Add-Result $Name 'PASS' ([string]$r) $sw.Elapsed.TotalMilliseconds }
-        } catch {
-            $sw.Stop()
-            Add-Result $Name 'FAIL' (Cut $_.Exception.Message 80) $sw.Elapsed.TotalMilliseconds
-        }
-    }
-
-    Write-Host ''
-    Type-Line '   >> Protocole d''auto-diagnostic engagé.' 'Cyan'
-
-    # ---------------- T1 : analyseurs (cas connus, aucune dépendance au PC)
+function Invoke-SelfTestAnalyzers {
+    # T1 : analyseurs (cas connus, aucune dépendance au PC ni à la console).
+    # Appelée par Invoke-SelfTest (auto-test) et par tools/check.ps1 (contrôle avant chaque fabrication) :
+    # Test-Case, Assert-True et Write-Section sont fournis par l'appelant.
     Write-Section 'T1' 'Analyseurs de résultats (cas de référence)'
 
     $sfcCases = @(
@@ -1696,6 +1668,42 @@ function Invoke-SelfTest {
         Assert-True ($got -eq '#.+-+...') "obtenu $got"
         'OK'
     }
+}
+
+function Invoke-SelfTest {
+    $results = New-Object System.Collections.Generic.List[object]
+    $log = New-Object System.Collections.Generic.List[string]
+
+    function Add-Result([string]$Name, [string]$State, [string]$Detail, [double]$Ms) {
+        $results.Add([pscustomobject]@{ Name = $Name; State = $State; Detail = $Detail })
+        $col = @{ PASS = 'Green'; FAIL = 'Red'; SKIP = 'DarkGray' }[$State]
+        Write-Host '   ' -NoNewline
+        Write-Host ('[{0}]' -f $State) -NoNewline -ForegroundColor $col
+        Write-Host (' {0,-42}' -f (Cut $Name 42)) -NoNewline -ForegroundColor Gray
+        Write-Host ('{0,7:N0} ms  ' -f $Ms) -NoNewline -ForegroundColor DarkGray
+        Write-Host $Detail -ForegroundColor White
+        $log.Add(('[{0}] {1,-42} {2,7:N0} ms  {3}' -f $State, $Name, $Ms, $Detail))
+    }
+    function Assert-True([bool]$Cond, [string]$Msg) { if (-not $Cond) { throw $Msg } }
+    function Test-Case([string]$Name, [scriptblock]$Body, [switch]$NeedAdmin) {
+        if ($NeedAdmin -and -not $isAdmin) { Add-Result $Name 'SKIP' 'droits admin requis' 0; return }
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            $r = & $Body | Select-Object -Last 1
+            $sw.Stop()
+            if ($r -is [string] -and $r.StartsWith('SKIP:')) { Add-Result $Name 'SKIP' $r.Substring(5) $sw.Elapsed.TotalMilliseconds }
+            else { Add-Result $Name 'PASS' ([string]$r) $sw.Elapsed.TotalMilliseconds }
+        } catch {
+            $sw.Stop()
+            Add-Result $Name 'FAIL' (Cut $_.Exception.Message 80) $sw.Elapsed.TotalMilliseconds
+        }
+    }
+
+    Write-Host ''
+    Type-Line '   >> Protocole d''auto-diagnostic engagé.' 'Cyan'
+
+    # ---------------- T1 : analyseurs (cas connus, aucune dépendance au PC)
+    Invoke-SelfTestAnalyzers
 
     # ---------------- T2 : moteurs d'exécution
     Write-Section 'T2' 'Moteurs d''exécution'
@@ -2933,8 +2941,9 @@ if ($ping.Count -gt 0) {
     Write-Status 'Accès Internet (1.1.1.1)' 'aucune réponse' 'FAIL'
 }
 
-$dnsOk = $false
-$dnsMs = (Measure-Command { $dnsOk = [bool](Resolve-DnsName 'www.microsoft.com' -DnsOnly -QuickTimeout) }).TotalMilliseconds
+$dnsSw = [Diagnostics.Stopwatch]::StartNew()
+$dnsOk = [bool](Resolve-DnsName 'www.microsoft.com' -DnsOnly -QuickTimeout)
+$dnsMs = $dnsSw.Elapsed.TotalMilliseconds
 if ($dnsOk) { Write-Status 'Résolution DNS' ("{0:N0} ms" -f $dnsMs) 'OK' }
 else { Write-Status 'Résolution DNS' 'échec' 'FAIL' }
 

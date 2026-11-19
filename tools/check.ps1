@@ -1,0 +1,282 @@
+﻿<#
+Contrôle de src/jarvis-checkup.ps1 avant fabrication. Lancé par build.py et par la CI GitHub.
+
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\check.ps1 [-RequireAnalyzer]
+
+Ne lance jamais le programme : il analyse le texte et l'arbre syntaxique, puis exécute seulement
+les tests T1 (fonctions pures, aucune dépendance au PC). Code de sortie : 0 si tout passe, 1 sinon.
+
+  1. Fichier    : UTF-8 avec BOM, fins de ligne CRLF, caractères interdits
+  2. Syntaxe    : le vrai analyseur de Windows PowerShell 5.1
+  3. Règles     : version cohérente, Read-Host, Invoke-Expression, suppressions récursives,
+                  outils système appelés sans chemin, blocs catch vides
+  4. Tests T1   : Invoke-SelfTestAnalyzers, hors console, en mode strict
+  5. PSScriptAnalyzer (s'il est installé ; exigé avec -RequireAnalyzer)
+#>
+param(
+    [string]$Source,
+    [switch]$RequireAnalyzer
+)
+
+$ErrorActionPreference = 'Stop'
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { $null = $_ }
+
+$Root = Split-Path -Parent $PSScriptRoot
+if (-not $Source) { $Source = Join-Path $Root 'src\jarvis-checkup.ps1' }
+$Settings = Join-Path $Root 'PSScriptAnalyzerSettings.psd1'
+
+# ------------------------------------------------------------------
+# Plafonds : ils ne peuvent que BAISSER. Chaque valeur est le nombre de cas connus et justifiés.
+# ------------------------------------------------------------------
+# Blocs « catch {} » vides (échec ignoré en silence).
+$MaxEmptyCatch = 29
+# Outils système appelés par leur seul nom (recherche dans le PATH) : cmd de l'auto-test, powercfg,
+# DISM et sfc de la réparation.
+$MaxBareTools = 4
+# « Remove-Item -Recurse » autorisés, par fonction : désinstallation (dossiers du profil, clé de registre)
+# et bac à sable de l'auto-test.
+$RecurseAllowed = @{ 'Uninstall-Jarvis' = 2; 'Invoke-SelfTest' = 1 }
+# Nombre minimal de tests T1 attendus (garde-fou contre un lot de tests vidé par erreur).
+$MinT1 = 18
+
+$script:Fails = New-Object System.Collections.Generic.List[string]
+function Add-Fail([string]$Message) {
+    $script:Fails.Add($Message)
+    Write-Host ('  [FAIL] ' + $Message) -ForegroundColor Red
+}
+function Add-Pass([string]$Message) { Write-Host ('  [ OK ] ' + $Message) -ForegroundColor Green }
+function Add-Note([string]$Message) { Write-Host ('  [INFO] ' + $Message) -ForegroundColor Cyan }
+function Write-Step([string]$Title) { Write-Host ''; Write-Host $Title -ForegroundColor White }
+
+function Get-OuterFunction($Node) {
+    # Nom de la fonction de premier niveau qui contient ce noeud, ou « (programme principal) »
+    $name = '(programme principal)'
+    $p = $Node.Parent
+    while ($p) {
+        if ($p -is [System.Management.Automation.Language.FunctionDefinitionAst]) { $name = $p.Name }
+        $p = $p.Parent
+    }
+    return $name
+}
+
+Write-Host ('Contrôle de ' + $Source) -ForegroundColor White
+
+# ------------------------------------------------------------------
+# 1. Fichier
+# ------------------------------------------------------------------
+Write-Step '1. Fichier'
+$bytes = [IO.File]::ReadAllBytes($Source)
+if ($bytes.Length -gt 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+    Add-Pass 'UTF-8 avec BOM'
+} else {
+    Add-Fail 'BOM UTF-8 absent : Windows PowerShell 5.1 lirait mal les accents'
+}
+$text = [Text.Encoding]::UTF8.GetString($bytes)
+$lines = $text -split "`n"
+$loneLf = 0
+for ($i = 0; $i -lt $lines.Count - 1; $i++) { if (-not $lines[$i].EndsWith("`r")) { $loneLf++ } }
+if ($loneLf -eq 0) { Add-Pass 'fins de ligne CRLF' }
+else { Add-Fail ("{0} ligne(s) terminée(s) par LF seul (sed de Git Bash ?) : la source doit rester en CRLF" -f $loneLf) }
+
+$forbidden = @{
+    0x2014 = 'tiret cadratin'; 0x2013 = 'tiret demi-cadratin'
+    0x2018 = 'guillemet typographique'; 0x2019 = 'guillemet typographique'; 0x201A = 'guillemet typographique'
+    0x201B = 'guillemet typographique'; 0x201C = 'guillemet typographique'; 0x201D = 'guillemet typographique'
+    0x201E = 'guillemet typographique'
+}
+$badChars = 0
+foreach ($code in $forbidden.Keys) {
+    $ch = [string][char]$code
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i].Contains($ch)) {
+            $badChars++
+            Add-Fail ("ligne {0} : {1} (U+{2:X4}) interdit" -f ($i + 1), $forbidden[$code], $code)
+        }
+    }
+}
+if ($badChars -eq 0) { Add-Pass 'aucun tiret long ni guillemet typographique' }
+
+# ------------------------------------------------------------------
+# 2. Syntaxe
+# ------------------------------------------------------------------
+Write-Step '2. Syntaxe (analyseur PowerShell)'
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Source, [ref]$tokens, [ref]$errors)
+if (@($errors).Count -eq 0) {
+    Add-Pass ('aucune erreur (PowerShell ' + $PSVersionTable.PSVersion.ToString() + ')')
+} else {
+    foreach ($e in @($errors) | Select-Object -First 10) {
+        Add-Fail ("ligne {0} : {1}" -f $e.Extent.StartLineNumber, $e.Message)
+    }
+}
+if ($PSVersionTable.PSVersion.Major -ne 5) {
+    Add-Fail 'ce contrôle doit tourner sous Windows PowerShell 5.1 (powershell.exe), pas PowerShell 7'
+}
+
+# ------------------------------------------------------------------
+# 3. Règles du projet
+# ------------------------------------------------------------------
+Write-Step '3. Règles du projet'
+
+# Version : la même aux 4 endroits (règle 13 de CLAUDE.md)
+$vCode = [regex]::Matches($text, '(?m)^\$JarvisVersion = ''([0-9.]+)''')
+$vDoc = [regex]::Matches($text, 'Check-up système v([0-9.]+)')
+$vBanner = [regex]::Matches($text, 'module check-up v([0-9.]+)')
+$versions = @()
+foreach ($m in @($vCode) + @($vDoc) + @($vBanner)) { $versions += $m.Groups[1].Value }
+$distinct = @($versions | Select-Object -Unique)
+if ($vCode.Count -ne 1 -or $vDoc.Count -ne 1 -or $vBanner.Count -ne 2) {
+    Add-Fail ("version : attendu 1 `$JarvisVersion, 1 en-tête et 2 bannières ; trouvé {0}, {1} et {2}" -f $vCode.Count, $vDoc.Count, $vBanner.Count)
+} elseif ($distinct.Count -ne 1) {
+    Add-Fail ('version incohérente entre $JarvisVersion, en-tête et bannières : ' + ($versions -join ', '))
+} else {
+    Add-Pass ('version ' + $distinct[0] + ' identique aux 4 endroits')
+}
+
+$commands = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true))
+
+# Toute saisie passe par Read-Answer (règle 4)
+$readHost = @($commands | Where-Object { [string]$_.GetCommandName() -match '(^|\\)Read-Host$' })
+$badRead = @($readHost | Where-Object { (Get-OuterFunction $_) -ne 'Read-Answer' })
+if ($badRead.Count -eq 0) { Add-Pass 'Read-Host seulement dans Read-Answer' }
+else { foreach ($c in $badRead) { Add-Fail ("ligne {0} : Read-Host hors de Read-Answer" -f $c.Extent.StartLineNumber) } }
+
+# Aucune exécution de texte
+$iex = @($commands | Where-Object { [string]$_.GetCommandName() -match '^(Invoke-Expression|iex)$' })
+if ($iex.Count -eq 0) { Add-Pass 'aucun Invoke-Expression' }
+else { foreach ($c in $iex) { Add-Fail ("ligne {0} : Invoke-Expression interdit" -f $c.Extent.StartLineNumber) } }
+
+# Suppressions récursives : liste blanche par fonction (règle 6)
+$recurse = @($commands | Where-Object {
+    [string]$_.GetCommandName() -eq 'Remove-Item' -and
+    @($_.CommandElements | Where-Object {
+        $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -like 'Rec*'
+    }).Count -gt 0
+})
+$recurseOk = $true
+foreach ($g in ($recurse | Group-Object { Get-OuterFunction $_ })) {
+    $allowed = 0
+    if ($RecurseAllowed.ContainsKey($g.Name)) { $allowed = $RecurseAllowed[$g.Name] }
+    if ($g.Count -gt $allowed) {
+        $recurseOk = $false
+        $where = ($g.Group | ForEach-Object { $_.Extent.StartLineNumber }) -join ', '
+        Add-Fail ("Remove-Item -Recurse dans {0} : {1} trouvé(s), {2} autorisé(s) (lignes {3})" -f $g.Name, $g.Count, $allowed, $where)
+    }
+}
+if ($recurseOk) { Add-Pass ("Remove-Item -Recurse : {0}, tous sur liste blanche" -f $recurse.Count) }
+
+# Outils système appelés par leur seul nom : un programme du même nom placé dans le PATH serait lancé en admin
+$bare = @($commands | Where-Object {
+    [string]$_.GetCommandName() -match '^(dism|sfc|chkdsk|shutdown|powercfg|bcdedit|reg|netsh|wevtutil|cleanmgr|cmd|powershell)(\.exe)?$'
+})
+$bareWhere = ($bare | ForEach-Object { '{0} l.{1}' -f $_.GetCommandName(), $_.Extent.StartLineNumber }) -join ', '
+if ($bare.Count -gt $MaxBareTools) {
+    Add-Fail ("outils système appelés sans chemin complet : {0}, plafond {1} ({2})" -f $bare.Count, $MaxBareTools, $bareWhere)
+} elseif ($bare.Count -lt $MaxBareTools) {
+    Add-Fail ("outils système sans chemin : {0}, plafond {1} : baisse `$MaxBareTools à {0} dans tools\check.ps1" -f $bare.Count, $MaxBareTools)
+} elseif ($bare.Count -eq 0) {
+    Add-Pass 'outils système tous appelés par chemin complet'
+} else {
+    Add-Note ("outils système sans chemin : {0} connus, à corriger ({1})" -f $bare.Count, $bareWhere)
+}
+
+# Blocs catch vides
+$emptyCatch = @($ast.FindAll({
+    param($n) $n -is [System.Management.Automation.Language.CatchClauseAst] -and $n.Body.Statements.Count -eq 0
+}, $true))
+if ($emptyCatch.Count -gt $MaxEmptyCatch) {
+    $known = ($emptyCatch | ForEach-Object { $_.Extent.StartLineNumber }) -join ', '
+    Add-Fail ("blocs catch vides : {0}, plafond {1} (lignes {2})" -f $emptyCatch.Count, $MaxEmptyCatch, $known)
+} elseif ($emptyCatch.Count -lt $MaxEmptyCatch) {
+    Add-Fail ("blocs catch vides : {0}, plafond {1} : baisse `$MaxEmptyCatch à {0} dans tools\check.ps1" -f $emptyCatch.Count, $MaxEmptyCatch)
+} else {
+    Add-Pass ("blocs catch vides : {0} (plafond {1})" -f $emptyCatch.Count, $MaxEmptyCatch)
+}
+
+# ------------------------------------------------------------------
+# 4. Tests T1 hors console
+# ------------------------------------------------------------------
+Write-Step '4. Tests T1 (analyseurs, hors console, mode strict)'
+if (@($errors).Count -gt 0) {
+    Add-Fail 'tests T1 non lancés : la source a des erreurs de syntaxe'
+} else {
+    # Fonctions de premier niveau et les seules variables globales dont T1 a besoin
+    $needVars = @('$JarvisVersion', '$JarvisRepo', '$script:GlyphMap')
+    $parts = @()
+    foreach ($st in $ast.EndBlock.Statements) {
+        if ($st -is [System.Management.Automation.Language.AssignmentStatementAst] -and $needVars -contains $st.Left.Extent.Text) {
+            $parts += $st.Extent.Text
+        } elseif ($st -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+            $parts += $st.Extent.Text
+        }
+    }
+    $prelude = [scriptblock]::Create(($parts -join "`r`n"))
+    $t1 = New-Object System.Collections.Generic.List[object]
+    try {
+        & {
+            # Même réglage que le programme (ligne « $ErrorActionPreference » de la source)
+            $ErrorActionPreference = 'SilentlyContinue'
+            . $prelude
+            function Write-Section { }
+            function Assert-True([bool]$Cond, [string]$Msg) { if (-not $Cond) { throw $Msg } }
+            function Test-Case([string]$Name, [scriptblock]$Body, [switch]$NeedAdmin) {
+                try {
+                    $r = & $Body | Select-Object -Last 1
+                    $t1.Add([pscustomobject]@{ Name = $Name; Ok = $true; Detail = [string]$r })
+                } catch {
+                    $t1.Add([pscustomobject]@{ Name = $Name; Ok = $false; Detail = $_.Exception.Message })
+                }
+            }
+            Set-StrictMode -Version Latest
+            Invoke-SelfTestAnalyzers
+        }
+    } catch {
+        Add-Fail ('tests T1 interrompus : ' + $_.Exception.Message)
+    }
+    $ko = @($t1 | Where-Object { -not $_.Ok })
+    foreach ($k in $ko) { Add-Fail ("T1 « {0} » : {1}" -f $k.Name, $k.Detail) }
+    if ($t1.Count -lt $MinT1) {
+        Add-Fail ("seulement {0} test(s) T1 exécuté(s), au moins {1} attendus" -f $t1.Count, $MinT1)
+    } elseif ($ko.Count -eq 0) {
+        Add-Pass ("{0} tests T1 réussis" -f $t1.Count)
+    }
+}
+
+# ------------------------------------------------------------------
+# 5. PSScriptAnalyzer
+# ------------------------------------------------------------------
+Write-Step '5. PSScriptAnalyzer'
+# Copie locale possible dans .modules\ (hors dépôt) : sur un PC où Documents est protégé (OneDrive, Accès
+# contrôlé aux dossiers), « Install-Module -Scope CurrentUser » échoue. Pour la poser :
+#   Save-Module -Name PSScriptAnalyzer -Repository PSGallery -Path .modules
+$localModules = Join-Path $Root '.modules'
+if (Test-Path -LiteralPath $localModules) { $env:PSModulePath = $localModules + ';' + $env:PSModulePath }
+$pssa = Get-Module -ListAvailable -Name PSScriptAnalyzer | Sort-Object Version -Descending | Select-Object -First 1
+if (-not $pssa) {
+    if ($RequireAnalyzer) { Add-Fail 'PSScriptAnalyzer absent alors qu''il est exigé (-RequireAnalyzer)' }
+    else { Add-Note 'non installé sur ce PC : étape sautée (la CI GitHub la fait). Pour l''avoir : Save-Module -Name PSScriptAnalyzer -Repository PSGallery -Path .modules' }
+} else {
+    try {
+        Import-Module PSScriptAnalyzer -ErrorAction Stop
+        $found = @(Invoke-ScriptAnalyzer -Path $Source -Settings $Settings)
+        if ($found.Count -eq 0) { Add-Pass ('aucune remarque (version ' + $pssa.Version + ')') }
+        else {
+            foreach ($f in $found | Select-Object -First 30) {
+                Add-Fail ("ligne {0} : {1} : {2}" -f $f.Line, $f.RuleName, $f.Message)
+            }
+            if ($found.Count -gt 30) { Add-Fail ("... et {0} autre(s) remarque(s)" -f ($found.Count - 30)) }
+        }
+    } catch {
+        Add-Fail ('PSScriptAnalyzer en erreur : ' + $_.Exception.Message)
+    }
+}
+
+# ------------------------------------------------------------------
+Write-Host ''
+if ($script:Fails.Count -gt 0) {
+    Write-Host ("CONTRÔLE REFUSÉ : {0} problème(s)." -f $script:Fails.Count) -ForegroundColor Red
+    exit 1
+}
+Write-Host 'CONTRÔLE RÉUSSI.' -ForegroundColor Green
+exit 0
