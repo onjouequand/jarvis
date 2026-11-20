@@ -1,5 +1,5 @@
 ﻿<#
-    J.A.R.V.I.S. // Check-up système v3.18
+    J.A.R.V.I.S. // Check-up système v3.19
     -----------------------------------------------------------------
     Modules :
       [01] Système        : version Windows, uptime, redémarrage en attente
@@ -97,7 +97,7 @@ param(
 # ------------------------------------------------------------------
 # Identité du programme et emplacement
 # ------------------------------------------------------------------
-$JarvisVersion = '3.18'
+$JarvisVersion = '3.19'
 $JarvisSelf = $env:JARVIS_SELF                     # défini par JARVIS.cmd
 if (-not $JarvisSelf) { $JarvisSelf = $PSCommandPath }  # lancement direct du .ps1
 $JarvisHome = $null
@@ -233,7 +233,7 @@ function Show-Banner {
         foreach ($l in $plain) { Write-Host $l -ForegroundColor Cyan; Pause-Ms 70 }
         Write-Host ''
         Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-        Write-Host '      module check-up v3.18' -ForegroundColor DarkGray
+        Write-Host '      module check-up v3.19' -ForegroundColor DarkGray
         Write-Host ''
         return
     }
@@ -253,7 +253,7 @@ function Show-Banner {
     }
     Write-Host ''
     Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-    Write-Host '      module check-up v3.18' -ForegroundColor DarkGray
+    Write-Host '      module check-up v3.19' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -2897,6 +2897,24 @@ function Test-WingetNoUpgrade([string]$Raw) {
     return ($Raw -notmatch '(?m)^\s*-{10,}\s*$' -and (Get-WingetUnknownCount $Raw) -gt 0)
 }
 
+function Test-WingetStillListed([string]$Id, $Rows) {
+    # winget a répondu « terminé » pour $Id : $true si la nouvelle liste de winget ($Rows, ConvertFrom-WingetText) le
+    # propose encore. Un identifiant coupé par winget (terminé par des points de suspension) se compare par son début,
+    # à condition qu'il en reste au moins 3 caractères. Fonction pure, testée en T1.
+    if (-not $Id) { return $false }
+    $ell = [string][char]0x2026
+    foreach ($r in @($Rows)) {
+        if ($null -eq $r) { continue }
+        $rid = [string]$r.Id
+        if ($rid -eq $Id) { return $true }
+        if ($rid.EndsWith($ell)) {
+            $head = $rid.TrimEnd([char]0x2026)
+            if ($head.Length -ge 3 -and $Id.StartsWith($head, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        }
+    }
+    return $false
+}
+
 function Get-WingetScanState([string]$Raw, [int]$Parsed) {
     # Que prouve la réponse de « winget upgrade » ? LIST : un tableau a été lu ($Parsed lignes).
     # NONE : winget dit lui-même qu'il n'y a rien à mettre à jour. UNREADABLE : ni l'un ni l'autre,
@@ -4595,6 +4613,21 @@ function Invoke-SelfTestAnalyzers {
         Assert-True ((Get-OnDiskBytes 0 $sp 0) -eq 0) 'fichier creux vide mal compté'
         '6/6 cas'
     }
+    Test-Case 'winget : application encore proposée après « terminé »' {
+        $ell = [string][char]0x2026
+        $rows = @(
+            [pscustomobject]@{ Name = 'Discord'; Id = 'Discord.Discord'; Installed = '1.0.9244'; Available = '1.0.9269' },
+            [pscustomobject]@{ Name = 'Microsoft Visual C++'; Id = ('Microsoft.VCRedist.2015+' + $ell); Installed = '14.40'; Available = '14.42' }
+        )
+        Assert-True (Test-WingetStillListed 'Discord.Discord' $rows) 'identifiant exact non reconnu'
+        Assert-True (Test-WingetStillListed 'discord.discord' $rows) 'casse différente non reconnue'
+        Assert-True (Test-WingetStillListed 'Microsoft.VCRedist.2015+.x64' $rows) 'identifiant coupé par winget non reconnu'
+        Assert-True (-not (Test-WingetStillListed 'Mozilla.Firefox' $rows)) 'application absente crue encore proposée'
+        Assert-True (-not (Test-WingetStillListed 'Discord.Discord' @())) 'liste vide mal lue'
+        # Identifiant réduit aux points de suspension : il ne doit pas correspondre à tout
+        Assert-True (-not (Test-WingetStillListed 'Mozilla.Firefox' @([pscustomobject]@{ Id = ('Mo' + $ell) }))) 'début trop court accepté'
+        '6/6 cas'
+    }
     Test-Case 'Console : police essayée' {
         # Relevés du 19/11/2026 : « Terminal » 8 x 12, famille 0x30 (bitmap) après chcp 65001 ; Consolas 16, famille 0x36
         $b = Get-ConsoleFontPlan 12 0x30 'Terminal'
@@ -5951,7 +5984,7 @@ if ($null -eq $wuh -or -not $wuh.Ok) {
         Write-Sub 'Windows Update les retente seul. Si l''échec revient, note le code et cherche-le sur support.microsoft.com'
     }
     if ($hf.Resolved -gt 0) { Write-Sub ("{0} autre(s) échec(s), réussi(s) ou remplacé(s) depuis : rien à faire" -f $hf.Resolved) }
-    if ($hf.Store -gt 0) { Write-Sub ("{0} échec(s) d'applications du Microsoft Store, non comptés ici : voir la section suivante" -f $hf.Store) }
+    if ($hf.Store -gt 0) { Write-Sub ("{0} échec(s) d'applications du Microsoft Store : s'il reste une mise à jour à faire, elle est en section 03" -f $hf.Store) }
 }
 
 # ==================================================================
@@ -7134,17 +7167,30 @@ if ($script:WGCount -gt 0) {
         Write-Host '   >> Vérification du résultat...' -ForegroundColor DarkCyan
         $raw2 = (Split-NativeOutput -Lines @(& winget upgrade --accept-source-agreements --disable-interactivity 2>&1)).Out
         $leftAll = @(ConvertFrom-WingetText $raw2)
-        $left = @($leftAll | Where-Object { $skip -notcontains $_.Id })
         $verif = Get-WingetScanState $raw2 $leftAll.Count
-        $ell = [string][char]0x2026
+        # Certaines applications finissent leur mise à jour en se relançant après la fin de winget (Discord, autre PC
+        # le 20/11/2026 : annoncé « toujours en retard », relancé seul quelques secondes plus tard, à jour au scan
+        # suivant). Nouvelle lecture toutes les 20 s, 3 fois au plus, tant qu'une application annoncée « terminée » est
+        # encore proposée ; une lecture illisible garde la précédente.
+        for ($try = 1; $try -le 3 -and $verif -ne 'UNREADABLE'; $try++) {
+            $waiting = @($okItems | Where-Object { Test-WingetStillListed $_.Id $leftAll })
+            if ($waiting.Count -eq 0) { break }
+            if ($try -eq 1) {
+                Write-Host '   >> Certaines applications finissent leur mise à jour en se relançant toutes seules.' -ForegroundColor DarkCyan
+            }
+            Write-Host ('   >> Ancienne version encore inscrite pour {0} application(s) : nouvelle vérification dans 20 s ({1}/3)...' -f $waiting.Count, $try) -ForegroundColor DarkCyan
+            Start-Sleep -Seconds 20
+            $raw3 = (Split-NativeOutput -Lines @(& winget upgrade --accept-source-agreements --disable-interactivity 2>&1)).Out
+            $all3 = @(ConvertFrom-WingetText $raw3)
+            if ((Get-WingetScanState $raw3 $all3.Count) -eq 'UNREADABLE') { break }
+            $leftAll = $all3
+        }
+        $left = @($leftAll | Where-Object { $skip -notcontains $_.Id })
         foreach ($it in $okItems) {
             # winget a répondu « terminé » : le succès n'est annoncé que si la nouvelle liste le confirme.
-            # Un identifiant coupé par winget (terminé par des points de suspension) se compare par son début.
-            $still = @($leftAll | Where-Object {
-                $_.Id -eq $it.Id -or ($_.Id.EndsWith($ell) -and $it.Id.StartsWith($_.Id.TrimEnd([char]0x2026), [StringComparison]::OrdinalIgnoreCase))
-            })
+            $still = Test-WingetStillListed $it.Id $leftAll
             if ($verif -eq 'UNREADABLE') { Write-Action 'INFO' ($it.Name + ' : winget a répondu « terminé », résultat non vérifié') }
-            elseif ($still.Count -gt 0 -and $spans.ContainsKey($it.Id) -and (Test-AppxInUseBetween $spans[$it.Id][0] $spans[$it.Id][1])) {
+            elseif ($still -and $spans.ContainsKey($it.Id) -and (Test-AppxInUseBetween $spans[$it.Id][0] $spans[$it.Id][1])) {
                 # Preuve lue dans le journal de Windows (erreur 0x80073D02)
                 Write-Action 'WARN' ($it.Name + ' : nouvelle version téléchargée, mais pas installée : Windows a constaté que l''application tournait encore')
                 $explained += $it.Id
@@ -7152,7 +7198,10 @@ if ($script:WGCount -gt 0) {
                 Write-Host '          parfois lancé dès le démarrage de Windows. Le plus sûr : Microsoft Store >' -ForegroundColor DarkGray
                 Write-Host '          Bibliothèque > Obtenir les mises à jour, ou la mise à jour proposée par l''application.' -ForegroundColor DarkGray
             }
-            elseif ($still.Count -gt 0) { Write-Action 'WARN' ($it.Name + ' : winget a répondu « terminé », mais l''ancienne version est toujours là') }
+            elseif ($still) {
+                Write-Action 'WARN' ($it.Name + ' : winget a répondu « terminé », mais l''ancienne version est toujours là')
+                Write-Host '          Si l''application vient de se relancer, refais un scan dans quelques minutes pour vérifier.' -ForegroundColor DarkGray
+            }
             else { Write-Action 'OK' ($it.Name + ' : mise à jour vérifiée') }
         }
         foreach ($n in $koList) { Write-Action 'FAIL' $n }
