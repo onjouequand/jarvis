@@ -1,18 +1,18 @@
-<# : JARVIS.cmd - fichier hybride batch + PowerShell. Ne pas modifier ce fichier.
+<# : JARVIS.cmd. Ne pas modifier ce texte
 @echo off
-rem JARVIS-SHA256=efdb10543bcca4c3733bc037826dea300c8efc4eae8d70685c47537935c079df
+rem JARVIS-SHA256=0dd2ae13ca2d1ca01d79606c2f670ae5b90dfde8e9bef89ae721a6ef6977e91a
 setlocal
-chcp 65001 >nul
+"%SystemRoot%\System32\chcp.com" 65001 >nul
 set "JARVIS_SELF=%~f0"
 set "JARVIS_ARGS=%*"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { Write-Host 'PowerShell est en mode restreint sur ce PC (Controle intelligent des applications ou strategie d entreprise) : JARVIS ne peut pas fonctionner ici.' -ForegroundColor Red; exit 4 }; $t = [IO.File]::ReadAllText($env:JARVIS_SELF, [Text.Encoding]::UTF8); $e = $t.IndexOf([string][char]10 + '#' + '>'); $b = $t.Substring($e + 3); $h = -join ([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($b)) | ForEach-Object { $_.ToString('x2') }); if ($e -lt 0 -or $t -notmatch ('JARVIS-SHA256=' + $h)) { Write-Host 'JARVIS.cmd est modifie ou incomplet : telecharge-le a nouveau.' -ForegroundColor Red; exit 3 }; $sb = [ScriptBlock]::Create($t); Invoke-Expression ('& $sb ' + $env:JARVIS_ARGS)"
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -Command "if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { Write-Host 'PowerShell est en mode restreint sur ce PC (Controle intelligent des applications ou strategie d entreprise) : JARVIS ne peut pas fonctionner ici.' -ForegroundColor Red; exit 4 }; $t = [IO.File]::ReadAllText($env:JARVIS_SELF); $e = $t.IndexOf([string][char]10 + '#' + '>'); $b = $t.Substring($e + 3); $h = -join ([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($b)) | %% { $_.ToString('x2') }); if ($e -lt 0 -or $t -notmatch ('JARVIS-SHA256=' + $h)) { Write-Host 'JARVIS.cmd est modifie ou incomplet : telecharge-le a nouveau.' -ForegroundColor Red; exit 3 }; $sb = [ScriptBlock]::Create($t); Invoke-Expression ('& $sb ' + $env:JARVIS_ARGS)"
 set "JARVIS_RC=%errorlevel%"
 if "%JARVIS_RC%"=="3" pause
 if "%JARVIS_RC%"=="4" pause
 exit /b %JARVIS_RC%
 #>
 <#
-    J.A.R.V.I.S. // Check-up système v3.19
+    J.A.R.V.I.S. // Check-up système v3.20
     -----------------------------------------------------------------
     Modules :
       [01] Système        : version Windows, uptime, redémarrage en attente
@@ -110,7 +110,7 @@ param(
 # ------------------------------------------------------------------
 # Identité du programme et emplacement
 # ------------------------------------------------------------------
-$JarvisVersion = '3.19'
+$JarvisVersion = '3.20'
 $JarvisSelf = $env:JARVIS_SELF                     # défini par JARVIS.cmd
 if (-not $JarvisSelf) { $JarvisSelf = $PSCommandPath }  # lancement direct du .ps1
 $JarvisHome = $null
@@ -246,7 +246,7 @@ function Show-Banner {
         foreach ($l in $plain) { Write-Host $l -ForegroundColor Cyan; Pause-Ms 70 }
         Write-Host ''
         Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-        Write-Host '      module check-up v3.19' -ForegroundColor DarkGray
+        Write-Host '      module check-up v3.20' -ForegroundColor DarkGray
         Write-Host ''
         return
     }
@@ -266,7 +266,7 @@ function Show-Banner {
     }
     Write-Host ''
     Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-    Write-Host '      module check-up v3.19' -ForegroundColor DarkGray
+    Write-Host '      module check-up v3.20' -ForegroundColor DarkGray
     Write-Host ''
 }
 

@@ -58,14 +58,14 @@ assert not err and not stack, (err, stack[:3])
 assert '—' not in s and '–' not in s, 'tiret cadratin ou demi-cadratin interdit'
 badq=[c for c in '\u2018\u2019\u201a\u201b\u201c\u201d\u201e' if c in s]
 assert not badq, ('guillemets typographiques interdits (PowerShell les traite comme des guillemets)', badq)
-header_tpl = r'''<# : JARVIS.cmd - fichier hybride batch + PowerShell. Ne pas modifier ce fichier.
+header_tpl = r'''<# : JARVIS.cmd. Ne pas modifier ce texte
 @echo off
 rem JARVIS-SHA256=__HASH__
 setlocal
-chcp 65001 >nul
+"%SystemRoot%\System32\chcp.com" 65001 >nul
 set "JARVIS_SELF=%~f0"
 set "JARVIS_ARGS=%*"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { Write-Host 'PowerShell est en mode restreint sur ce PC (Controle intelligent des applications ou strategie d entreprise) : JARVIS ne peut pas fonctionner ici.' -ForegroundColor Red; exit 4 }; $t = [IO.File]::ReadAllText($env:JARVIS_SELF, [Text.Encoding]::UTF8); $e = $t.IndexOf([string][char]10 + '#' + '>'); $b = $t.Substring($e + 3); $h = -join ([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($b)) | ForEach-Object { $_.ToString('x2') }); if ($e -lt 0 -or $t -notmatch ('JARVIS-SHA256=' + $h)) { Write-Host 'JARVIS.cmd est modifie ou incomplet : telecharge-le a nouveau.' -ForegroundColor Red; exit 3 }; $sb = [ScriptBlock]::Create($t); Invoke-Expression ('& $sb ' + $env:JARVIS_ARGS)"
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -Command "if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { Write-Host 'PowerShell est en mode restreint sur ce PC (Controle intelligent des applications ou strategie d entreprise) : JARVIS ne peut pas fonctionner ici.' -ForegroundColor Red; exit 4 }; $t = [IO.File]::ReadAllText($env:JARVIS_SELF); $e = $t.IndexOf([string][char]10 + '#' + '>'); $b = $t.Substring($e + 3); $h = -join ([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($b)) | %% { $_.ToString('x2') }); if ($e -lt 0 -or $t -notmatch ('JARVIS-SHA256=' + $h)) { Write-Host 'JARVIS.cmd est modifie ou incomplet : telecharge-le a nouveau.' -ForegroundColor Red; exit 3 }; $sb = [ScriptBlock]::Create($t); Invoke-Expression ('& $sb ' + $env:JARVIS_ARGS)"
 set "JARVIS_RC=%errorlevel%"
 if "%JARVIS_RC%"=="3" pause
 if "%JARVIS_RC%"=="4" pause

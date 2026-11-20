@@ -1,5 +1,5 @@
 ﻿<#
-    J.A.R.V.I.S. // Check-up système v3.19
+    J.A.R.V.I.S. // Check-up système v3.20
     -----------------------------------------------------------------
     Modules :
       [01] Système        : version Windows, uptime, redémarrage en attente
@@ -97,7 +97,7 @@ param(
 # ------------------------------------------------------------------
 # Identité du programme et emplacement
 # ------------------------------------------------------------------
-$JarvisVersion = '3.19'
+$JarvisVersion = '3.20'
 $JarvisSelf = $env:JARVIS_SELF                     # défini par JARVIS.cmd
 if (-not $JarvisSelf) { $JarvisSelf = $PSCommandPath }  # lancement direct du .ps1
 $JarvisHome = $null
@@ -233,7 +233,7 @@ function Show-Banner {
         foreach ($l in $plain) { Write-Host $l -ForegroundColor Cyan; Pause-Ms 70 }
         Write-Host ''
         Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-        Write-Host '      module check-up v3.19' -ForegroundColor DarkGray
+        Write-Host '      module check-up v3.20' -ForegroundColor DarkGray
         Write-Host ''
         return
     }
@@ -253,7 +253,7 @@ function Show-Banner {
     }
     Write-Host ''
     Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-    Write-Host '      module check-up v3.19' -ForegroundColor DarkGray
+    Write-Host '      module check-up v3.20' -ForegroundColor DarkGray
     Write-Host ''
 }
 
