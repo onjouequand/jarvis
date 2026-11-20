@@ -1,6 +1,6 @@
 <# : JARVIS.cmd - fichier hybride batch + PowerShell. Ne pas modifier ce fichier.
 @echo off
-rem JARVIS-SHA256=e2ba3ded5520a2afbc3b568ddf45d4d66c47f6c9549120ea3bbe4404c35a4bbc
+rem JARVIS-SHA256=bae571efddae364544a32e4508a8561580bed68448534c50a0b70d9a01411c77
 setlocal
 chcp 65001 >nul
 set "JARVIS_SELF=%~f0"
@@ -12,7 +12,7 @@ if "%JARVIS_RC%"=="4" pause
 exit /b %JARVIS_RC%
 #>
 <#
-    J.A.R.V.I.S. // Check-up système v3.17
+    J.A.R.V.I.S. // Check-up système v3.18
     -----------------------------------------------------------------
     Modules :
       [01] Système        : version Windows, uptime, redémarrage en attente
@@ -110,7 +110,7 @@ param(
 # ------------------------------------------------------------------
 # Identité du programme et emplacement
 # ------------------------------------------------------------------
-$JarvisVersion = '3.17'
+$JarvisVersion = '3.18'
 $JarvisSelf = $env:JARVIS_SELF                     # défini par JARVIS.cmd
 if (-not $JarvisSelf) { $JarvisSelf = $PSCommandPath }  # lancement direct du .ps1
 $JarvisHome = $null
@@ -133,6 +133,11 @@ $StartLnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'JARVIS.lnk'
 $DeskLnk  = Join-Path ([Environment]::GetFolderPath('Desktop')) 'JARVIS.lnk'
 
 $ErrorActionPreference = 'SilentlyContinue'
+# Lancé par JARVIS.cmd (ScriptBlock), la ligne ci-dessus n'atteint pas les commandes de Windows écrites en
+# modules CIM (Get-PnpDevice, Get-NetRoute, Get-MpComputerStatus...) : leurs erreurs s'affichaient en rouge
+# (PC sans Bluetooth, capture du 19/11/2026 ; reproduit avec JARVIS.cmd, pas avec -File). Réglage par défaut
+# de chaque commande ; un -ErrorAction écrit dans l'appel (Stop, pour un OK) reste prioritaire.
+$PSDefaultParameterValues['*:ErrorAction'] = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 try { $Host.UI.RawUI.WindowTitle = 'J.A.R.V.I.S. // System Check-up' } catch {}
 
@@ -241,7 +246,7 @@ function Show-Banner {
         foreach ($l in $plain) { Write-Host $l -ForegroundColor Cyan; Pause-Ms 70 }
         Write-Host ''
         Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-        Write-Host '      module check-up v3.17' -ForegroundColor DarkGray
+        Write-Host '      module check-up v3.18' -ForegroundColor DarkGray
         Write-Host ''
         return
     }
@@ -261,7 +266,7 @@ function Show-Banner {
     }
     Write-Host ''
     Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-    Write-Host '      module check-up v3.17' -ForegroundColor DarkGray
+    Write-Host '      module check-up v3.18' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -799,11 +804,48 @@ function Test-SafeCleanTarget([string]$Path, $Allowed = $null) {
     return $true
 }
 
+function Get-OnDiskBytes([int64]$Length, [IO.FileAttributes]$Attributes, $Allocated) {
+    # Place qu'un fichier libère vraiment. Fichier creux ou compressé : la place allouée ($Allocated, lue par
+    # Get-AllocatedBytes), jamais plus que sa taille ; $null si elle n'a pas pu être lue. Autre fichier : sa taille.
+    # Relevé du 20/11/2026 : cache de l'optimisation de livraison, 9 fichiers creux sur 18 (mises à jour reçues
+    # en partie), 5,11 Go de tailles pour 1,04 Go sur le disque. Fonction pure, testée en T1.
+    $flags = [int]([IO.FileAttributes]::SparseFile) -bor [int]([IO.FileAttributes]::Compressed)
+    if (([int]$Attributes -band $flags) -eq 0) { return $Length }
+    if ($null -eq $Allocated -or [int64]$Allocated -lt 0) { return $null }
+    if ([int64]$Allocated -gt $Length) { return $Length }
+    return [int64]$Allocated
+}
+
+function Get-AllocatedBytes([string]$Path) {
+    # Place réellement occupée sur le disque par un fichier (GetCompressedFileSizeW) ; $null si illisible
+    try {
+        if (-not ('JarvisNative.DiskSize' -as [type])) {
+            Add-Type -Namespace JarvisNative -Name DiskSize -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] public static extern uint GetCompressedFileSizeW(string path, out uint high);
+'@
+        }
+        $hi = [uint32]0
+        $lo = [JarvisNative.DiskSize]::GetCompressedFileSizeW($Path, [ref]$hi)
+        if ($lo -eq [uint32]::MaxValue -and [Runtime.InteropServices.Marshal]::GetLastWin32Error() -ne 0) { return $null }
+        return (([int64]$hi -shl 32) + [int64]$lo)
+    } catch { return $null }
+}
+
+function Get-FileDiskSize($File) {
+    # Place libérée par la suppression de ce fichier ($File : FileInfo) ; $null si elle n'a pas pu être lue.
+    # La place allouée n'est lue que pour un fichier creux ou compressé (un appel à Windows de plus par fichier).
+    $len = [int64]$File.Length
+    $flags = [int]([IO.FileAttributes]::SparseFile) -bor [int]([IO.FileAttributes]::Compressed)
+    if (([int]$File.Attributes -band $flags) -eq 0) { return $len }
+    return (Get-OnDiskBytes $len $File.Attributes (Get-AllocatedBytes $File.FullName))
+}
+
 function Measure-AgedFiles([string]$Path, [int]$MinAgeHours, [string]$Extension = '') {
     # Taille totale et taille des fichiers de plus de $MinAgeHours (avec l'extension voulue), sans suivre les
     # jonctions. Ok = $false si la cible existe mais ne peut pas être lue (droits) : jamais un « 0 » trompeur.
     # Link : la cible elle-même est une jonction ou un lien (dossier déplacé), elle n'est ni comptée ni nettoyée.
-    # Partial : un sous-dossier n'a pas pu être lu, les tailles sont des minimums.
+    # Partial : un sous-dossier n'a pas pu être lu, les tailles sont des minimums. Tailles = place sur le disque
+    # (Get-FileDiskSize) : un fichier creux compte pour ce qu'il occupe ; place illisible = 0 et Partial.
     $r = [pscustomobject]@{ Ok = $false; Exists = $false; Link = $false; Partial = $false; TotalBytes = [int64]0; AgedBytes = [int64]0; AgedCount = 0 }
     $top = $null
     try { $top = Get-Item -LiteralPath $Path -Force -ErrorAction Stop }
@@ -835,10 +877,12 @@ function Measure-AgedFiles([string]$Path, [int]$MinAgeHours, [string]$Extension 
     } else { $files.Add($top) }
     $limit = (Get-Date).AddHours(-$MinAgeHours)
     foreach ($f in $files) {
-        $r.TotalBytes += [int64]$f.Length
+        $size = Get-FileDiskSize $f
+        if ($null -eq $size) { $r.Partial = $true; $size = [int64]0 }
+        $r.TotalBytes += $size
         if ($f.LastWriteTime -ge $limit) { continue }
         if ($Extension -and $f.Extension -ne $Extension) { continue }
-        $r.AgedBytes += [int64]$f.Length
+        $r.AgedBytes += $size
         $r.AgedCount++
     }
     $r.Ok = $true
@@ -1116,7 +1160,10 @@ function Measure-FolderBounded([string]$Path, [int]$MaxSeconds) {
         try {
             foreach ($it in (New-Object IO.DirectoryInfo $cur).EnumerateFileSystemInfos()) {
                 if ($it.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
-                if ($it -is [IO.DirectoryInfo]) { $stack.Push($it.FullName) } else { $r.Bytes += [int64]$it.Length }
+                if ($it -is [IO.DirectoryInfo]) { $stack.Push($it.FullName); continue }
+                # Place sur le disque (fichiers compressés ou creux comptés pour ce qu'ils occupent)
+                $sz = Get-FileDiskSize $it
+                if ($null -eq $sz) { $partial = $true } else { $r.Bytes += $sz }
             }
         } catch { $partial = $true }
     }
@@ -2606,7 +2653,7 @@ function Get-CleanupTaskState {
 function Invoke-ComponentAnalysis {
     # DISM /AnalyzeComponentStore (lecture seule, droits admin). $null si DISM n'a pas pu tourner jusqu'au bout.
     # Pas de -AskOnTimeout : arrêter une analyse ne touche à rien.
-    $r = Invoke-ProcessSpinner -Label 'Analyse des composants Windows (1-5 min)' -FilePath (Get-SystemToolPath 'dism.exe') `
+    $r = Invoke-ProcessSpinner -Label 'Analyse des composants Windows (jusqu''à 15 min)' -FilePath (Get-SystemToolPath 'dism.exe') `
          -Arguments '/Online /Cleanup-Image /AnalyzeComponentStore' -TimeoutSec 900 -Encoding 'Auto'
     if ($null -eq $r) { return $null }
     $i = Get-ComponentStoreInfo $r.Text
@@ -4535,6 +4582,32 @@ function Invoke-SelfTestAnalyzers {
         Assert-True ($null -ne $r -and $r.X + $r.W -le 0 -and $r.Y + $r.H -le 1392) ('second écran : {0} {1} {2} {3}' -f $r.X, $r.Y, $r.W, $r.H)
         '5/5 cas'
     }
+    Test-Case 'Bluetooth : puce, absence et lecture impossible' {
+        $usb = [pscustomobject]@{ InstanceId = 'USB\VID_8087&PID_0029\5&2A3D'; FriendlyName = 'Intel(R) Wireless Bluetooth(R)'; Status = 'OK' }
+        $pci = [pscustomobject]@{ InstanceId = 'PCI\VEN_8086&DEV_51F1\3&11583659'; FriendlyName = 'Intel(R) Bluetooth'; Status = 'OK' }
+        $tel = [pscustomobject]@{ InstanceId = 'BTHENUM\{0000111E-0000-1000-8000-00805F9B34FB}_LOCALMFG'; FriendlyName = 'Téléphone'; Status = 'OK' }
+        $a = Get-BtRadioVerdict @($tel, $usb) ''
+        Assert-True ($a.State -eq 'RADIO' -and $a.Radio.FriendlyName -like 'Intel*') 'puce USB non trouvée derrière un service'
+        Assert-True ((Get-BtRadioVerdict @($pci) '').State -eq 'RADIO') 'puce PCI non trouvée'
+        Assert-True ((Get-BtRadioVerdict @($tel) '').State -eq 'NONE') 'service du téléphone pris pour une puce'
+        # PC sans Bluetooth (capture du 19/11/2026) : Get-PnpDevice lève ObjectNotFound
+        $n = Get-BtRadioVerdict $null 'ObjectNotFound'
+        Assert-True ($n.State -eq 'NONE' -and $null -eq $n.Radio) 'absence de Bluetooth prise pour une lecture impossible'
+        Assert-True ((Get-BtRadioVerdict $null 'NotSpecified').State -eq 'UNKNOWN') 'échec de lecture pris pour une absence'
+        Assert-True ((Get-BtRadioVerdict @() '').State -eq 'NONE') 'liste vide mal lue'
+        '6/6 cas'
+    }
+    Test-Case 'Nettoyage : place réelle des fichiers creux' {
+        $sp = [IO.FileAttributes]::SparseFile -bor [IO.FileAttributes]::Archive
+        # Relevé du 20/11/2026 (cache de livraison) : fichier de 4,43 Go dont 0,69 Go reçus
+        Assert-True ((Get-OnDiskBytes 4756602880 $sp 740884480) -eq 740884480) 'fichier creux compté à sa taille annoncée'
+        Assert-True ((Get-OnDiskBytes 1000 ([IO.FileAttributes]::Archive) $null) -eq 1000) 'fichier ordinaire mal compté'
+        Assert-True ((Get-OnDiskBytes 1000 ([IO.FileAttributes]::Compressed) 400) -eq 400) 'fichier compressé compté à sa taille'
+        Assert-True ($null -eq (Get-OnDiskBytes 1000 $sp $null)) 'place illisible remplacée par une taille'
+        Assert-True ((Get-OnDiskBytes 1000 $sp 4096) -eq 1000) 'place arrondie au-delà de la taille du fichier'
+        Assert-True ((Get-OnDiskBytes 0 $sp 0) -eq 0) 'fichier creux vide mal compté'
+        '6/6 cas'
+    }
     Test-Case 'Console : police essayée' {
         # Relevés du 19/11/2026 : « Terminal » 8 x 12, famille 0x30 (bitmap) après chcp 65001 ; Consolas 16, famille 0x36
         $b = Get-ConsoleFontPlan 12 0x30 'Terminal'
@@ -4953,7 +5026,13 @@ function Invoke-SelfTest {
         if ($null -ne $s.Period) { $per = '{0:N0} j' -f $s.Period.TotalDays }
         ('{0}, dernier passage {1}, période {2}' -f $v, (Format-Date $s.LastRun), $per)
     }
-    Test-Case 'Composants Windows : analyse (1-5 min)' {
+    Test-Case 'Composants Windows : analyse réelle' {
+        # Le scan complet ne lance cette analyse que si Windows ne nettoie plus lui-même ses composants : l'auto-test
+        # fait de même. Elle prenait 154 s sur 177 de l'auto-test du PC de Thomas (20/11/2026) et plus de 6 min sur
+        # un PC moins rapide ; la lecture des messages de DISM reste vérifiée en T1 (textes EN/FR).
+        $s = Get-CleanupTaskState
+        $v = Get-CleanupTaskVerdict $s.State $s.LastRun $s.LastResult $s.Deadline (Get-Date)
+        if ($v -eq 'OK' -or $v -eq 'RUNNING') { return 'SKIP:Windows nettoie lui-même ses composants, le scan ne lance pas cette analyse' }
         $ci = Invoke-ComponentAnalysis
         Assert-True ($null -ne $ci) 'DISM n''a pas répondu à temps'
         if ($ci.Code -ne 0 -and (Get-ComponentCleanupVerdict '' $ci.Code) -eq 'PENDING') { return 'SKIP:mises à jour en attente d''un redémarrage' }
@@ -5365,6 +5444,21 @@ function Invoke-SelfTest {
     return $fail
 }
 
+function Get-BtRadioVerdict($Devices, [string]$ErrorCategory) {
+    # Puce Bluetooth d'après Get-PnpDevice -Class Bluetooth -PresentOnly : State = 'RADIO' (Radio = l'appareil),
+    # 'NONE' ou 'UNKNOWN' (lecture impossible). $ErrorCategory : catégorie de l'erreur levée, ou vide. Windows dit
+    # « aucun appareil de cette classe » par une erreur ObjectNotFound (PC sans Bluetooth, capture du 19/11/2026) :
+    # c'est une lecture réussie. La puce a un identifiant USB\ ou PCI\ ; les autres entrées Bluetooth sont des
+    # services (ceux du téléphone, par exemple). Fonction pure, testée en T1.
+    if ($ErrorCategory) {
+        if ($ErrorCategory -eq 'ObjectNotFound') { return [pscustomobject]@{ State = 'NONE'; Radio = $null } }
+        return [pscustomobject]@{ State = 'UNKNOWN'; Radio = $null }
+    }
+    $r = @(@($Devices) | Where-Object { $null -ne $_ -and ([string]$_.InstanceId -like 'USB\*' -or [string]$_.InstanceId -like 'PCI\*') })
+    if ($r.Count -eq 0) { return [pscustomobject]@{ State = 'NONE'; Radio = $null } }
+    return [pscustomobject]@{ State = 'RADIO'; Radio = $r[0] }
+}
+
 function Get-CMErrorText([int]$code) {
     switch ($code) {
         1  { 'configuration incorrecte' }
@@ -5401,6 +5495,11 @@ if (-not $placed) {
     $null = Set-ConsoleClassicSize
     $null = Set-ConsoleFontBigger
     $null = Set-ConsoleTall
+} else {
+    # Relance administrateur depuis Windows Terminal : l'ancienne console reprend la fenêtre d'avant, mais avec la
+    # police « Terminal » 8 x 12 (capture du 19/11/2026 sur un écran 1920 x 1080 : 134 colonnes x 82 lignes de
+    # petites lettres). Même police agrandie que par les raccourcis (essai : Consolas 20, 119 x 49).
+    $null = Set-ConsoleFontBigger
 }
 Clear-Host
 Show-Banner
@@ -6142,15 +6241,36 @@ elseif ($realBad -eq 0) { Write-Status 'Périphériques en erreur' 'aucun' 'OK' 
 # ==================================================================
 Write-Section '05' 'Bluetooth'
 
+$btDevs = $null
+$btErr = $null
+try { $btDevs = @(Get-PnpDevice -Class Bluetooth -PresentOnly -ErrorAction Stop) }
+catch {
+    $btErr = [string]$_.CategoryInfo.Category
+    if ($btErr -eq '') { $btErr = 'NotSpecified' }
+}
+$bt = Get-BtRadioVerdict $btDevs $btErr
+$hasBtRadio = ($bt.State -eq 'RADIO')
+
 $svc = Get-Service bthserv
-$hasBtRadio = [bool](Get-PnpDevice -Class Bluetooth -PresentOnly | Where-Object { $_.InstanceId -like 'USB\*' -or $_.InstanceId -like 'PCI\*' })
+if ($svc) {
+    $svcTxt = switch ([string]$svc.Status) {
+        'Stopped'      { 'arrêté' }
+        'StartPending' { 'en cours de démarrage' }
+        'StopPending'  { 'en cours d''arrêt' }
+        'Paused'       { 'en pause' }
+        default        { [string]$svc.Status }
+    }
+}
 if ($svc -and $svc.Status -eq 'Running') { Write-Status 'Service Bluetooth (bthserv)' 'en cours' 'OK' }
-elseif ($svc -and $hasBtRadio) { Write-Status 'Service Bluetooth (bthserv)' ([string]$svc.Status) 'FAIL' }
-elseif ($svc) { Write-Status 'Service Bluetooth (bthserv)' ([string]$svc.Status) 'INFO' }
+elseif ($svc -and $hasBtRadio) { Write-Status 'Service Bluetooth (bthserv)' $svcTxt 'FAIL' }
+elseif ($svc -and $bt.State -eq 'NONE') { Write-Status 'Service Bluetooth (bthserv)' ($svcTxt + ' (normal sans Bluetooth)') 'INFO' }
+elseif ($svc) { Write-Status 'Service Bluetooth (bthserv)' $svcTxt 'INFO' }
 else { Write-Status 'Service Bluetooth (bthserv)' 'introuvable' 'INFO' }
 
-$radio = Get-PnpDevice -Class Bluetooth -PresentOnly | Where-Object { $_.InstanceId -like 'USB\*' -or $_.InstanceId -like 'PCI\*' } | Select-Object -First 1
-if ($radio) {
+$radio = $bt.Radio
+if ($bt.State -eq 'UNKNOWN') {
+    Write-Status 'Adaptateur' 'lecture impossible' 'INFO'
+} elseif ($radio) {
     if ($radio.Status -eq 'OK') { Write-Status 'Adaptateur' $radio.FriendlyName 'OK' }
     else { Write-Status 'Adaptateur' ("{0} : {1}" -f $radio.FriendlyName, $radio.Status) 'FAIL' }
 

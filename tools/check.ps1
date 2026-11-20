@@ -42,7 +42,7 @@ $RecurseAllowed = @{ 'Uninstall-Jarvis' = 1 }
 $LowDeleteAllowed = @{ 'Remove-TempCandidates' = 2; 'Remove-EmptyDir' = 1; 'Remove-TreeNoJunction' = 1; 'Clear-CleanTarget' = 1;
                        'Clear-RecycleBinChecked' = 1; 'Clear-DoCache' = 1; 'Invoke-SelfTest' = 5 }
 # Nombre minimal de tests T1 attendus (garde-fou contre un lot de tests vidé par erreur).
-$MinT1 = 53
+$MinT1 = 55
 
 $script:Fails = New-Object System.Collections.Generic.List[string]
 function Add-Fail([string]$Message) {
