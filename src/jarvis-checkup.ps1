@@ -1,5 +1,5 @@
 ﻿<#
-    J.A.R.V.I.S. // Check-up système v3.21
+    J.A.R.V.I.S. // Check-up système v3.22
     -----------------------------------------------------------------
     Modules :
       [01] Système        : version Windows, uptime, redémarrage en attente
@@ -97,7 +97,7 @@ param(
 # ------------------------------------------------------------------
 # Identité du programme et emplacement
 # ------------------------------------------------------------------
-$JarvisVersion = '3.21'
+$JarvisVersion = '3.22'
 $JarvisSelf = $env:JARVIS_SELF                     # défini par JARVIS.cmd
 if (-not $JarvisSelf) { $JarvisSelf = $PSCommandPath }  # lancement direct du .ps1
 $JarvisHome = $null
@@ -235,7 +235,7 @@ function Show-Banner {
         foreach ($l in $plain) { Write-Host $l -ForegroundColor Cyan; Pause-Ms 70 }
         Write-Host ''
         Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-        Write-Host '      module check-up v3.21' -ForegroundColor DarkGray
+        Write-Host '      module check-up v3.22' -ForegroundColor DarkGray
         Write-Host ''
         return
     }
@@ -255,7 +255,7 @@ function Show-Banner {
     }
     Write-Host ''
     Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-    Write-Host '      module check-up v3.21' -ForegroundColor DarkGray
+    Write-Host '      module check-up v3.22' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -3313,7 +3313,9 @@ function Get-WuErrorHint([string]$Code) {
         '^0x8024000B$' { return 'opération annulée (souvent par un arrêt ou un redémarrage du PC)' }
         # KB5132057 sur le PC de Thomas, 21/11/2026 : « Hydration failed » dans CBS.log, fichier téléchargé intact, copie
         # du PC impossible à mettre à jour (fonctions non activées : Hyper-V, IIS, SMB1). Reconnu par Microsoft en novembre.
-        '^0x80070306$' { return 'Windows n''a pas pu mettre à jour certaines copies de ses fichiers gardées sur le PC (défaut connu chez Microsoft) ; une réinstallation qui garde fichiers et applications le corrige si l''échec dure' }
+        # 0x800F0993 (PSFX_E_REBASE_HYDRATION_CANDIDATES_MISSING, nom lu dans CBS.log) : même mise à jour, même PC, le
+        # 22/11/2026 à 17 h 50 ; même cause (fichiers de Windows que la mise à jour ne peut pas reconstruire).
+        '^0x(80070306|800F0993)$' { return 'Windows n''a pas pu mettre à jour certaines copies de ses fichiers gardées sur le PC (défaut connu chez Microsoft) ; une réinstallation qui garde fichiers et applications le corrige si l''échec dure' }
         # Pilote d'imprimante Canon sur PC-LV le 21/11/2026 : imprimante absente, l'échec revient à chaque essai
         '^0x800F020B$' { return 'appareil introuvable, souvent une imprimante ou un périphérique éteint ou débranché : branche-le et allume-le, sinon ce pilote peut être ignoré' }
     }
@@ -3989,6 +3991,82 @@ function Write-EventCount([string]$Label, [bool]$ReadOk, [int]$Count, [string]$B
     if (-not $ReadOk) { Write-Status $Label 'lecture du journal impossible' 'INFO' }
     elseif ($Count -gt 0) { Write-Status $Label ([string]$Count) $BadState }
     else { Write-Status $Label '0' 'OK' }
+}
+
+function Get-DiskErrorVerdict($Events, $Arrivals, $Present) {
+    # Erreurs disque de la section 10 : lesquelles viennent d'un appareil amovible débranché depuis (clé USB, carte
+    # mémoire, disque virtuel monté) ? Sans gravité pour le PC, elles passent en INFO. PC de Thomas, 21/11/2026 :
+    # « erreur du contrôleur sur \Device\Harddisk1\DR5 » (disk 11) = clé Kingston DataTraveler 3.0 retirée depuis,
+    # reconnue dans le journal des disques branchés (Partition/Diagnostic, événement 1006, bus 7 = USB).
+    # $Events : Provider, Time, Device (1er champ de l'événement). $Arrivals : Time, DiskNumber, BusType, Manufacturer,
+    # Model, Serial ; $null = journal illisible. $Present : Number, Serial (disques branchés maintenant) ; $null =
+    # lecture impossible. Tout doute garde l'alerte : un disque interne qui disparaît est en panne, c'est grave.
+    # Débranché = type amovible, et plus aucun disque branché à ce numéro ni avec ce numéro de série.
+    # Rend Alert (nombre gardé en alerte), Unplugged (nombre sans gravité) et Devices (Name, What, Kind, Events ;
+    # Kind = UNPLUGGED, REMOVABLE (amovible encore branché), FIXED (disque interne) ou UNKNOWN). Fonction pure, T1.
+    $types = @{ 7 = 'clé USB ou disque externe'; 12 = 'carte mémoire'; 13 = 'carte mémoire'; 15 = 'disque virtuel monté' }
+    $norm = { param($s) $t = ([string]$s).Trim(); if ($t -eq 'NULL') { return '' }; return (($t -replace '[^A-Za-z0-9]', '').ToUpperInvariant()) }
+    $alert = 0
+    $unpl = 0
+    $dev = [ordered]@{}
+    foreach ($e in @($Events)) {
+        if ($null -eq $e) { continue }
+        $kind = 'UNKNOWN'
+        $name = ''
+        $what = ''
+        $m = [regex]::Match([string]$e.Device, '\\Device\\Harddisk(\d+)\\DR\d+', 'IgnoreCase')
+        if ([string]$e.Provider -eq 'disk' -and $m.Success -and $null -ne $Arrivals -and $null -ne $Present) {
+            $n = [int]$m.Groups[1].Value
+            $arr = @(@($Arrivals) | Where-Object { $null -ne $_ -and $_.DiskNumber -eq $n -and $_.Time -le $e.Time } | Sort-Object Time -Descending)
+            if ($arr.Count -gt 0) {
+                $a = $arr[0]
+                $man = ([string]$a.Manufacturer).Trim()
+                $mod = ([string]$a.Model).Trim()
+                if ($man -eq 'NULL') { $man = '' }
+                if ($mod -eq 'NULL') { $mod = '' }
+                $name = $mod
+                if ($man -and -not ($mod -like ($man + '*'))) { $name = ($man + ' ' + $mod).Trim() }
+                $bus = 0
+                if (-not [int]::TryParse(([string]$a.BusType).Trim(), [ref]$bus)) { $bus = -1 }
+                if ($types.ContainsKey($bus)) {
+                    $what = $types[$bus]
+                    $sn = & $norm $a.Serial
+                    $here = @(@($Present) | Where-Object { $null -ne $_ -and ($_.Number -eq $n -or ($sn -and (& $norm $_.Serial) -eq $sn)) })
+                    if ($here.Count -gt 0) { $kind = 'REMOVABLE' } else { $kind = 'UNPLUGGED' }
+                } else {
+                    $kind = 'FIXED'
+                }
+            }
+        }
+        if ($kind -eq 'UNPLUGGED') { $unpl++ } else { $alert++ }
+        if ($name) {
+            $key = $kind + '|' + $name
+            if ($dev.Contains($key)) { $dev[$key].Events++ }
+            else { $dev[$key] = [pscustomobject]@{ Name = $name; What = $what; Kind = $kind; Events = 1 } }
+        }
+    }
+    return [pscustomobject]@{ Alert = $alert; Unplugged = $unpl; Devices = @($dev.Values) }
+}
+
+function Get-DiskArrivals([datetime]$Since) {
+    # Disques branchés depuis $Since d'après le journal « Partition/Diagnostic » de Windows : événement 1006, écrit à
+    # chaque arrivée d'un disque (démarrage du PC, clé USB branchée...), avec son numéro, son type de bus, son modèle
+    # et son numéro de série. Lisible sans droits admin sous Windows 10 22H2 et Windows 11 (relevé le 22/11/2026 sur
+    # les trois PC). $null : journal illisible.
+    $r = Get-EventsSafe @{ LogName = 'Microsoft-Windows-Partition/Diagnostic'; Id = 1006; StartTime = $Since }
+    if (-not $r.Ok) { return $null }
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($ev in @($r.Events)) {
+        $h = @{}
+        try {
+            foreach ($x in @(([xml]$ev.ToXml()).Event.EventData.Data)) { $h[[string]$x.Name] = [string]$x.'#text' }
+        } catch { continue }
+        $out.Add([pscustomobject]@{
+            Time = $ev.TimeCreated; DiskNumber = (ConvertTo-IntOrNull $h['DiskNumber']); BusType = $h['BusType']
+            Manufacturer = $h['Manufacturer']; Model = $h['Model']; Serial = $h['SerialNumber']
+        })
+    }
+    return ,($out.ToArray())
 }
 
 function Get-RegValueSafe([string]$Path, [string]$Name) {
@@ -4671,6 +4749,51 @@ function Invoke-SelfTestAnalyzers {
         Assert-True (-not (Test-NoEventError '')) 'erreur inconnue prise pour « aucun événement »'
         '4/4 cas'
     }
+    Test-Case 'Journaux : erreurs d''un appareil débranché' {
+        # PC de Thomas, 21/11/2026 : erreur disk 11 sur la clé Kingston (bus 7 = USB), retirée depuis ; seul le
+        # disque 0 est branché. Arrivées relevées dans son journal Partition/Diagnostic (texte « NULL » compris).
+        $t0 = [datetime]'2026-11-21T13:54:18'
+        $arr = @(
+            [pscustomobject]@{ Time = $t0.AddDays(-2); DiskNumber = 1; BusType = '7'; Manufacturer = 'Linux'; Model = 'File-Stor Gadget'; Serial = 'NULL' },
+            [pscustomobject]@{ Time = $t0.AddMinutes(-20); DiskNumber = 1; BusType = '7'; Manufacturer = 'Kingston'; Model = 'DataTraveler 3.0'; Serial = '4B0F8AD05FC9' },
+            [pscustomobject]@{ Time = $t0.AddMinutes(50); DiskNumber = 1; BusType = '7'; Manufacturer = 'Kingston'; Model = 'DataTraveler 3.0'; Serial = '4B0F8AD05FC9' },
+            [pscustomobject]@{ Time = $t0.AddHours(-5); DiskNumber = 0; BusType = '17'; Manufacturer = 'NULL'; Model = 'Samsung SSD 990 PRO 1TB'; Serial = '0025_3845_3141_E9FB.' })
+        $now = @([pscustomobject]@{ Number = 0; Serial = '0025_3845_3141_E9FB.' })
+        $ev = [pscustomobject]@{ Provider = 'disk'; Time = $t0; Device = "\Device\Harddisk1\DR5`r`n" }
+        $v = Get-DiskErrorVerdict @($ev) $arr $now
+        Assert-True ($v.Alert -eq 0 -and $v.Unplugged -eq 1) 'clé USB débranchée comptée en alerte'
+        $d1 = @($v.Devices)
+        Assert-True ($d1.Count -eq 1 -and $d1[0].Name -eq 'Kingston DataTraveler 3.0' -and $d1[0].Kind -eq 'UNPLUGGED' -and $d1[0].What -like 'cl*USB*') 'clé débranchée mal nommée'
+        # Même clé encore branchée sous un autre numéro, ou autre disque branché au même numéro : alerte gardée
+        $now2 = @($now) + @([pscustomobject]@{ Number = 2; Serial = '4B0F8AD05FC9' })
+        $v2 = Get-DiskErrorVerdict @($ev) $arr $now2
+        Assert-True ($v2.Alert -eq 1 -and @($v2.Devices)[0].Kind -eq 'REMOVABLE') 'clé encore branchée sortie de l''alerte'
+        $now3 = @($now) + @([pscustomobject]@{ Number = 1; Serial = 'AUTRE' })
+        Assert-True ((Get-DiskErrorVerdict @($ev) $arr $now3).Alert -eq 1) 'numéro repris par un autre disque : alerte perdue'
+        # Disque interne disparu (en panne) : alerte gardée, modèle sans le fabricant « NULL »
+        $ev0 = [pscustomobject]@{ Provider = 'disk'; Time = $t0; Device = '\Device\Harddisk0\DR0' }
+        $v0 = Get-DiskErrorVerdict @($ev0) $arr @()
+        Assert-True ($v0.Alert -eq 1 -and @($v0.Devices)[0].Kind -eq 'FIXED' -and @($v0.Devices)[0].Name -eq 'Samsung SSD 990 PRO 1TB') 'disque interne disparu sorti de l''alerte'
+        # Lectures impossibles ou appareil inconnu : alerte gardée
+        Assert-True ((Get-DiskErrorVerdict @($ev) $null $now).Alert -eq 1) 'journal des disques illisible : alerte perdue'
+        Assert-True ((Get-DiskErrorVerdict @($ev) $arr $null).Alert -eq 1) 'disques branchés illisibles : alerte perdue'
+        $evOld = [pscustomobject]@{ Provider = 'disk'; Time = $t0.AddDays(-3); Device = '\Device\Harddisk1\DR1' }
+        Assert-True ((Get-DiskErrorVerdict @($evOld) $arr $now).Alert -eq 1) 'erreur antérieure à toute arrivée connue : alerte perdue'
+        $ntfs = [pscustomobject]@{ Provider = 'Ntfs'; Time = $t0; Device = '\Device\HarddiskVolume12' }
+        Assert-True ((Get-DiskErrorVerdict @($ntfs) $arr $now).Alert -eq 1) 'erreur NTFS sortie de l''alerte'
+        $evNo = [pscustomobject]@{ Provider = 'disk'; Time = $t0; Device = '' }
+        Assert-True ((Get-DiskErrorVerdict @($evNo) $arr $now).Alert -eq 1) 'erreur sans disque nommé sortie de l''alerte'
+        # Appareil USB sans numéro de série (téléphone en mode stockage), puis la clé : deux appareils débranchés
+        $evG = [pscustomobject]@{ Provider = 'disk'; Time = $t0.AddDays(-1); Device = '\Device\Harddisk1\DR3' }
+        $vG = Get-DiskErrorVerdict @($evG, $ev, $ev) $arr $now
+        Assert-True ($vG.Unplugged -eq 3 -and @($vG.Devices).Count -eq 2 -and @($vG.Devices | Where-Object { $_.Name -eq 'Kingston DataTraveler 3.0' })[0].Events -eq 2) 'appareils débranchés mal comptés'
+        # Disque virtuel monté puis démonté (bus 15, relevé le 19/11/2026 sur le PC de Thomas)
+        $arrV = @([pscustomobject]@{ Time = $t0.AddHours(-1); DiskNumber = 2; BusType = '15'; Manufacturer = 'Msft'; Model = 'Virtual Disk'; Serial = 'NULL' })
+        $vV = Get-DiskErrorVerdict @([pscustomobject]@{ Provider = 'disk'; Time = $t0; Device = '\Device\Harddisk2\DR2' }) $arrV $now
+        Assert-True ($vV.Unplugged -eq 1 -and @($vV.Devices)[0].What -like '*virtuel*' -and @($vV.Devices)[0].Name -eq 'Msft Virtual Disk') 'disque virtuel démonté mal lu'
+        Assert-True ((Get-DiskErrorVerdict @() $arr $now).Alert -eq 0) 'aucune erreur mal lue'
+        '13/13 cas'
+    }
     Test-Case 'Windows Update : téléchargement et installation prouvés' {
         Assert-True ((Get-WuDownloadState 2 3 3) -eq 'READY') 'téléchargement complet non reconnu'
         Assert-True ((Get-WuDownloadState 3 3 2) -eq 'PARTIAL') 'téléchargement partiel non reconnu'
@@ -5046,7 +5169,10 @@ function Invoke-SelfTestAnalyzers {
         Assert-True (-not (Test-WuPreviewTitle '2026-11 Mise à jour cumulative pour Windows 11 (KB5132061) (26300.9974)')) 'mise à jour de sécurité prise pour une préversion'
         Assert-True (-not (Test-WuPreviewTitle 'Canon - Printer - 2.90.2.30')) 'pilote pris pour une préversion'
         Assert-True ($null -ne (Get-WuErrorHint '0x80070306')) 'code 0x80070306 sans explication'
-        '17/17 cas'
+        # KB5132057 sur le PC de Thomas le 22/11/2026, 17 h 50 (événement 20, -2146498157)
+        Assert-True ((Get-WuErrorHint ('0x{0:X8}' -f -2146498157)) -eq (Get-WuErrorHint '0x80070306')) 'code 0x800F0993 sans l''explication de 0x80070306'
+        Assert-True ($null -eq (Get-WuErrorHint '0x800F0994')) 'code voisin expliqué par erreur'
+        '19/19 cas'
     }
     Test-Case 'Accès contrôlé : exceptions à risque' {
         $r0 = Get-CfaAllowedRisk $null
@@ -5564,6 +5690,16 @@ function Invoke-SelfTest {
         $none = Get-EventsSafe @{ LogName = 'Journal-Inexistant-JARVIS' }
         Assert-True (-not $none.Ok) 'journal absent lu comme « aucun événement »'
         ('lisible, {0} erreur(s) en 7 jours' -f @($r.Events).Count)
+    }
+    Test-Case 'Journal des disques branchés' {
+        # Sert à reconnaître les erreurs d'un appareil débranché (section 10) ; illisible, elles restent en alerte
+        $a = Get-DiskArrivals ((Get-Date).AddDays(-37))
+        if ($null -eq $a) { return 'SKIP:journal Partition/Diagnostic illisible : les erreurs disque restent toutes en alerte' }
+        $p = @(Get-CimInstance Win32_DiskDrive -ErrorAction Stop)
+        Assert-True ($p.Count -gt 0) 'aucun disque branché lu'
+        $bad = @(@($a) | Where-Object { $null -eq $_.DiskNumber })
+        Assert-True ($bad.Count -eq 0) ('{0} arrivée(s) sans numéro de disque' -f $bad.Count)
+        ('{0} arrivée(s) de disque en 37 jours, {1} disque(s) branché(s)' -f @($a).Count, $p.Count)
     }
     Test-Case 'Antivirus (Defender / Centre de sécurité)' {
         $mp2 = Get-MpComputerStatus
@@ -6624,7 +6760,7 @@ if (($null -eq $wuh -or -not $wuh.Ok) -and -not $wue.Ok) {
             Write-Sub ("{0}  {1}  (code {2})" -f (Format-Date $f.Date), (Cut $f.Title 58), $f.Code) 'Yellow'
             $hint = Get-WuErrorHint $f.Code
             if ($hint) { Write-Sub ('  ' + $hint) }
-            if ($f.Code -eq '0x80070306' -and $null -ne $cvBuild -and $cvBuild -ge 26100) {
+            if ($f.Code -in '0x80070306', '0x800F0993' -and $null -ne $cvBuild -and $cvBuild -ge 26100) {
                 Write-Sub '  Paramètres > Système > Récupération > Résoudre les problèmes à l''aide de Windows Update (environ 1 h)'
             }
         }
@@ -7418,8 +7554,42 @@ Write-EventCount 'Écrans bleus (BugCheck)' $bsodRead.Ok (@($bsodRead.Events).Co
 $wheaRead = Get-EventsSafe @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WHEA-Logger'; StartTime = $since }
 Write-EventCount 'Erreurs matérielles (WHEA)' $wheaRead.Ok (@($wheaRead.Events).Count) 'WARN'
 
-$diskErr = @($sysErr | Where-Object { $_.ProviderName -in 'disk', 'Ntfs', 'stornvme', 'storahci', 'Microsoft-Windows-Ntfs' }).Count
-Write-EventCount 'Erreurs disque / NTFS' $sysRead.Ok $diskErr 'WARN'
+$diskEv = @($sysErr | Where-Object { $_.ProviderName -in 'disk', 'Ntfs', 'stornvme', 'storahci', 'Microsoft-Windows-Ntfs' })
+# v3.22 : une erreur d'un appareil amovible débranché depuis (clé USB du 21/11/2026 sur le PC de Thomas) n'est plus
+# une alerte. Le journal des disques branchés n'est lu que s'il y a une erreur à classer (Get-DiskErrorVerdict).
+$diskV = $null
+if ($diskEv.Count -gt 0) {
+    $diskRows = @(foreach ($dkE in $diskEv) {
+        $devTxt = ''
+        if (@($dkE.Properties).Count -gt 0) { $devTxt = [string]$dkE.Properties[0].Value }
+        [pscustomobject]@{ Provider = [string]$dkE.ProviderName; Time = $dkE.TimeCreated; Device = $devTxt }
+    })
+    $diskArr = $null
+    if (@($diskRows | Where-Object { $_.Provider -eq 'disk' }).Count -gt 0) { $diskArr = Get-DiskArrivals ($since.AddDays(-30)) }
+    $diskNow = $null
+    try {
+        $diskNow = @(Get-CimInstance Win32_DiskDrive -ErrorAction Stop | ForEach-Object { [pscustomobject]@{ Number = $_.Index; Serial = [string]$_.SerialNumber } })
+    } catch { $diskNow = $null }
+    $diskV = Get-DiskErrorVerdict $diskRows $diskArr $diskNow
+}
+$diskAlert = 0
+if ($null -ne $diskV) { $diskAlert = $diskV.Alert }
+Write-EventCount 'Erreurs disque / NTFS' $sysRead.Ok $diskAlert 'WARN'
+if ($null -ne $diskV) {
+    foreach ($dkD in @($diskV.Devices | Where-Object { $_.Kind -eq 'FIXED' })) { Write-Sub ("sur {0} : {1}" -f (Cut $dkD.Name 50), $dkD.Events) 'Yellow' }
+    foreach ($dkD in @($diskV.Devices | Where-Object { $_.Kind -eq 'REMOVABLE' })) {
+        Write-Sub ("sur {0} ({1}, branché) : {2}" -f (Cut $dkD.Name 40), $dkD.What, $dkD.Events) 'Yellow'
+        Write-Sub '  si elles reviennent, copie son contenu ailleurs : il peut être en fin de vie'
+    }
+    if ($diskV.Unplugged -gt 0) {
+        Write-Status 'Erreurs d''un appareil débranché' ("{0}, sans gravité pour le PC" -f $diskV.Unplugged) 'INFO'
+        foreach ($dkD in @($diskV.Devices | Where-Object { $_.Kind -eq 'UNPLUGGED' })) { Write-Sub ("{0} ({1}) : {2}, débranché depuis" -f (Cut $dkD.Name 40), $dkD.What, $dkD.Events) }
+        if (@($diskV.Devices | Where-Object { $_.Kind -eq 'UNPLUGGED' -and $_.What -ne 'disque virtuel monté' }).Count -gt 0) {
+            Write-Sub 'Avant de débrancher une clé ou un disque externe : icône près de l''horloge > Éjecter.'
+            Write-Sub 'Si ses erreurs reviennent quand il est branché, copie son contenu ailleurs : il peut être en fin de vie.'
+        }
+    }
+}
 
 if ($sysRead.Ok) { Write-Status 'Erreurs système (total)' ([string]$sysErr.Count) 'INFO' }
 $topErr = $sysErr | Group-Object ProviderName | Sort-Object Count -Descending | Select-Object -First 3
