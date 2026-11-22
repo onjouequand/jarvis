@@ -1,6 +1,6 @@
 <# : JARVIS.cmd. Ne pas modifier ce texte
 @echo off
-rem JARVIS-SHA256=0dd2ae13ca2d1ca01d79606c2f670ae5b90dfde8e9bef89ae721a6ef6977e91a
+rem JARVIS-SHA256=2b4e99e22ed0cf045fb969922ac3a15d471208fc8adc43ed8fee8b6ba9bcaeb1
 setlocal
 "%SystemRoot%\System32\chcp.com" 65001 >nul
 set "JARVIS_SELF=%~f0"
@@ -12,7 +12,7 @@ if "%JARVIS_RC%"=="4" pause
 exit /b %JARVIS_RC%
 #>
 <#
-    J.A.R.V.I.S. // Check-up système v3.20
+    J.A.R.V.I.S. // Check-up système v3.21
     -----------------------------------------------------------------
     Modules :
       [01] Système        : version Windows, uptime, redémarrage en attente
@@ -110,7 +110,7 @@ param(
 # ------------------------------------------------------------------
 # Identité du programme et emplacement
 # ------------------------------------------------------------------
-$JarvisVersion = '3.20'
+$JarvisVersion = '3.21'
 $JarvisSelf = $env:JARVIS_SELF                     # défini par JARVIS.cmd
 if (-not $JarvisSelf) { $JarvisSelf = $PSCommandPath }  # lancement direct du .ps1
 $JarvisHome = $null
@@ -200,6 +200,7 @@ $script:Warnings    = New-Object System.Collections.Generic.List[string]
 $script:Alerts      = New-Object System.Collections.Generic.List[string]
 $script:Report      = New-Object System.Collections.Generic.List[string]
 $script:WUCount     = 0
+$script:ScanDetected = $null    # défauts du magasin de composants vus par DISM /ScanHealth (CBS.log), v3.21
 $script:WUManual    = 0
 $script:WGItems     = @()
 $script:WGCount     = 0
@@ -209,6 +210,7 @@ $script:KeepSysDumps = $true     # vidages système gardés (écran bleu récent
 $script:ComponentInfo = $null    # analyse des composants Windows (scan complet)
 $script:WinOld      = $false     # dossier Windows.old présent et assez ancien pour proposer de le retirer
 $script:WuTouched   = $false     # installation de mises à jour Windows lancée par JARVIS pendant cette session
+$script:WuOpened    = $false     # page Windows Update ouverte par JARVIS (recherche ou téléchargement possibles), v3.21
 $script:CleanUser   = $null      # compte qui exécute JARVIS, quand ce n'est pas celui de la session
 $script:NeedRestore = $false
 $script:DefenderScan = $false    # Defender est l'antivirus en service : analyse rapide proposable
@@ -246,7 +248,7 @@ function Show-Banner {
         foreach ($l in $plain) { Write-Host $l -ForegroundColor Cyan; Pause-Ms 70 }
         Write-Host ''
         Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-        Write-Host '      module check-up v3.20' -ForegroundColor DarkGray
+        Write-Host '      module check-up v3.21' -ForegroundColor DarkGray
         Write-Host ''
         return
     }
@@ -266,7 +268,7 @@ function Show-Banner {
     }
     Write-Host ''
     Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-    Write-Host '      module check-up v3.20' -ForegroundColor DarkGray
+    Write-Host '      module check-up v3.21' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -317,14 +319,22 @@ function Remove-ControlChars([string]$Text) {
     return ($Text -replace '[\x00-\x1F\x7F-\x9F]', '')
 }
 
+function ConvertTo-DisplayText([string]$Text) {
+    # Texte affiché et écrit dans le rapport : caractères de contrôle retirés, puis tirets longs reçus de
+    # Windows ou des éditeurs (U+2012 à U+2015, signe moins U+2212) remplacés par « - » (v3.21 : titre de la
+    # mise à jour Defender « Antivirus - KB2267602 » ; Thomas n'en veut nulle part). Fonction pure, T1.
+    $t = Remove-ControlChars $Text
+    return ($t -replace ('[{0}-{1}{2}]' -f [char]0x2012, [char]0x2015, [char]0x2212), '-')
+}
+
 function Write-Status {
     param(
         [string]$Label,
         [string]$Value,
         [ValidateSet('OK', 'WARN', 'FAIL', 'INFO')][string]$State = 'INFO'
     )
-    $Label = Remove-ControlChars $Label
-    $Value = Remove-ControlChars $Value
+    $Label = ConvertTo-DisplayText $Label
+    $Value = ConvertTo-DisplayText $Value
     $tags   = @{ OK = '[ OK ]'; WARN = '[WARN]'; FAIL = '[FAIL]'; INFO = '[INFO]' }
     $colors = @{ OK = 'Green';  WARN = 'Yellow'; FAIL = 'Red';    INFO = 'DarkCyan' }
     $lbl = Cut $Label 32
@@ -342,7 +352,7 @@ function Write-Status {
 
 function Write-Sub {
     param([string]$Text, [ConsoleColor]$Color = 'DarkGray')
-    $Text = Remove-ControlChars $Text
+    $Text = ConvertTo-DisplayText $Text
     Write-Host ('          > ' + $Text) -ForegroundColor $Color
     $script:Report.Add('          > ' + $Text)
 }
@@ -352,7 +362,7 @@ function Write-Action {
     param([ValidateSet('OK', 'WARN', 'FAIL', 'INFO')][string]$State, [string]$Text)
     $tags   = @{ OK = '[ OK ]'; WARN = '[WARN]'; FAIL = '[FAIL]'; INFO = '[INFO]' }
     $colors = @{ OK = 'Green';  WARN = 'Yellow'; FAIL = 'Red';    INFO = 'Cyan' }
-    $Text = Remove-ControlChars $Text
+    $Text = ConvertTo-DisplayText $Text
     Write-Host ('   ' + $tags[$State] + ' ' + $Text) -ForegroundColor $colors[$State]
     $script:Report.Add($tags[$State] + ' ' + $Text)
 }
@@ -1042,6 +1052,17 @@ function Format-DoSize($State) {
     return ('environ ' + (Format-Bytes $State.Bytes))
 }
 
+function Test-DoDeleteAvailable {
+    # $true si Windows sait vider ce cache par l'interface qu'utilise Clear-DoCache. Absente sous Windows 10 22H2
+    # (PC-LV le 21/11/2026 : classe sans aucune méthode, module DeliveryOptimization 1.0.2.0 sans
+    # Delete-DeliveryOptimizationCache, vidage refusé « Méthode Delete introuvable ») ; présente sous Windows 11
+    # (Delete, SetPinned, SetExpiration).
+    try {
+        $c = Get-CimClass -Namespace 'root/Microsoft/Windows/DeliveryOptimization' -ClassName MSFT_DeliveryOptimizationFile -ErrorAction Stop
+        return (@($c.CimClassMethods | ForEach-Object { [string]$_.Name }) -contains 'Delete')
+    } catch { return $false }
+}
+
 function Clear-DoCache {
     # Vidage par l'interface de Windows (celle qu'appelle Delete-DeliveryOptimizationCache, sans ses messages
     # en anglais) ; fichiers épinglés conservés. Résultat lu dans une nouvelle mesure, de même nature qu'avant.
@@ -1640,14 +1661,19 @@ function Confirm-DeepScan {
         $bat = Get-CimInstance Win32_Battery | Select-Object -First 1
     }
     $reasons = @()
-    if ((Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
-        (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')) {
-        $reasons += 'un redémarrage est en attente'
-    }
+    $rebootPending = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
+        (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')
+    if ($rebootPending) { $reasons += 'un redémarrage est en attente' }
     if (Get-Process TiWorker) { $reasons += 'Windows Update installe des composants en ce moment' }
     if ($reasons.Count -gt 0) {
         Write-Host ('   [!] ' + ($reasons -join ' et ') + '.') -ForegroundColor Yellow
         Write-Host '       SFC et DISM risquent d''échouer ou de donner un résultat faux. Redémarrer d''abord est conseillé.' -ForegroundColor Yellow
+        if ($rebootPending) {
+            # Relevé le 21/11/2026 dans CBS.log : après un simple « Redémarrer », « Deferring shutdown processing
+            # at users request », la mise à jour reste en attente et l'avertissement revient.
+            Write-Host '       Choisis Démarrer > Marche/Arrêt > « Mettre à jour et redémarrer » si ce choix est affiché :' -ForegroundColor Yellow
+            Write-Host '       un simple « Redémarrer » peut laisser les mises à jour en attente.' -ForegroundColor Yellow
+        }
         if (-not (Read-YesNo '   >> Continuer quand même le scan complet ?')) { return $false }
     }
     Write-Host ''
@@ -1719,6 +1745,20 @@ function Test-ShowWingetOffer {
 }
 
 function Install-WingetModule {
+    # Accès contrôlé actif et dossier absent : l'installateur de Microsoft (PowerShellGet) va tenter de créer un
+    # dossier vide dans Documents et Windows va le signaler. Prévenir avant, pour que personne ne clique sur
+    # « Autoriser » (cela autoriserait tout PowerShell, vu le 21/11/2026).
+    $cfaNow = 'UNKNOWN'
+    $mpp = Get-MpPreference
+    if ($mpp) { $cfaNow = Get-CfaVerdict $mpp.EnableControlledFolderAccess }
+    $docs = [Environment]::GetFolderPath('MyDocuments')
+    if ($docs -and (Test-CfaNoticeExpected $cfaNow (Test-Path -LiteralPath (Join-Path $docs 'WindowsPowerShell\Scripts\InstalledScriptInfos')))) {
+        Write-Host '   [i] Sécurité Windows peut afficher « Modification non autorisée bloquée » pour PowerShell.' -ForegroundColor Yellow
+        Write-Host '       C''est attendu et sans danger : l''installateur de Microsoft tente de créer un dossier vide' -ForegroundColor Gray
+        Write-Host '       dans Documents, l''accès contrôlé aux dossiers le refuse, et le module s''installe quand même.' -ForegroundColor Gray
+        Write-Host '       Ferme simplement la notification. Ne clique pas sur « Autoriser » : tous les scripts' -ForegroundColor Gray
+        Write-Host '       PowerShell pourraient alors modifier tes documents.' -ForegroundColor Gray
+    }
     $res = Invoke-Spinner 'Installation du module winget (1 à 3 min)' {
         try {
             # Le dépôt PowerShell Gallery exige TLS 1.2 (absent par défaut sur d'anciens Windows 10)
@@ -1779,6 +1819,23 @@ function Invoke-WingetModuleOffer {
 # ------------------------------------------------------------------
 # Windows Update : installation par J.A.R.V.I.S. (API officielle Windows Update Agent)
 # ------------------------------------------------------------------
+function Test-WuDefinitionUpdate {
+    # Vrai pour une mise à jour des signatures de Microsoft Defender : catégorie « Definition Updates »
+    # (e0789628-ce08-4437-be74-2495b842f43b) ou article KB2267602. Le titre français écrit « Ko » : relevé le
+    # 21/11/2026, « Mise à jour de la sélection disjointe pour Microsoft Defender Antivirus - 2267602 Ko
+    # (version 1.463.399.0) », d'où la recherche du seul numéro. T1.
+    param($Update)
+    if ($null -eq $Update) { return $false }
+    if ($Update.PSObject.Properties['Categories']) {
+        foreach ($c in @($Update.Categories)) {
+            if ($null -ne $c -and $c.PSObject.Properties['CategoryID'] -and [string]$c.CategoryID -eq 'e0789628-ce08-4437-be74-2495b842f43b') { return $true }
+        }
+    }
+    if ($Update.PSObject.Properties['KBs'] -and @($Update.KBs) -contains '2267602') { return $true }
+    if (-not $Update.PSObject.Properties['Title']) { return $false }
+    return ([string]$Update.Title -match '(^|\D)2267602(\D|$)')
+}
+
 function Test-SkipWuUpdate {
     # Raison d'exclure une mise à jour, ou $null si elle peut être installée sans surveillance
     param($Update)
@@ -1950,12 +2007,27 @@ function Open-WindowsUpdateGuided {
     $uso = Join-Path $env:windir 'System32\UsoClient.exe'
     if (Test-Path -LiteralPath $uso) { Start-Process -FilePath $uso -ArgumentList 'StartInteractiveScan' -WindowStyle Hidden }
     Start-Process 'ms-settings:windowsupdate'
+    # Le cache de Windows Update ne sera plus proposé pendant cette session : le vider arrête Windows Update
+    $script:WuOpened = $true
+    $build = $null
+    try { $build = ConvertTo-IntOrNull (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop).CurrentBuild } catch { $build = $null }
     Write-Host ''
     Write-Host '   DANS LA FENÊTRE WINDOWS UPDATE QUI VIENT DE S''OUVRIR :' -ForegroundColor Cyan
-    Write-Host '   1. Clique sur « Rechercher des mises à jour » (bouton en haut à droite).' -ForegroundColor Gray
-    Write-Host '      Si la recherche est déjà en cours, attends simplement.' -ForegroundColor DarkGray
-    Write-Host '   2. Clique ensuite sur « Télécharger et installer tout » s''il apparaît.' -ForegroundColor Gray
-    Write-Host '   3. Attends la fin, puis clique sur « Redémarrer maintenant » si Windows le demande.' -ForegroundColor Gray
+    if ($null -ne $build -and $build -lt 22000) {
+        # Windows 10 : « Télécharger et installer tout » est un bouton de Windows 11 (PC-LV, 21/11/2026 ; mots de
+        # Windows 10 à confirmer à l'écran)
+        Write-Host '   1. Clique sur « Rechercher des mises à jour ».' -ForegroundColor Gray
+        Write-Host '      Si la recherche est déjà en cours, attends simplement.' -ForegroundColor DarkGray
+        Write-Host '   2. Windows installe ensuite ce qu''il trouve. Clique sur « Télécharger et installer »' -ForegroundColor Gray
+        Write-Host '      si ce bouton apparaît sous une mise à jour.' -ForegroundColor Gray
+        Write-Host '   3. Les pilotes peuvent être rangés sous « Afficher les mises à jour facultatives ».' -ForegroundColor Gray
+        Write-Host '   4. Attends la fin, puis clique sur « Redémarrer maintenant » si Windows le demande.' -ForegroundColor Gray
+    } else {
+        Write-Host '   1. Clique sur « Rechercher des mises à jour » (bouton en haut à droite).' -ForegroundColor Gray
+        Write-Host '      Si la recherche est déjà en cours, attends simplement.' -ForegroundColor DarkGray
+        Write-Host '   2. Clique ensuite sur « Télécharger et installer tout » s''il apparaît.' -ForegroundColor Gray
+        Write-Host '   3. Attends la fin, puis clique sur « Redémarrer maintenant » si Windows le demande.' -ForegroundColor Gray
+    }
     Write-Host ''
 }
 
@@ -2542,10 +2614,139 @@ function Get-DismRepairVerdict([string]$Text, $Code) {
     # DISM /RestoreHealth : REPAIRED (réparation annoncée par DISM, code 0), NOSOURCE (fichiers de réparation
     # introuvables ou image irréparable), FAILED (autre échec), UNKNOWN (code 0 mais message non reconnu)
     $t = ($Text -replace "`0", '') -replace '\s+', ' '
-    if ($t -match 'restore operation failed|chec de la restauration|source files could not be|introuvable') { return 'NOSOURCE' }
+    if ($t -match 'restore operation failed|chec de la restauration|source files could not be|repair content could not be found|introuvable') { return 'NOSOURCE' }
+    # 0x800F081F (source introuvable) et 0x800F0915 (« Le contenu de réparation est introuvable », relevé
+    # sur l'autre PC le 20/11/2026, texte dans CbsProvider.dll.mui) : même cas, quel que soit le texte
+    if ($null -ne $Code -and ([int]$Code -eq -2146498529 -or [int]$Code -eq -2146498283)) { return 'NOSOURCE' }
     if ($null -eq $Code -or [int]$Code -ne 0) { return 'FAILED' }
     if ($t -match 'restore operation completed successfully|restauration a .{1,3}t.{1,3} effectu') { return 'REPAIRED' }
     return 'UNKNOWN'
+}
+
+function Get-CbsSummary([string]$Text, $Since, [string]$Kind) {
+    # Dernier bilan « Summary: » de CBS.log écrit après $Since (journal en anglais quelle que soit la langue de
+    # Windows). $Kind : 'DETECT' (DISM /ScanHealth, « Operation: Detect only ») ou 'REPAIR' (/RestoreHealth,
+    # « Operation: Detect and Repair »). Rend Time, Detected, Repaired, Remaining, ou $null sans bilan complet.
+    # Relevé sur l'autre PC le 20/11/2026 : DISM rendait 0x800F0915 (« échec ») alors que 1 929 défauts sur
+    # 1 973 avaient été réparés. Fonction pure, testée en T1 (fins de ligne CRLF).
+    if ([string]::IsNullOrEmpty($Text)) { return $null }
+    $found = $null
+    $cur = $null
+    foreach ($line in ($Text -split "`r?`n")) {
+        $m = [regex]::Match($line, '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\s+\w+\s+CBS\s+(.*)$')
+        if (-not $m.Success) { continue }
+        $body = $m.Groups[2].Value.Trim()
+        if ($body -eq 'Summary:') {
+            $t = [datetime]::ParseExact($m.Groups[1].Value, 'yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+            $cur = @{ Time = $t; Kind = ''; Detected = $null; Repaired = $null }
+            continue
+        }
+        if ($null -eq $cur) { continue }
+        if ($body -match '^Operation:\s*Detect and Repair') { $cur.Kind = 'REPAIR' }
+        elseif ($body -match '^Operation:\s*Detect only') { $cur.Kind = 'DETECT' }
+        elseif ($body -match '^Total Detected Corruption:\s*(\d+)') { $cur.Detected = [int]$Matches[1] }
+        elseif ($body -match '^Total Repaired Corruption:\s*(\d+)') { $cur.Repaired = [int]$Matches[1] }
+        elseif ($body -match '^Total Operation Time:') {
+            if ($cur.Kind -eq $Kind -and $null -ne $cur.Detected -and $null -ne $cur.Repaired -and
+                ($null -eq $Since -or $cur.Time -ge $Since)) {
+                $found = [pscustomobject]@{
+                    Time = $cur.Time; Detected = $cur.Detected; Repaired = $cur.Repaired
+                    Remaining = [math]::Max(0, $cur.Detected - $cur.Repaired)
+                }
+            }
+            $cur = $null
+        }
+    }
+    return $found
+}
+
+function Read-CbsLogText($Since) {
+    # Fin de CBS.log (8 Mo au plus par fichier), lue sans gêner Windows (partage lecture et écriture). Si
+    # Windows a mis le journal de côté depuis $Since (CbsPersist_*.log, vu le 20/11/2026 juste après une
+    # réparation), le plus récent est lu avant. Droits admin. '' si rien n'est lisible.
+    $dir = Join-Path ([Environment]::GetFolderPath('Windows')) 'Logs\CBS'
+    $paths = @()
+    try {
+        $paths += @(Get-ChildItem -LiteralPath $dir -Filter 'CbsPersist_*.log' -ErrorAction Stop |
+            Where-Object { $null -eq $Since -or $_.LastWriteTime -ge $Since } |
+            Sort-Object LastWriteTime | Select-Object -Last 1 | ForEach-Object { $_.FullName })
+    } catch { $paths = @() }
+    $paths += (Join-Path $dir 'CBS.log')
+    $sb = New-Object Text.StringBuilder
+    foreach ($p in $paths) {
+        $fs = $null
+        try {
+            $fs = [IO.File]::Open($p, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+            if ($fs.Length -gt 8MB) { $null = $fs.Seek(-8MB, [IO.SeekOrigin]::End) }
+            $sr = New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8)
+            $null = $sb.Append($sr.ReadToEnd())
+            $null = $sb.Append("`r`n")
+        } catch {
+            $null = $sb.Append("`r`n")
+        } finally {
+            if ($fs) { $fs.Dispose() }
+        }
+    }
+    return $sb.ToString()
+}
+
+function Get-SfcRepairSummary([string]$Text, $Since) {
+    # Fichiers remis par SFC depuis $Since, lus dans les lignes « [SR] Repairing file ... from store » de CBS.log.
+    # OnlyOneDrive : seul le raccourci OneDrive du profil par défaut a été remis. Relevé sur PC-LV le 21/11/2026 :
+    # OneDrive, mis à jour le matin, avait remplacé ce raccourci ; SFC a remis celui de Windows (2019) et annonçait
+    # « fichiers corrompus réparés, redémarrage conseillé » pour rien. Fonction pure, testée en T1 (fins CRLF).
+    $files = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrEmpty($Text)) {
+        foreach ($line in ($Text -split "`r?`n")) {
+            $m = [regex]::Match($line, '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\s+\w+\s+CSI\s+\w+\s+\[SR\] Repairing file (.+?)(?: from store)?\s*$')
+            if (-not $m.Success) { continue }
+            if ($null -ne $Since) {
+                $t = [datetime]::ParseExact($m.Groups[1].Value, 'yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+                if ($t -lt $Since) { continue }
+            }
+            $f = $m.Groups[2].Value.Trim()
+            if ($f.StartsWith('\??\')) { $f = $f.Substring(4) }
+            $f = $f -replace '\\{2,}', '\'
+            if (-not $files.Contains($f)) { $files.Add($f) }
+        }
+    }
+    $arr = $files.ToArray()
+    $only = $arr.Count -gt 0
+    foreach ($f in $arr) {
+        if ($f -notmatch '\\Users\\Default\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\OneDrive\.lnk$') { $only = $false }
+    }
+    return [pscustomobject]@{ Files = $arr; OnlyOneDrive = $only }
+}
+
+function Write-SfcRepairedFiles($Summary) {
+    # Fichiers remis par SFC (3 au plus), dans la console et le rapport
+    $list = @($Summary.Files)
+    foreach ($f in ($list | Select-Object -First 3)) { Write-Sub ('Remis : ' + (Cut $f 90)) }
+    if ($list.Count -gt 3) { Write-Sub ('... et {0} autre(s), détails dans C:\Windows\Logs\CBS\CBS.log' -f ($list.Count - 3)) }
+}
+
+function Get-RepairRetryAdvice([string]$Last, $Now, $DetectedNow) {
+    # Avant de reproposer DISM /RestoreHealth (v3.21). $Last : dernière réparation mémorisée dans config.json
+    # (« LastRepair » = 'AAAA-MM-JJ|RÉSULTAT|restants'). Rend $null (proposer comme d'habitude), 'SAME'
+    # (dernière réparation incomplète et pas plus de défauts aujourd'hui qu'il n'en restait) ou 'FAILED'
+    # (dernière réparation incomplète il y a moins de 90 jours, comparaison impossible). Plus de défauts
+    # qu'il n'en restait : $null, une nouvelle réparation peut en corriger une partie. Fonction pure, T1.
+    if ([string]::IsNullOrWhiteSpace($Last) -or $null -eq $Now) { return $null }
+    $p = @($Last -split '\|')
+    if ($p.Count -lt 2) { return $null }
+    $d = [datetime]::MinValue
+    if (-not [datetime]::TryParseExact($p[0], 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::None, [ref]$d)) { return $null }
+    $age = ([datetime]$Now - $d).TotalDays
+    if ($age -lt 0 -or $age -gt 90) { return $null }
+    if ($p[1] -notin @('PARTIAL', 'NOSOURCE')) { return $null }
+    $left = $null
+    if ($p.Count -ge 3) { $left = ConvertTo-IntOrNull $p[2] }
+    if ($null -ne $DetectedNow -and $null -ne $left) {
+        if ([int]$DetectedNow -le $left) { return 'SAME' }
+        return $null
+    }
+    return 'FAILED'
 }
 
 function ConvertFrom-DismSize([string]$Text) {
@@ -2740,6 +2941,29 @@ function Wait-ServicingIdle([int]$TimeoutSec = 300) {
     return (-not (Get-Process TiWorker))
 }
 
+function Test-MsiBusy {
+    # $true si Windows Installer exécute une installation (verrou « Global\_MSIExecute », documenté par Microsoft),
+    # $false s'il est libre. Un verrou présent mais illisible compte comme occupé.
+    try {
+        $m = [Threading.Mutex]::OpenExisting('Global\_MSIExecute')
+        $m.Dispose()
+        return $true
+    } catch {
+        return ($_.Exception.GetBaseException() -is [UnauthorizedAccessException])
+    }
+}
+
+function Wait-MsiIdle([int]$TimeoutSec = 300) {
+    # Avant chaque mise à jour winget : attendre qu'aucune autre installation ne tourne (Windows Update, Store,
+    # programme d'installation précédent). PC-LV le 21/11/2026 : l'installateur de Java a retiré l'ancienne version
+    # puis échoué avec le code 1618 (« une autre installation est déjà en cours »). $true quand il est libre.
+    if (-not (Test-MsiBusy)) { return $true }
+    Write-Host '   >> Une autre installation est en cours : j''attends qu''elle se termine (5 min au plus)...' -ForegroundColor DarkCyan
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ((Test-MsiBusy) -and $sw.Elapsed.TotalSeconds -lt $TimeoutSec) { Start-Sleep -Seconds 2 }
+    return (-not (Test-MsiBusy))
+}
+
 function Test-CleanStillBlocked([string]$Label) {
     # Juste avant la question : un redémarrage ou une installation a pu apparaître depuis la section 11
     # (mises à jour Windows installées par JARVIS juste avant). TiWorker en cours : attente de 5 minutes au plus.
@@ -2763,9 +2987,21 @@ function Invoke-CleanTarget($Target) {
     if ($script:CleanUser) { $who = ', compte ' + $script:CleanUser }
     switch ($Target.Key) {
         'Temp' {
-            if (-not (Read-YesNo ('   >> Supprimer les fichiers temporaires de plus de 24 h ({0}{1}) ?' -f $size, $who))) { return }
             $dirs = @((Join-Path $env:windir 'Temp'))
             if (Test-SafeTempPath $env:TEMP) { $dirs = @($env:TEMP) + $dirs }
+            # Taille relue juste avant la question : les installations faites depuis le scan ont pu en ajouter
+            # (PC-LV le 21/11/2026 : environ 135 Mo mesurés pendant le scan, 578 Mo supprimés)
+            $now = [int64]0
+            $known = $true
+            foreach ($p in $dirs) {
+                $m0 = Measure-AgedFiles $p 24
+                if ($m0.Ok) { $now += $m0.AgedBytes } else { $known = $false }
+            }
+            if ($known) {
+                if ($now -le 0) { return }
+                $size = Format-Bytes $now
+            }
+            if (-not (Read-YesNo ('   >> Supprimer les fichiers temporaires de plus de 24 h ({0}{1}) ?' -f $size, $who))) { return }
             $res = [pscustomobject]@{ Ok = $false; FreedBytes = [int64]0; LeftBytes = [int64]0; Reason = '' }
             $notes = @()
             foreach ($p in $dirs) {
@@ -2798,6 +3034,13 @@ function Invoke-CleanTarget($Target) {
             else { Write-Action 'WARN' ('Corbeille : {0} libérés, {1} élément(s) encore présent(s)' -f (Format-Bytes $r.FreedBytes), $r.LeftCount) }
         }
         'WuCache' {
+            if ($script:WuOpened) {
+                # Le vider arrête Windows Update : la recherche ou le téléchargement lancés dans la page ouverte par
+                # JARVIS seraient coupés (Get-WuBusyState ne voit que les installations ; PC-LV, 21/11/2026)
+                Write-Action 'INFO' 'Cache Windows Update : pas de nettoyage maintenant, Windows Update vient d''être ouvert'
+                Write-Host '          Relance un scan plus tard pour le vider.' -ForegroundColor DarkGray
+                return
+            }
             if (Test-CleanStillBlocked 'Cache Windows Update') { return }
             Write-Host '   [i] Fichiers de mises à jour déjà téléchargés. Windows Update est arrêté quelques secondes puis relancé ;' -ForegroundColor DarkGray
             Write-Host '       il retéléchargera au besoin ce qui manque.' -ForegroundColor DarkGray
@@ -2988,8 +3231,20 @@ function Get-WuHistoryFailures {
     # $Pending : mises à jour encore proposées (objets Title, UpdateId), ou $null si la recherche a échoué.
     # Un échec qui n'est plus proposé (remplacé par une version plus récente, ou réussi sous un autre nom)
     # compte dans Resolved : il n'y a plus rien à faire.
-    param([object[]]$Entries, [datetime]$Since, [object[]]$Pending = $null)
+    # Lignes venues du journal Système (Source = 'Log', ConvertFrom-WuClientEvent) : l'API ne voit pas toujours ces
+    # mises à jour, ni dans l'historique ni dans la recherche (KB5132057 le 21/11/2026, absente des deux) ; la liste
+    # $Pending ne sert donc que pour une mise à jour que l'API connaît. $OsBuild (« 26300.9974 ») : une mise à jour
+    # dont le titre donne une version de Windows déjà atteinte ou dépassée (« (26300.10075) ») est réglée.
+    param([object[]]$Entries, [datetime]$Since, [object[]]$Pending = $null, [string]$OsBuild = '')
     $r = [pscustomobject]@{ Failed = @(); Resolved = 0; Store = 0 }
+    $osMaj = $null; $osUbr = $null
+    if ($OsBuild -match '^(\d+)\.(\d+)$') { $osMaj = [int]$Matches[1]; $osUbr = [int]$Matches[2] }
+    $apiKeys = @{}
+    foreach ($e in @($Entries)) {
+        if ($null -eq $e) { continue }
+        $src = $e.PSObject.Properties['Source']
+        if ($null -eq $src -or [string]$src.Value -ne 'Log') { $apiKeys[(Get-WuHistoryKey ([string]$e.Title) ([string]$e.UpdateId))] = $true }
+    }
     $pendKeys = $null
     if ($null -ne $Pending) {
         $pendKeys = @{}
@@ -3018,13 +3273,46 @@ function Get-WuHistoryFailures {
         $t = [string]$f.Entry.Title
         if ($t -cmatch '^[0-9A-Z]{12}-') { $r.Store++; continue }
         if ($okLast.ContainsKey($f.Key) -and $okLast[$f.Key] -gt [datetime]$f.Entry.Date) { $r.Resolved++; continue }
-        if ($null -ne $pendKeys -and -not $pendKeys.ContainsKey($f.Key) -and -not $pendKeys.ContainsKey(([string]$f.Entry.UpdateId).ToLowerInvariant())) {
+        if ($null -ne $osMaj -and $t -match '\((\d{5})\.(\d+)\)' -and [int]$Matches[1] -eq $osMaj -and [int]$Matches[2] -le $osUbr) {
+            $r.Resolved++; continue
+        }
+        if ($null -ne $pendKeys -and $apiKeys.ContainsKey($f.Key) -and -not $pendKeys.ContainsKey($f.Key) -and -not $pendKeys.ContainsKey(([string]$f.Entry.UpdateId).ToLowerInvariant())) {
             $r.Resolved++; continue
         }
         $list += [pscustomobject]@{ Title = $t; Code = ('0x{0:X8}' -f [int]$f.Entry.HResult); Date = [datetime]$f.Entry.Date }
     }
     $r.Failed = $list
     return $r
+}
+
+function ConvertFrom-WuClientEvent {
+    # Événements 19 (installation réussie) et 20 (échec) du journal Système (Microsoft-Windows-WindowsUpdateClient),
+    # rendus sous la forme des lignes de l'historique pour Get-WuHistoryFailures. L'historique de l'API Windows Update
+    # ne montre pas tout : le 21/11/2026, les cinq échecs de KB5132057 (0x80070306) n'y étaient pas, seul ce journal
+    # les gardait. $Data : champs de l'événement (updateTitle, updateGuid, errorCode, comme dans son XML).
+    # $null : événement inexploitable. Fonction pure, testée en T1.
+    # Applications du Store écartées (titre « 9PLM9XGG6VKS-OpenAI.Codex ») : une ligne par version dans ce journal,
+    # 21 au lieu de 1 le 21/11/2026 ; l'historique de l'API les compte déjà et la section 03 dit ce qui reste à faire.
+    param([int]$Id, [datetime]$Date, [hashtable]$Data)
+    if (($Id -ne 19 -and $Id -ne 20) -or $null -eq $Data) { return $null }
+    $t = ([string]$Data['updateTitle']).Trim()
+    if (-not $t -or $t -cmatch '^[0-9A-Z]{12}-') { return $null }
+    $rc = 2
+    $hr = 0
+    if ($Id -eq 20) {
+        $rc = 4
+        $c = ([string]$Data['errorCode']).Trim()
+        if ($c -notmatch '^0x([0-9A-Fa-f]{1,8})$') { return $null }
+        $hr = [Convert]::ToInt32($Matches[1], 16)
+    }
+    $g = ([string]$Data['updateGuid']).Trim().Trim('{', '}').ToLowerInvariant()
+    return [pscustomobject]@{ Date = $Date; Operation = 1; ResultCode = $rc; HResult = $hr; Title = $t; UpdateId = $g; Source = 'Log' }
+}
+
+function Test-WuPreviewTitle([string]$Title) {
+    # Préversion facultative (« Mise à jour de la préversion », « Preview ») : ses corrections arrivent ensuite avec
+    # la mise à jour de sécurité du mois suivant, rien n'oblige à l'installer. Fonction pure, testée en T1.
+    return ($Title -match 'pr.version|\bpreview\b')
 }
 
 function Get-WuErrorHint([string]$Code) {
@@ -3036,8 +3324,63 @@ function Get-WuErrorHint([string]$Code) {
         '^0x800F0922$' { return 'souvent un VPN actif ou une partition réservée de Windows trop pleine' }
         '^0x(80240034|8024402C|80072EE2|80072EFD)$' { return 'téléchargement impossible : vérifie la connexion Internet' }
         '^0x8024000B$' { return 'opération annulée (souvent par un arrêt ou un redémarrage du PC)' }
+        # KB5132057 sur le PC de Thomas, 21/11/2026 : « Hydration failed » dans CBS.log, fichier téléchargé intact, copie
+        # du PC impossible à mettre à jour (fonctions non activées : Hyper-V, IIS, SMB1). Reconnu par Microsoft en novembre.
+        '^0x80070306$' { return 'Windows n''a pas pu mettre à jour certaines copies de ses fichiers gardées sur le PC (défaut connu chez Microsoft) ; une réinstallation qui garde fichiers et applications le corrige si l''échec dure' }
+        # Pilote d'imprimante Canon sur PC-LV le 21/11/2026 : imprimante absente, l'échec revient à chaque essai
+        '^0x800F020B$' { return 'appareil introuvable, souvent une imprimante ou un périphérique éteint ou débranché : branche-le et allume-le, sinon ce pilote peut être ignoré' }
     }
     return $null
+}
+
+function Get-WingetErrorHint([string]$Code) {
+    # Explication courte d'un code de sortie de winget, d'après ses journaux (PC-LV, 21/11/2026). $null : code
+    # sans explication, il est affiché seul. Fonction pure, testée en T1.
+    switch -Regex ($Code) {
+        # « Package hash verification failed » : l'éditeur a changé son fichier sans que winget le sache (CCleaner)
+        '^0x8A150011$' { return 'le fichier de l''éditeur ne correspond pas à celui attendu : winget refuse de l''installer, par sécurité. Réessaie dans quelques jours ou mets-la à jour depuis l''application' }
+        # « ShellExecute installer failed » : le programme d'installation de l'éditeur a échoué (Java : code 1618)
+        '^0x8A150006$' { return 'son programme d''installation a échoué, souvent parce qu''une autre installation tournait : redémarre le PC, puis relance J.A.R.V.I.S.' }
+        '^0x80070002$' { return 'un fichier manquait pendant l''installation : relance un scan pour réessayer' }
+    }
+    return $null
+}
+
+function Get-WingetPresence($ExitCode) {
+    # Code de sortie de « winget list --id X --exact » : PRESENT (0), ABSENT (0x8A150014, aucun paquet installé ne
+    # correspond, relevé le 21/11/2026), UNKNOWN pour tout le reste (winget introuvable, source illisible).
+    # Fonction pure, testée en T1.
+    if ($null -eq $ExitCode) { return 'UNKNOWN' }
+    try { $h = '{0:X8}' -f $ExitCode } catch { return 'UNKNOWN' }
+    if ($h -eq '00000000') { return 'PRESENT' }
+    if ($h -eq '8A150014' -or $h -eq 'FFFFFFFF8A150014') { return 'ABSENT' }
+    return 'UNKNOWN'
+}
+
+function Get-WingetVersionChange([string]$Before, [string]$After) {
+    # Version inscrite avant et après une mise à jour winget « terminée » mais encore proposée : CHANGED (Google Play
+    # Games sur PC-LV le 21/11/2026 : 26.6.957.0 puis 26.11.281.0, winget proposant toujours 159.0.8140.0, numérotée
+    # autrement), SAME, ou UNKNOWN si l'une est illisible (vide, « < 1.4.7 », « Unknown », coupée par winget).
+    # Fonction pure, testée en T1.
+    $b = ([string]$Before).Trim()
+    $a = ([string]$After).Trim()
+    $ell = [string][char]0x2026
+    foreach ($v in @($b, $a)) {
+        if (-not $v -or $v -notmatch '^\d' -or $v.EndsWith($ell)) { return 'UNKNOWN' }
+    }
+    if ($b -eq $a) { return 'SAME' }
+    return 'CHANGED'
+}
+
+function Get-MachineLabel([string]$Maker, [string]$Model) {
+    # « Fabricant Modèle », sans répéter le fabricant quand le modèle commence déjà par lui (PC-LV le 21/11/2026 :
+    # « HP » et « HP ENVY x360 m6 Convertible » donnaient « HP HP ENVY... »). Fonction pure, testée en T1.
+    $mk = ([string]$Maker).Trim()
+    $md = ([string]$Model).Trim()
+    if (-not $mk) { return $md }
+    if (-not $md) { return $mk }
+    if ($md.StartsWith($mk, [StringComparison]::OrdinalIgnoreCase)) { return $md }
+    return ($mk + ' ' + $md)
 }
 
 function Split-NativeOutput {
@@ -3108,6 +3451,9 @@ function Get-BiosSearchName([string]$BoardProduct, [string]$SystemModel, [string
     if ($m -match $filler) { $m = '' }
     if ($From -ne 'System' -or -not $m) { return $b }
     if (-not $b -or $b -eq $m) { return $m }
+    # Un nom qui contient déjà l'autre suffit (v3.21 : « MS-7B98 (carte mère Z390-A PRO (MS-7B98)) » vu sur l'autre PC)
+    if ($b.IndexOf($m, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $b }
+    if ($m.IndexOf($b, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $m }
     return ('{0} (carte mère {1})' -f $m, $b)
 }
 
@@ -3219,6 +3565,38 @@ function Get-CfaVerdict($Value) {
         4 { return 'AUDIT' }
         default { return 'UNKNOWN' }
     }
+}
+
+function Get-CfaAllowedRisk {
+    # Applications autorisées par l'accès contrôlé aux dossiers (Get-MpPreference.ControlledFolderAccessAllowedApplications).
+    # Un programme qui lance n'importe quel script ou programme (PowerShell, cmd, svchost...) ouvre la porte aux
+    # rançongiciels : le 21/11/2026, un clic sur « Autoriser » après une notification a ajouté powershell.exe entier
+    # sur le PC de Thomas ; sur PC-LV, svchost.exe et dllhost.exe étaient autorisés. Sans droits administrateur,
+    # Windows rend « N/A: Must be an administrator to view exclusions ». Fonction pure, testée en T1.
+    # State : OK (Count = applications autorisées, aucune à risque), WARN (Risky = noms), UNKNOWN (liste illisible).
+    param([object[]]$Apps)
+    $r = [pscustomobject]@{ State = 'OK'; Count = 0; Risky = @() }
+    $risky = @('powershell.exe', 'powershell_ise.exe', 'pwsh.exe', 'cmd.exe', 'wscript.exe', 'cscript.exe', 'mshta.exe',
+               'rundll32.exe', 'regsvr32.exe', 'dllhost.exe', 'svchost.exe')
+    $found = @()
+    foreach ($a in @($Apps)) {
+        if ($null -eq $a) { continue }
+        $s = ([string]$a).Trim()
+        if (-not $s) { continue }
+        if ($s -match '^N/A') { $r.State = 'UNKNOWN'; return $r }
+        $r.Count++
+        $leaf = ($s -split '\\')[-1].ToLowerInvariant()
+        if ($risky -contains $leaf -and $found -notcontains $leaf) { $found += $leaf }
+    }
+    if ($found.Count -gt 0) { $r.State = 'WARN'; $r.Risky = $found }
+    return $r
+}
+
+function Test-CfaNoticeExpected([string]$CfaVerdict, [bool]$FolderExists) {
+    # Bouton [M] : PowerShellGet (fourni avec Windows) crée Documents\WindowsPowerShell\Scripts\InstalledScriptInfos à
+    # chaque chargement s'il manque. Accès contrôlé actif : Windows refuse et affiche « Modification non autorisée
+    # bloquée » pour powershell.exe (PC-LV, 21/11/2026 ; le module s'est installé quand même). Fonction pure, T1.
+    return ($CfaVerdict -eq 'ON' -and -not $FolderExists)
 }
 
 function Get-RdpVerdict($Policy, $Local) {
@@ -3861,8 +4239,12 @@ function Update-Report([string]$File, [string[]]$Lines) {
 function Invoke-WindowsRepair {
     # Réparation de Windows : DISM /RestoreHealth puis SFC /scannow. Chaque outil est lancé par son chemin
     # complet, son code et son texte sont lus, et le résultat affiché vient d'un analyseur testé (T1).
+    # v3.21 : le bilan de DISM (défauts trouvés et réparés) est lu dans CBS.log juste après DISM, avant que
+    # SFC ne relance le service qui peut mettre ce journal de côté ; il est mémorisé (LastRepair) pour
+    # prévenir avant de reproposer une réparation qui n'ira pas plus loin.
     Write-Host '   NE FERME PAS CETTE FENÊTRE pendant la réparation.' -ForegroundColor Yellow
     Write-Host ''
+    $start = (Get-Date).AddSeconds(-5)
     $dism = Invoke-ProcessSpinner -Label 'DISM /RestoreHealth (10-30 min)' -FilePath (Get-SystemToolPath 'dism.exe') `
             -Arguments '/Online /Cleanup-Image /RestoreHealth' -TimeoutSec 3600 -Encoding 'Auto' -AskOnTimeout
     if ($null -eq $dism) {
@@ -3871,22 +4253,40 @@ function Invoke-WindowsRepair {
         Write-Sub 'Réparation non faite : relance un scan complet pour recommencer'
         return
     }
+    $sum = Get-CbsSummary (Read-CbsLogText $start) $start 'REPAIR'
+    $incomplete = $false
+    $memo = $null
     switch (Get-DismRepairVerdict $dism.Text $dism.Code) {
-        'REPAIRED' { Write-Status 'DISM RestoreHealth' 'image Windows réparée' 'OK' }
+        'REPAIRED' {
+            Write-Status 'DISM RestoreHealth' 'image Windows réparée' 'OK'
+            if ($sum -and $sum.Detected -gt 0) { Write-Sub ('{0:N0} défaut(s) réparé(s) dans le magasin de composants' -f $sum.Repaired) }
+            $memo = 'REPAIRED|0'
+        }
         'NOSOURCE' {
-            Write-Status 'DISM RestoreHealth' 'échec : fichiers de réparation introuvables ou image irréparable' 'FAIL'
-            Write-Sub 'Vérifie la connexion Internet puis relance un scan complet'
-            Write-Sub 'Si l''échec persiste : réparation de Windows conseillée (réinstallation sur place)'
+            $incomplete = $true
+            if ($sum -and $sum.Repaired -gt 0 -and $sum.Remaining -gt 0) {
+                Write-Status 'DISM RestoreHealth' ('réparation partielle : {0:N0} défauts réparés sur {1:N0}' -f $sum.Repaired, $sum.Detected) 'WARN'
+                Write-Sub ('{0:N0} restent : Windows Update ne fournit plus les fichiers qui les remplaceraient' -f $sum.Remaining)
+                $memo = 'PARTIAL|{0}' -f $sum.Remaining
+            } else {
+                Write-Status 'DISM RestoreHealth' 'échec : fichiers de réparation introuvables' 'FAIL'
+                Write-Sub 'Vérifie la connexion Internet, puis réessaie après la prochaine mise à jour de Windows'
+                $memo = 'NOSOURCE|'
+                if ($sum) { $memo = 'NOSOURCE|{0}' -f $sum.Remaining }
+            }
         }
         'FAILED' {
             Write-Status 'DISM RestoreHealth' ("échec, code 0x{0:X8}" -f [int]$dism.Code) 'FAIL'
             Write-Sub 'Détails : C:\Windows\Logs\DISM\dism.log'
+            $memo = 'FAILED|'
         }
         default {
             Write-Status 'DISM RestoreHealth' 'terminé, mais résultat non reconnu' 'INFO'
             Write-Sub 'Détails : C:\Windows\Logs\DISM\dism.log'
         }
     }
+    if ($memo) { $null = Set-JarvisConfigValue 'LastRepair' ('{0}|{1}' -f (Get-Date -Format 'yyyy-MM-dd'), $memo) }
+    $sfcStart = (Get-Date).AddSeconds(-5)
     $sfc = Invoke-ProcessSpinner -Label 'SFC /scannow (5-20 min)' -FilePath (Get-SfcPath) `
            -Arguments '/scannow' -TimeoutSec 3600 -Encoding 'Auto' -AskOnTimeout
     if ($null -eq $sfc) {
@@ -3895,10 +4295,21 @@ function Invoke-WindowsRepair {
         return
     }
     switch (Get-SfcVerdict $sfc.Text) {
-        'CLEAN' { Write-Status 'SFC /scannow' 'aucune violation d''intégrité' 'OK' }
+        'CLEAN' {
+            Write-Status 'SFC /scannow' 'aucune violation d''intégrité' 'OK'
+            # DISM incomplet mais Windows en service intact : aucune réinstallation à conseiller
+            if ($incomplete) { Write-Sub 'Windows en service intact : rien d''urgent, réessaie après la prochaine mise à jour de Windows' }
+        }
         'REPAIRED' {
-            Write-Status 'SFC /scannow' 'fichiers système corrompus réparés' 'OK'
-            Write-Sub 'Redémarre le PC pour terminer la réparation'
+            $rep = Get-SfcRepairSummary (Read-CbsLogText $sfcStart) $sfcStart
+            if ($rep.OnlyOneDrive) {
+                Write-Status 'SFC /scannow' 'seul le raccourci OneDrive des nouveaux comptes a été remis' 'OK'
+                Write-Sub 'OneDrive remplace ce raccourci quand il se met à jour, SFC remet celui de Windows : rien à faire'
+            } else {
+                Write-Status 'SFC /scannow' 'fichiers système corrompus réparés' 'OK'
+                Write-SfcRepairedFiles $rep
+                Write-Sub 'Redémarre le PC pour terminer la réparation'
+            }
         }
         'UNFIXED' {
             Write-Status 'SFC /scannow' 'des fichiers corrompus n''ont pas pu être réparés' 'FAIL'
@@ -4023,6 +4434,10 @@ function Invoke-SelfTestAnalyzers {
             @(("La restauration a été effectuée.`r`nL" + $ap + "opération a réussi.`r`n"), 0, 'REPAIRED'),
             @('The restore operation failed. Either the repair source was not found or the component store cannot be repaired.', -2146498529, 'NOSOURCE'),
             @('Échec de la restauration. La source de réparation est introuvable ou le magasin de composants est irréparable.', -2146498529, 'NOSOURCE'),
+            # 0x800F0915, autre PC le 20/11/2026 ; texte français relevé dans CbsProvider.dll.mui le 21/11/2026
+            @(("Erreur : 0x800f0915`r`n`r`nLe contenu de réparation est introuvable. Vérifiez la connectivité Internet ou utilisez l" + $ap + "option « Source ».`r`n"), -2146498283, 'NOSOURCE'),
+            @("Error: 0x800f0915`r`n`r`nThe repair content could not be found anywhere.`r`n", -2146498283, 'NOSOURCE'),
+            @('Erreur', -2146498283, 'NOSOURCE'),
             @('Error: 1726 The remote procedure call failed.', 1726, 'FAILED'),
             @('The operation completed successfully.', 0, 'UNKNOWN'),
             @('', $null, 'FAILED')
@@ -4122,6 +4537,109 @@ function Invoke-SelfTestAnalyzers {
         $all = $r[0].Name + $r[0].Id + $r[0].Installed + $r[0].Available
         Assert-True ($all -notmatch '[\x00-\x1F\x7F-\x9F]') 'caractère de contrôle conservé'
         'séquence d''échappement neutralisée'
+    }
+    Test-Case 'DISM : bilan de la réparation lu dans CBS.log' {
+        # Lignes réelles de l'autre PC (20/11/2026), fins de ligne CRLF comme le vrai journal (règle 0)
+        $L = { param($ts, $msg) '{0}, Info                  CBS    {1}' -f $ts, $msg }
+        $rows = @(
+            (& $L '2026-11-20 12:29:20' 'Summary:'),
+            (& $L '2026-11-20 12:29:20' 'Operation: Detect only '),
+            (& $L '2026-11-20 12:29:20' 'Operation result: 0x0'),
+            (& $L '2026-11-20 12:29:20' 'Last Successful Step: Stage package detection completes.'),
+            (& $L '2026-11-20 12:29:20' "Total Detected Corruption:`t692"),
+            (& $L '2026-11-20 12:29:20' "`tCSI Payload Corruption:`t692"),
+            (& $L '2026-11-20 12:29:20' "Total Repaired Corruption:`t0"),
+            (& $L '2026-11-20 12:29:20' 'Total Operation Time: 212 seconds.'),
+            (& $L '2026-11-20 13:01:24' 'Repair failed: Missing replacement payload.'),
+            (& $L '2026-11-20 13:01:24' 'Summary:'),
+            (& $L '2026-11-20 13:01:24' 'Operation: Detect and Repair '),
+            (& $L '2026-11-20 13:01:24' 'Operation result: 0x0'),
+            (& $L '2026-11-20 13:01:24' "Total Detected Corruption:`t1973"),
+            (& $L '2026-11-20 13:01:24' "Total Repaired Corruption:`t1929"),
+            (& $L '2026-11-20 13:01:24' "`tCSI Payload Repaired:`t648"),
+            (& $L '2026-11-20 13:01:24' 'Total Operation Time: 1582 seconds.')
+        )
+        $crlf = ($rows -join "`r`n") + "`r`n"
+        $lf = ($rows -join "`n") + "`n"
+        $t0 = [datetime]'2026-11-20 12:35:00'
+        $r = Get-CbsSummary $crlf $t0 'REPAIR'
+        Assert-True ($null -ne $r -and $r.Detected -eq 1973 -and $r.Repaired -eq 1929 -and $r.Remaining -eq 44) 'bilan de la réparation (CRLF) mal lu'
+        $r = Get-CbsSummary $lf $t0 'REPAIR'
+        Assert-True ($null -ne $r -and $r.Remaining -eq 44) 'bilan de la réparation (LF) mal lu'
+        $d = Get-CbsSummary $crlf ([datetime]'2026-11-20 12:25:00') 'DETECT'
+        Assert-True ($null -ne $d -and $d.Detected -eq 692 -and $d.Repaired -eq 0) 'bilan de l''analyse mal lu'
+        Assert-True ($null -eq (Get-CbsSummary $crlf $t0 'DETECT')) 'analyse antérieure au lancement prise en compte'
+        $cut = ($rows[9..13] -join "`r`n") + "`r`n"
+        Assert-True ($null -eq (Get-CbsSummary $cut $t0 'REPAIR')) 'bilan incomplet accepté'
+        Assert-True ($null -eq (Get-CbsSummary '' $t0 'REPAIR')) 'texte vide accepté'
+        '6/6 cas'
+    }
+    Test-Case 'SFC : fichiers remis lus dans CBS.log' {
+        # Lignes réelles de PC-LV le 21/11/2026 (SFC lancé vers 17 h 02), espaces d'origine
+        $pre = 'Info                  CSI    '
+        $lnk = '\??\C:\Users\Default\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\\OneDrive.lnk'
+        $rows = @(
+            ('2026-11-21 17:05:29, ' + $pre + '00000241 [SR] Repairing file ' + $lnk + ' from store'),
+            ('2026-11-21 17:05:57, ' + $pre + '000002a0 [SR] Repairing file ' + $lnk + ' from store'),
+            ('2026-11-21 17:05:57, ' + $pre + '000002a2 [SR] Repair complete')
+        )
+        $t0 = [datetime]'2026-11-21 17:02:00'
+        $crlf = ($rows -join "`r`n") + "`r`n"
+        $r = Get-SfcRepairSummary $crlf $t0
+        Assert-True ($r.OnlyOneDrive -and @($r.Files).Count -eq 1) 'raccourci OneDrive seul non reconnu (CRLF)'
+        Assert-True (@($r.Files)[0] -eq 'C:\Users\Default\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\OneDrive.lnk') 'chemin mal nettoyé'
+        $r = Get-SfcRepairSummary ($rows -join "`n") $t0
+        Assert-True ($r.OnlyOneDrive) 'raccourci OneDrive seul non reconnu (LF)'
+        $dll = '2026-11-21 17:06:10, ' + $pre + '000002b0 [SR] Repairing file \??\C:\Windows\System32\\exemple.dll from store'
+        $r = Get-SfcRepairSummary ($crlf + $dll + "`r`n") $t0
+        Assert-True (-not $r.OnlyOneDrive -and @($r.Files).Count -eq 2) 'autre fichier réparé caché derrière OneDrive'
+        $r = Get-SfcRepairSummary $crlf ([datetime]'2026-11-21 17:10:00')
+        Assert-True (-not $r.OnlyOneDrive -and @($r.Files).Count -eq 0) 'réparation antérieure au lancement prise en compte'
+        $r = Get-SfcRepairSummary '' $t0
+        Assert-True (-not $r.OnlyOneDrive -and @($r.Files).Count -eq 0) 'journal illisible pris pour une fausse alerte'
+        $other = '2026-11-21 17:05:29, ' + $pre + '00000241 [SR] Repairing file \??\C:\Users\Utilisateur\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\\OneDrive.lnk from store'
+        Assert-True (-not (Get-SfcRepairSummary $other $t0).OnlyOneDrive) 'raccourci OneDrive d''un vrai compte pris pour celui du modèle'
+        '7/7 cas'
+    }
+    Test-Case 'DISM : réparation déjà tentée' {
+        $now = [datetime]'2026-11-21'
+        $cases = @(
+            @('2026-11-20|PARTIAL|44', 44, 'SAME'),
+            @('2026-11-20|PARTIAL|44', 30, 'SAME'),
+            @('2026-11-20|PARTIAL|44', 120, $null),
+            @('2026-11-20|PARTIAL|44', $null, 'FAILED'),
+            @('2026-11-20|NOSOURCE|', 10, 'FAILED'),
+            @('2026-11-20|REPAIRED|0', 5, $null),
+            @('2026-11-20|FAILED|', 5, $null),
+            @('2026-06-01|PARTIAL|44', 44, $null),
+            @('2026-12-01|PARTIAL|44', 44, $null),
+            @('pas une date', 1, $null),
+            @('', 1, $null)
+        )
+        foreach ($c in $cases) {
+            $got = Get-RepairRetryAdvice $c[0] $now $c[1]
+            Assert-True ($got -eq $c[2]) ("« {0} », {1} défauts -> {2}, attendu {3}" -f $c[0], $c[1], $got, $c[2])
+        }
+        '{0}/{0} cas' -f $cases.Count
+    }
+    Test-Case 'Windows Update : signatures Defender reconnues' {
+        $mk = { param($t, $cat, $kb) [pscustomobject]@{ Title = $t; Categories = @($cat | ForEach-Object { [pscustomobject]@{ CategoryID = $_ } }); KBs = @($kb) } }
+        $fr = 'Mise à jour de la sélection disjointe pour Microsoft Defender Antivirus - 2267602 Ko (version 1.463.399.0) - Canal actuel (large)'
+        Assert-True (Test-WuDefinitionUpdate (& $mk $fr @() @())) 'titre français (Ko) non reconnu'
+        Assert-True (Test-WuDefinitionUpdate (& $mk 'Security Intelligence Update' @('E0789628-CE08-4437-BE74-2495B842F43B') @())) 'catégorie non reconnue'
+        Assert-True (Test-WuDefinitionUpdate (& $mk 'Mise à jour' @() @('2267602'))) 'numéro KB non reconnu'
+        Assert-True (-not (Test-WuDefinitionUpdate (& $mk '2026-11 Mise à jour cumulative (KB5070773)' @('0fa1201d-4330-4fa8-8ae9-b877473b6441') @('5070773')))) 'mise à jour cumulative prise pour une signature'
+        Assert-True (-not (Test-WuDefinitionUpdate (& $mk 'Pilote 22676021' @() @()))) 'numéro voisin pris pour une signature'
+        Assert-True (-not (Test-WuDefinitionUpdate ([pscustomobject]@{ Title = 'Sans catégories' }))) 'objet incomplet'
+        Assert-True (-not (Test-WuDefinitionUpdate $null)) 'valeur nulle'
+        '7/7 cas'
+    }
+    Test-Case 'Affichage : tirets longs remplacés' {
+        $got = ConvertTo-DisplayText ('Antivirus ' + [char]0x2013 + ' KB2267602 ' + [char]0x2014 + ' 1 ' + [char]0x2212 + ' 2' + [char]7)
+        Assert-True ($got -eq 'Antivirus - KB2267602 - 1 - 2') ('obtenu : ' + $got)
+        Assert-True ((ConvertTo-DisplayText 'Défaut ok') -eq 'Défaut ok') 'texte ordinaire modifié'
+        Assert-True ((ConvertTo-DisplayText $null) -eq '') 'valeur nulle'
+        '3/3 cas'
     }
     Test-Case 'Affichage : caractères de contrôle retirés' {
         $esc = [string][char]27
@@ -4502,7 +5020,65 @@ function Invoke-SelfTestAnalyzers {
         Assert-True ((Get-WuErrorHint '0x800F0922') -match 'VPN') 'code 0x800F0922 sans explication'
         Assert-True ((Get-WuErrorHint '0x80073712') -match 'scan complet') 'fichiers de Windows abîmés sans conseil'
         Assert-True ($null -eq (Get-WuErrorHint '0x12345678')) 'code inconnu expliqué'
-        '12/12 cas'
+        Assert-True ((Get-WuErrorHint '0x800F020B') -match 'débranché') 'appareil absent (0x800F020B) sans explication'
+        '13/13 cas'
+    }
+    Test-Case 'Windows Update : journal Système et préversions' {
+        $d0 = Get-Date '2026-11-21 17:25:52'
+        $kbT = '2026-11 Mise à jour de la préversion (KB5132057) (26300.10075)'
+        $ev = ConvertFrom-WuClientEvent 20 $d0 @{ updateTitle = $kbT; updateGuid = '{71AB9CFC-4BDF-48B7-B7AD-7F4CE4605CD7}'; errorCode = "0x80070306`r`n" }
+        Assert-True ($null -ne $ev -and $ev.ResultCode -eq 4 -and ('0x{0:X8}' -f [int]$ev.HResult) -eq '0x80070306') 'échec du journal mal lu (code)'
+        Assert-True ($ev.UpdateId -eq '71ab9cfc-4bdf-48b7-b7ad-7f4ce4605cd7') ('identifiant mal lu : ' + $ev.UpdateId)
+        $ok = ConvertFrom-WuClientEvent 19 $d0 @{ updateTitle = 'Pilote'; updateGuid = '{ABC}' }
+        Assert-True ($null -ne $ok -and $ok.ResultCode -eq 2 -and $ok.HResult -eq 0) 'réussite du journal mal lue'
+        Assert-True ($null -eq (ConvertFrom-WuClientEvent 20 $d0 @{ updateTitle = 'X'; errorCode = 'inconnu' })) 'code illisible accepté'
+        Assert-True ($null -eq (ConvertFrom-WuClientEvent 43 $d0 @{ updateTitle = 'X'; errorCode = '0x1' })) 'début d''installation pris pour un résultat'
+        Assert-True ($null -eq (ConvertFrom-WuClientEvent 20 $d0 @{ errorCode = '0x80070306' })) 'échec sans titre accepté'
+        # Cas réel du 21/11/2026 : l'historique de l'API ne contient pas KB5132057, le journal la contient plusieurs fois ;
+        # le pilote Canon est dans les deux sources et ne doit compter qu'une fois
+        $com = @([pscustomobject]@{ Date = $d0.AddHours(-4); Operation = 1; ResultCode = 2; HResult = 0; Title = 'Mise à jour de la sélection disjointe pour Microsoft Defender Antivirus - 2267602 Ko (version 1.463.399.0)'; UpdateId = 'aaa' },
+                 [pscustomobject]@{ Date = $d0.AddHours(-5); Operation = 1; ResultCode = 4; HResult = [Convert]::ToInt32('800F020B', 16); Title = 'Canon - Printer - 2.90.2.30'; UpdateId = 'ccc' })
+        $evs = @()
+        foreach ($m in 0, 12, 16) { $evs += ConvertFrom-WuClientEvent 20 ($d0.AddMinutes($m)) @{ updateTitle = $kbT; updateGuid = '{71ab9cfc-4bdf-48b7-b7ad-7f4ce4605cd7}'; errorCode = '0x80070306' } }
+        $evs += ConvertFrom-WuClientEvent 20 ($d0.AddHours(-5)) @{ updateTitle = 'Canon - Printer - 2.90.2.30'; updateGuid = '{CCC}'; errorCode = '0x800F020B' }
+        $pend = @([pscustomobject]@{ Title = $kbT; UpdateId = '71ab9cfc-4bdf-48b7-b7ad-7f4ce4605cd7' },
+                  [pscustomobject]@{ Title = 'Canon - Printer - 2.90.2.30'; UpdateId = 'ccc' })
+        $r = Get-WuHistoryFailures (@($com) + @($evs)) ($d0.AddDays(-30)) $pend
+        Assert-True (@($r.Failed).Count -eq 2) ('{0} échec(s), attendu 2 (préversion du journal, pilote vu dans les deux sources)' -f @($r.Failed).Count)
+        $kb = @($r.Failed | Where-Object { $_.Title -like '*KB5132057*' })
+        Assert-True ($kb.Count -eq 1 -and $kb[0].Code -eq '0x80070306') 'échec présent seulement dans le journal non retenu'
+        # Le 21/11/2026, la recherche de l'API ne proposait rien : l'échec du journal reste à signaler
+        $r2 = Get-WuHistoryFailures @($evs) ($d0.AddDays(-30)) @() '26300.9974'
+        Assert-True (@($r2.Failed | Where-Object { $_.Title -like '*KB5132057*' }).Count -eq 1) 'échec du journal effacé parce que l''API ne le propose pas'
+        $r3 = Get-WuHistoryFailures @($evs) ($d0.AddDays(-30)) @() '26300.10075'
+        Assert-True (@($r3.Failed | Where-Object { $_.Title -like '*KB5132057*' }).Count -eq 0 -and $r3.Resolved -ge 1) 'version de Windows atteinte : échec encore signalé'
+        Assert-True ($null -eq (ConvertFrom-WuClientEvent 20 $d0 @{ updateTitle = '9PLM9XGG6VKS-OpenAI.Codex'; errorCode = '0x80073D02' })) 'application du Store reprise du journal'
+        Assert-True (Test-WuPreviewTitle $kbT) 'préversion (titre français) non reconnue'
+        Assert-True (Test-WuPreviewTitle '2026-11 Cumulative Update Preview for Windows 11 Version 24H2 for x64-based Systems (KB5000000)') 'préversion (titre anglais) non reconnue'
+        Assert-True (Test-WuPreviewTitle '2026-11 .NET Framework Mise à jour de la préversion (KB5137006)') 'préversion de .NET non reconnue'
+        Assert-True (-not (Test-WuPreviewTitle '2026-11 Mise à jour cumulative pour Windows 11 (KB5132061) (26300.9974)')) 'mise à jour de sécurité prise pour une préversion'
+        Assert-True (-not (Test-WuPreviewTitle 'Canon - Printer - 2.90.2.30')) 'pilote pris pour une préversion'
+        Assert-True ($null -ne (Get-WuErrorHint '0x80070306')) 'code 0x80070306 sans explication'
+        '17/17 cas'
+    }
+    Test-Case 'Accès contrôlé : exceptions à risque' {
+        $r0 = Get-CfaAllowedRisk $null
+        Assert-True ($r0.State -eq 'OK' -and $r0.Count -eq 0) 'aucune exception mal lue'
+        Assert-True ((Get-CfaAllowedRisk @()).State -eq 'OK') 'liste vide mal lue'
+        Assert-True ((Get-CfaAllowedRisk @('N/A: Must be an administrator to view exclusions')).State -eq 'UNKNOWN') 'liste masquée (sans droits admin) prise pour une liste vide'
+        # Liste réelle de PC-LV (21/11/2026), nom du compte remplacé
+        $lv = @('C:\Program Files (x86)\Common Files\Adobe\Adobe Desktop Common\AdobeGenuineClient\customhook\gccustomhook.exe',
+                'C:\Program Files\CCleaner\CCleaner64.exe', 'C:\Program Files\CCleaner\CCUpdate.exe', 'C:\Program Files\Scrivener3\Scrivener.exe',
+                'C:\Users\Utilisateur\Downloads\ccsetup561.exe', 'C:\Windows\System32\dllhost.exe', 'C:\Windows\System32\MoUsoCoreWorker.exe',
+                'C:\Windows\System32\SrTasks.exe', 'C:\Windows\System32\svchost.exe')
+        $r1 = Get-CfaAllowedRisk $lv
+        Assert-True ($r1.State -eq 'WARN' -and $r1.Count -eq 9 -and (@($r1.Risky) -join ',') -eq 'dllhost.exe,svchost.exe') ('liste de PC-LV mal lue : ' + (@($r1.Risky) -join ','))
+        $r2 = Get-CfaAllowedRisk @('C:\WINDOWS\System32\WindowsPowerShell\v1.0\POWERSHELL.EXE', 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe')
+        Assert-True ($r2.State -eq 'WARN' -and @($r2.Risky).Count -eq 1 -and $r2.Risky[0] -eq 'powershell.exe') 'PowerShell autorisé non signalé (ou signalé deux fois)'
+        Assert-True ((Get-CfaAllowedRisk @('C:\Program Files\CCleaner\CCleaner64.exe')).State -eq 'OK') 'application ordinaire signalée à tort'
+        Assert-True ((Test-CfaNoticeExpected 'ON' $false) -and -not (Test-CfaNoticeExpected 'ON' $true)) 'avertissement de [M] mal décidé (accès contrôlé actif)'
+        Assert-True (-not (Test-CfaNoticeExpected 'OFF' $false) -and -not (Test-CfaNoticeExpected 'UNKNOWN' $false)) 'avertissement de [M] sans accès contrôlé actif'
+        '8/8 cas'
     }
     Test-Case 'Microsoft Store : noms, réglage et résultat' {
         $names = @{ 'SpotifyAB.SpotifyMusic_zpdnekdrzrea0' = 'Spotify' }
@@ -4561,11 +5137,13 @@ function Invoke-SelfTestAnalyzers {
         Assert-True ($null -eq (Get-BiosSupportLink '' '' '')) 'aucun fabricant'
         Assert-True (@(@($g, $d, $a, $m, $h, $s) | Where-Object { [string]$_.Url -notmatch '^https://[a-z0-9.-]+/' }).Count -eq 0) 'adresse non https'
         Assert-True ((Get-BiosSearchName 'Z790 AORUS ELITE DDR4' 'Z790 AORUS ELITE DDR4' 'System') -eq 'Z790 AORUS ELITE DDR4') 'carte et PC du même nom'
-        Assert-True ((Get-BiosSearchName 'B450 TOMAHAWK MAX (MS-7C02)' 'MS-7C02' 'System') -eq 'MS-7C02 (carte mère B450 TOMAHAWK MAX (MS-7C02))') 'modèle du PC différent de la carte'
+        Assert-True ((Get-BiosSearchName 'B450 TOMAHAWK MAX (MS-7C02)' 'MS-7C02' 'System') -eq 'B450 TOMAHAWK MAX (MS-7C02)') 'modèle du PC déjà dans le nom de la carte'
+        Assert-True ((Get-BiosSearchName 'Z390-A PRO (MS-7B98)' 'MS-7B98' 'System') -eq 'Z390-A PRO (MS-7B98)') 'nom doublé (autre PC, 20/11/2026)'
+        Assert-True ((Get-BiosSearchName 'PRO Z790-A WIFI' 'MS-7E07' 'System') -eq 'MS-7E07 (carte mère PRO Z790-A WIFI)') 'modèle du PC différent de la carte'
         Assert-True ((Get-BiosSearchName 'PRIME B550-PLUS' 'System Product Name' 'System') -eq 'PRIME B550-PLUS') 'texte de remplissage cherché'
         Assert-True ((Get-BiosSearchName 'X570 Steel Legend' 'To Be Filled By O.E.M.' 'Board') -eq 'X570 Steel Legend') 'carte mère ignorée'
         Assert-True ((Get-BiosSearchName 'Default string' 'Default string' 'System') -eq '') 'aucun nom utile'
-        '15/15 cas'
+        '17/17 cas'
     }
     Test-Case 'Fenêtre : place reprise après une relance' {
         $t = Format-WinRect -8 234 1200 1053
@@ -4640,6 +5218,32 @@ function Invoke-SelfTestAnalyzers {
         # Identifiant réduit aux points de suspension : il ne doit pas correspondre à tout
         Assert-True (-not (Test-WingetStillListed 'Mozilla.Firefox' @([pscustomobject]@{ Id = ('Mo' + $ell) }))) 'début trop court accepté'
         '6/6 cas'
+    }
+    Test-Case 'winget : codes, application retirée, version changée' {
+        # Relevés de PC-LV le 21/11/2026 (journaux de winget) : CCleaner 0x8A150011, Java 0x8A150006 puis absent
+        Assert-True ((Get-WingetErrorHint '0x8A150011') -match 'sécurité') 'empreinte différente (0x8A150011) sans explication'
+        Assert-True ((Get-WingetErrorHint '0x8A150006') -match 'autre installation') 'installateur en échec (0x8A150006) sans explication'
+        Assert-True ($null -eq (Get-WingetErrorHint '0x8A15FFFF')) 'code inconnu expliqué'
+        Assert-True ((Get-WingetPresence 0) -eq 'PRESENT') 'application présente mal lue'
+        Assert-True ((Get-WingetPresence (-1978335212)) -eq 'ABSENT') 'application absente (0x8A150014) mal lue'
+        Assert-True ((Get-WingetPresence (-1978335231)) -eq 'UNKNOWN') 'autre erreur de winget prise pour une réponse'
+        Assert-True ((Get-WingetPresence $null) -eq 'UNKNOWN') 'code absent pris pour une réponse'
+        $ell = [string][char]0x2026
+        Assert-True ((Get-WingetVersionChange '26.6.957.0' '26.11.281.0') -eq 'CHANGED') 'version changée non vue'
+        Assert-True ((Get-WingetVersionChange '26.6.957.0' '26.6.957.0') -eq 'SAME') 'même version crue changée'
+        Assert-True ((Get-WingetVersionChange '< 1.4.7' '1.4.7') -eq 'UNKNOWN') 'version « < 1.4.7 » comparée'
+        Assert-True ((Get-WingetVersionChange 'Unknown' '1.0') -eq 'UNKNOWN') 'version inconnue comparée'
+        Assert-True ((Get-WingetVersionChange '1.2.3' '') -eq 'UNKNOWN') 'version vide comparée'
+        Assert-True ((Get-WingetVersionChange ('14.50.357' + $ell) '14.52.37029.0') -eq 'UNKNOWN') 'version coupée par winget comparée'
+        '13/13 cas'
+    }
+    Test-Case 'Système : fabricant et modèle' {
+        Assert-True ((Get-MachineLabel 'HP' 'HP ENVY x360 m6 Convertible') -eq 'HP ENVY x360 m6 Convertible') 'fabricant répété (HP HP)'
+        Assert-True ((Get-MachineLabel 'hp' 'HP Pavilion') -eq 'HP Pavilion') 'casse différente : fabricant répété'
+        Assert-True ((Get-MachineLabel 'Micro-Star International Co., Ltd.' 'MS-7B51') -eq 'Micro-Star International Co., Ltd. MS-7B51') 'fabricant perdu'
+        Assert-True ((Get-MachineLabel 'LENOVO' '') -eq 'LENOVO') 'modèle vide mal lu'
+        Assert-True ((Get-MachineLabel $null ' Model ') -eq 'Model') 'fabricant vide mal lu'
+        '5/5 cas'
     }
     Test-Case 'Console : police essayée' {
         # Relevés du 19/11/2026 : « Terminal » 8 x 12, famille 0x30 (bitmap) après chcp 65001 ; Consolas 16, famille 0x36
@@ -5049,6 +5653,10 @@ function Invoke-SelfTest {
             Assert-True ($gap -le [math]::Max([double]50MB, 0.1 * [double]$d.Bytes)) ('estimation {0}, dossier {1}' -f (Format-Bytes $est), (Format-Bytes $d.Bytes))
             $txt += ', dossier ' + (Format-Bytes $d.Bytes)
         }
+        # Lire la taille ne suffit pas : sous Windows 10 22H2, le vidage est impossible (PC-LV, 21/11/2026) et le
+        # scan ne doit alors pas le proposer
+        if (Test-DoDeleteAvailable) { $txt += ' ; vidage possible' }
+        else { $txt += ' ; vidage impossible sur ce Windows, non proposé par le scan' }
         $txt
     }
     Test-Case 'Composants Windows : tâche de nettoyage lisible' {
@@ -5867,7 +6475,7 @@ $isLaptop = [bool](Get-CimInstance Win32_Battery)
 $typeTxt = 'PC fixe'
 if ($isLaptop) { $typeTxt = 'PC portable' }
 $cs = Get-CimInstance Win32_ComputerSystem
-Write-Status 'Machine' ('{0}  //  {1} {2}' -f $typeTxt, $cs.Manufacturer, $cs.Model) 'INFO'
+Write-Status 'Machine' ('{0}  //  {1}' -f $typeTxt, (Get-MachineLabel $cs.Manufacturer $cs.Model)) 'INFO'
 
 if ($os -and $os.LastBootUpTime) {
     $up = (Get-Date) - $os.LastBootUpTime
@@ -5881,7 +6489,11 @@ if ($os -and $os.LastBootUpTime) {
 $pending = @()
 if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $pending += 'composants Windows' }
 if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $pending += 'Windows Update' }
-if ($pending.Count -gt 0) { Write-Status 'Redémarrage en attente' ($pending -join ', ') 'WARN' }
+if ($pending.Count -gt 0) {
+    Write-Status 'Redémarrage en attente' ($pending -join ', ') 'WARN'
+    Write-Sub 'Démarrer > Marche/Arrêt > « Mettre à jour et redémarrer » si ce choix est affiché'
+    Write-Sub '(un simple « Redémarrer » peut laisser les mises à jour en attente)'
+}
 else { Write-Status 'Redémarrage en attente' 'aucun' 'OK' }
 
 # ==================================================================
@@ -5912,6 +6524,8 @@ $wu = Invoke-Spinner 'Interrogation des serveurs Microsoft' {
                 Driver = ($u.Type -eq 2)
                 Optional = [bool]$u.BrowseOnly
                 Interactive = [bool]$u.InstallationBehavior.CanRequestUserInput
+                Categories = @(foreach ($c in $u.Categories) { [pscustomobject]@{ CategoryID = [string]$c.CategoryID } })
+                KBs = @(foreach ($k in $u.KBArticleIDs) { [string]$k })
             }
         }
         [pscustomobject]@{ Ok = $true; Updates = $list; Error = $null }
@@ -5926,6 +6540,10 @@ if ($null -eq $wu) {
     Write-Status 'Recherche de mises à jour' ('échec : ' + (Cut $wu.Error 50)) 'WARN'
 } else {
     $all = @($wu.Updates)
+    # Signatures de Defender : Defender les installe lui-même plusieurs fois par jour, leur âge est jugé en
+    # section 06 ; une en attente n'est donc pas une alerte (v3.21, vue à chaque scan sur les deux PC)
+    $defs      = @($all | Where-Object { -not $_.Optional -and (Test-WuDefinitionUpdate $_) })
+    $all       = @($all | Where-Object { $_.Optional -or -not (Test-WuDefinitionUpdate $_) })
     $important = @($all | Where-Object { -not $_.Optional -and -not $_.Interactive })
     $manual    = @($all | Where-Object { -not $_.Optional -and $_.Interactive })
     $optional  = @($all | Where-Object { $_.Optional })
@@ -5941,6 +6559,9 @@ if ($null -eq $wu) {
             if ($u.Driver) { $kind = 'PILOTE' }
             Write-Sub ("[{0}] {1}" -f $kind, (Cut $u.Title 70)) 'Yellow'
         }
+    }
+    if ($defs.Count -gt 0) {
+        Write-Status 'Signatures Defender' ("{0} en attente : Defender les installe de lui-même" -f $defs.Count) 'INFO'
     }
     if ($manual.Count -gt 0) {
         Write-Status 'À faire dans Windows Update' ("{0}, demandent une action à l'écran" -f $manual.Count) 'INFO'
@@ -5976,25 +6597,61 @@ $wuh = Invoke-Spinner 'Lecture de l''historique des mises à jour' {
     }
 } 60
 
-if ($null -eq $wuh -or -not $wuh.Ok) {
+# Même période dans le journal Système (événements 19 et 20) : certains échecs n'apparaissent que là
+# (KB5132057 sur le PC de Thomas le 21/11/2026, cinq échecs absents de l'historique ci-dessus)
+$wue = Get-EventsSafe @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WindowsUpdateClient'; Id = 19, 20; StartTime = (Get-Date).AddDays(-30) }
+$wuRows = @()
+if ($null -ne $wuh -and $wuh.Ok) { $wuRows += @($wuh.Entries) }
+if ($wue.Ok) {
+    foreach ($ev in @($wue.Events)) {
+        $evData = @{}
+        try {
+            foreach ($x in @(([xml]$ev.ToXml()).Event.EventData.Data)) { $evData[[string]$x.Name] = [string]$x.'#text' }
+        } catch { continue }
+        $row = ConvertFrom-WuClientEvent $ev.Id $ev.TimeCreated $evData
+        if ($null -ne $row) { $wuRows += $row }
+    }
+}
+
+if (($null -eq $wuh -or -not $wuh.Ok) -and -not $wue.Ok) {
     Write-Status 'Échecs d''installation (30 j)' 'historique illisible' 'INFO'
 } else {
     $pend = $null
     if ($null -ne $wu -and $wu.Ok) { $pend = @($wu.Updates) }
-    $hf = Get-WuHistoryFailures @($wuh.Entries) ((Get-Date).AddDays(-30)) $pend
-    $nf = @($hf.Failed).Count
-    if ($nf -eq 0) {
+    $osVer = ''
+    if ($cv -and $cv.CurrentBuild -and $null -ne $cv.UBR) { $osVer = '{0}.{1}' -f $cv.CurrentBuild, $cv.UBR }
+    $hf = Get-WuHistoryFailures $wuRows ((Get-Date).AddDays(-30)) $pend $osVer
+    # Préversions facultatives à part : leur échec n'oblige à rien
+    $hfPrev = @($hf.Failed | Where-Object { Test-WuPreviewTitle $_.Title })
+    $hfReq = @($hf.Failed | Where-Object { -not (Test-WuPreviewTitle $_.Title) })
+    $cvBuild = $null
+    if ($cv) { $cvBuild = ConvertTo-IntOrNull $cv.CurrentBuild }
+    if ($hfReq.Count -eq 0 -and $hfPrev.Count -eq 0) {
         Write-Status 'Échecs d''installation (30 j)' 'aucun' 'OK'
-    } else {
-        $nfTxt = "{0} mise(s) à jour jamais réussie(s) depuis" -f $nf
-        if ($null -ne $pend) { $nfTxt = "{0} mise(s) à jour en échec, toujours proposée(s)" -f $nf }
+    }
+    if ($hfReq.Count -gt 0) {
+        $nfTxt = "{0} mise(s) à jour jamais réussie(s) depuis" -f $hfReq.Count
+        if ($null -ne $pend) { $nfTxt = "{0} mise(s) à jour en échec, toujours proposée(s)" -f $hfReq.Count }
         Write-Status 'Échecs d''installation (30 j)' $nfTxt 'WARN'
-        foreach ($f in @($hf.Failed)) {
+        foreach ($f in $hfReq) {
             Write-Sub ("{0}  {1}  (code {2})" -f (Format-Date $f.Date), (Cut $f.Title 58), $f.Code) 'Yellow'
             $hint = Get-WuErrorHint $f.Code
             if ($hint) { Write-Sub ('  ' + $hint) }
+            if ($f.Code -eq '0x80070306' -and $null -ne $cvBuild -and $cvBuild -ge 26100) {
+                Write-Sub '  Paramètres > Système > Récupération > Résoudre les problèmes à l''aide de Windows Update (environ 1 h)'
+            }
         }
         Write-Sub 'Windows Update les retente seul. Si l''échec revient, note le code et cherche-le sur support.microsoft.com'
+    }
+    if ($hfPrev.Count -gt 0) {
+        Write-Status 'Préversions en échec (30 j)' ("{0}, facultative(s) : rien d'obligatoire" -f $hfPrev.Count) 'INFO'
+        foreach ($f in $hfPrev) { Write-Sub ("{0}  {1}  (code {2})" -f (Format-Date $f.Date), (Cut $f.Title 58), $f.Code) }
+        Write-Sub 'Leurs corrections arrivent avec la mise à jour de sécurité du mois suivant : tu peux les ignorer.'
+        $ci = Get-RegValueSafe 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' 'IsContinuousInnovationOptedIn'
+        if ($ci.Ok -and (ConvertTo-IntOrNull $ci.Value) -eq 1) {
+            Write-Sub 'Pour que Windows arrête de les installer : Paramètres > Windows Update > désactive'
+            Write-Sub '« Recevoir les dernières mises à jour dès qu''elles sont disponibles »'
+        }
     }
     if ($hf.Resolved -gt 0) { Write-Sub ("{0} autre(s) échec(s), réussi(s) ou remplacé(s) depuis : rien à faire" -f $hf.Resolved) }
     if ($hf.Store -gt 0) { Write-Sub ("{0} échec(s) d'applications du Microsoft Store : s'il reste une mise à jour à faire, elle est en section 03" -f $hf.Store) }
@@ -6387,6 +7044,24 @@ if ($mp -and -not $mp.RealTimeProtectionEnabled -and $avOther.Count -gt 0) {
         'DISKONLY' { Write-Status 'Accès contrôlé aux dossiers' 'partiel (secteurs de disque seulement)' 'INFO' }
         default    { Write-Status 'Accès contrôlé aux dossiers' 'lecture impossible' 'INFO' }
     }
+    if ($cfa -eq 'ON') {
+        # Exceptions : un programme capable de tout lancer, une fois autorisé, laisse passer n'importe quel script
+        $car = Get-CfaAllowedRisk @($mpPref.ControlledFolderAccessAllowedApplications)
+        # Sans droits administrateur, une liste vide ne prouve rien (Windows masque les exceptions)
+        if ($car.State -eq 'OK' -and -not $isAdmin) { $car.State = 'UNKNOWN' }
+        if ($car.State -eq 'WARN') {
+            Write-Status 'Accès contrôlé : exceptions' (($car.Risky -join ', ') + ' autorisé(s)') 'WARN'
+            Write-Sub 'Ces programmes peuvent lancer n''importe quel script : un rançongiciel peut passer par eux pour'
+            Write-Sub 'modifier tes documents. Retire-les, sauf si tu les as autorisés exprès : Sécurité Windows >'
+            Write-Sub 'Protection contre les virus et menaces > Gérer la protection contre les ransomwares >'
+            Write-Sub 'Autoriser une application via l''accès contrôlé aux dossiers > clique dessus > Supprimer'
+        } elseif ($car.State -eq 'OK') {
+            if ($car.Count -eq 0) { Write-Status 'Accès contrôlé : exceptions' 'aucune application ajoutée' 'OK' }
+            else { Write-Status 'Accès contrôlé : exceptions' ('{0} application(s) ajoutée(s), aucune à risque' -f $car.Count) 'OK' }
+        } else {
+            Write-Status 'Accès contrôlé : exceptions' 'liste lisible seulement en administrateur' 'INFO'
+        }
+    }
     # L'analyse rapide n'est proposée en fin de scan que si Defender est bien l'antivirus en service
     $script:DefenderScan = [bool]$mp.AntivirusEnabled
 } else {
@@ -6410,7 +7085,11 @@ if ($isAdmin) {
     try {
         $sb = Confirm-SecureBootUEFI -ErrorAction Stop
         if ($sb) { Write-Status 'Secure Boot' 'actif' 'OK' }
-        else { Write-Status 'Secure Boot' 'désactivé' 'WARN' }
+        else {
+            Write-Status 'Secure Boot' 'désactivé' 'WARN'
+            Write-Sub 'Protège le démarrage de Windows ; il s''active dans le BIOS (menu Boot ou Security)'
+            Write-Sub 'Pas urgent. Jamais allé dans le BIOS ? Fais-toi aider : un mauvais réglage peut empêcher Windows de démarrer'
+        }
     } catch { Write-Status 'Secure Boot' 'non vérifiable (BIOS legacy ?)' 'INFO' }
 
     $tpm = Get-Tpm
@@ -6724,6 +7403,9 @@ if ($ping.Count -gt 0) {
     Write-Status 'Accès Internet (1.1.1.1)' 'aucune réponse' 'FAIL'
 }
 
+# Premier appel à vide : il charge la commande (module DnsClient), soit 400 à 600 ms comptés à tort
+# comme du temps de réponse DNS jusqu'à la v3.20 (mesuré le 21/11/2026 : 439 ms puis 19 ms)
+$null = Resolve-DnsName 'localhost' -DnsOnly -QuickTimeout -ErrorAction SilentlyContinue
 $dnsSw = [Diagnostics.Stopwatch]::StartNew()
 $dnsOk = [bool](Resolve-DnsName 'www.microsoft.com' -DnsOnly -QuickTimeout)
 $dnsMs = $dnsSw.Elapsed.TotalMilliseconds
@@ -6817,14 +7499,19 @@ $script:CleanTargets += New-CleanTarget 'WuCache' 'Cache Windows Update' $wuM.To
 
 # --- Optimisation de livraison
 $doS = Get-DoCacheState
+$doCan = Test-DoDeleteAvailable
 if ($doS.Ok) {
     Write-Status 'Optimisation de livraison' (Format-DoSize $doS) 'INFO'
-    if ($doS.Bytes -ge $CleanMinBytes) { Write-Sub 'Copies de mises à jour déjà téléchargées ; Windows les retire de lui-même après quelques jours' }
+    if ($doS.Bytes -ge $CleanMinBytes) {
+        Write-Sub 'Copies de mises à jour déjà téléchargées ; Windows les retire de lui-même après quelques jours'
+        if (-not $doCan) { Write-Sub 'Cette version de Windows ne permet pas à J.A.R.V.I.S. de les vider : rien à faire' }
+    }
 } else {
     Write-Status 'Optimisation de livraison' 'lecture impossible' 'INFO'
 }
 $doWhy = ''
-if ($null -eq $doS.Busy) { $doWhy = 'état des téléchargements illisible' }
+if (-not $doCan) { $doWhy = 'vidage impossible sur cette version de Windows' }
+elseif ($null -eq $doS.Busy) { $doWhy = 'état des téléchargements illisible' }
 elseif ($doS.Busy) { $doWhy = 'téléchargement en cours' }
 $doT = New-CleanTarget 'DoCache' 'Cache de l''optimisation de livraison' $doS.Bytes $doS.Ok $true $doWhy
 $doT.MinBytes = $CleanMinDoBytes
@@ -6957,7 +7644,7 @@ if (-not $bios) {
     if ($bios.ReleaseDate) { try { $bAge = ((Get-Date) - [datetime]$bios.ReleaseDate).Days } catch { $bAge = $null } }
     $bTxt = "{0}  ({1})" -f $bios.SMBIOSBIOSVersion, (Format-Date $bios.ReleaseDate)
     if ($null -eq $bAge) { Write-Status 'Version BIOS' "$bTxt  (date illisible)" 'INFO' }
-    elseif ($bAge -gt 365) { Write-Status 'Version BIOS' "$bTxt  (> 1 an)" 'WARN' }
+    elseif ($bAge -gt 365) { Write-Status 'Version BIOS' "$bTxt  (> 1 an)" 'INFO' }   # v3.21 : INFO, pas WARN (rien à faire sans conseil du fabricant)
     else { Write-Status 'Version BIOS' $bTxt 'OK' }
 }
 $csys = $null
@@ -6990,6 +7677,7 @@ if ($script:DeepMode) {
     Write-Host '   Ces analyses sont longues. Ne ferme pas la fenêtre.' -ForegroundColor DarkGray
 
     # --- DISM : état du magasin de composants
+    $scanStart = (Get-Date).AddSeconds(-5)
     $dism = Invoke-ProcessSpinner -Label 'DISM /ScanHealth (5-20 min)' `
             -FilePath (Get-SystemToolPath 'dism.exe') `
             -Arguments '/Online /Cleanup-Image /ScanHealth' -TimeoutSec 2400 -Encoding 'Auto'
@@ -7006,6 +7694,12 @@ if ($script:DeepMode) {
     } elseif ($dv -eq 'REPAIRABLE') {
         Write-Status 'DISM ScanHealth' 'corruption réparable détectée' 'WARN'
         $script:NeedRestore = $true
+        # Nombre de défauts lu dans CBS.log (v3.21), comparé ensuite à ce qui restait après la dernière réparation
+        $scanSum = Get-CbsSummary (Read-CbsLogText $scanStart) $scanStart 'DETECT'
+        if ($scanSum -and $scanSum.Detected -gt 0) {
+            $script:ScanDetected = $scanSum.Detected
+            Write-Sub ('{0:N0} défaut(s) dans le magasin de composants (copies de Windows)' -f $scanSum.Detected)
+        }
     } elseif ($dv -eq 'ERROR') {
         Write-Status 'DISM ScanHealth' ("code de sortie {0}" -f $dism.Code) 'WARN'
         Write-Sub 'Détails : C:\Windows\Logs\DISM\dism.log'
@@ -7017,6 +7711,7 @@ if ($script:DeepMode) {
 
     # --- SFC /scannow
     $sfcExe = Get-SfcPath
+    $sfcStart = (Get-Date).AddSeconds(-5)
     $sfc = Invoke-ProcessSpinner -Label 'SFC /scannow (5-20 min)' -FilePath $sfcExe `
            -Arguments '/scannow' -TimeoutSec 3600 -Encoding 'Auto' -AskOnTimeout
 
@@ -7037,8 +7732,15 @@ if ($script:DeepMode) {
             Write-Status 'SFC /scannow' 'fichiers corrompus NON réparés' 'FAIL'
             $script:NeedRestore = $true
         } elseif ($sv -eq 'REPAIRED') {
-            Write-Status 'SFC /scannow' 'fichiers corrompus trouvés et réparés' 'WARN'
-            Write-Sub 'Redémarrage conseillé'
+            $rep = Get-SfcRepairSummary (Read-CbsLogText $sfcStart) $sfcStart
+            if ($rep.OnlyOneDrive) {
+                Write-Status 'SFC /scannow' 'seul le raccourci OneDrive des nouveaux comptes a été remis' 'INFO'
+                Write-Sub 'OneDrive remplace ce raccourci quand il se met à jour, SFC remet celui de Windows : rien à faire'
+            } else {
+                Write-Status 'SFC /scannow' 'fichiers corrompus trouvés et réparés' 'WARN'
+                Write-SfcRepairedFiles $rep
+                Write-Sub 'Redémarrage conseillé'
+            }
         } else {
             Write-Status 'SFC /scannow' 'résultat non reconnu' 'INFO'
             Write-Sub 'Détails : C:\Windows\Logs\CBS\CBS.log'
@@ -7129,6 +7831,13 @@ if ($script:NeedRestore -and $isAdmin) {
         Write-Host '   [!] Réparation DISM impossible sans Internet : elle télécharge les fichiers sains depuis Windows Update.' -ForegroundColor Yellow
         Write-Host '       Connecte le PC puis relance le scan complet.' -ForegroundColor Yellow
     } else {
+        $retry = Get-RepairRetryAdvice ([string](Get-JarvisConfig)['LastRepair']) (Get-Date) $script:ScanDetected
+        if ($retry) {
+            $lastDate = ([string](Get-JarvisConfig)['LastRepair'] -split '\|')[0]
+            Write-Host ('   [i] La dernière réparation ({0}) n''a pas pu tout corriger : Windows Update ne fournissait plus certains fichiers.' -f $lastDate) -ForegroundColor Yellow
+            if ($retry -eq 'SAME') { Write-Host '       Les défauts vus aujourd''hui ne sont pas plus nombreux : une nouvelle réparation n''ira sans doute pas plus loin.' -ForegroundColor Yellow }
+            else { Write-Host '       Une nouvelle tentative a peu de chances d''aller plus loin, sauf après une nouvelle mise à jour de Windows.' -ForegroundColor Yellow }
+        }
         if (Read-YesNo '   >> Réparer l''image Windows (DISM /RestoreHealth puis SFC, 15-45 min) ?') {
             if (Wait-ACPower 'une coupure pendant la réparation peut abîmer Windows.') { Invoke-WindowsRepair }
             else { Write-Host '   >> Réparation annulée.' -ForegroundColor DarkGray }
@@ -7147,9 +7856,10 @@ if ($script:WGCount -gt 0) {
     Write-Host '       Enregistre ton travail avant de valider.' -ForegroundColor DarkGray
     if (Read-YesNo ("   >> Mettre à jour les {0} application(s) avec winget ?" -f $script:WGCount)) {
         Write-Host ''
-        $okItems = @(); $koList = @(); $naList = @()
+        $okItems = @(); $koList = @(); $naList = @(); $selfList = @()
         $spans = @{}      # début et fin de chaque mise à jour, pour relire ensuite le journal de Windows
         $explained = @()  # applications dont le retard vient d'être expliqué (encore en service)
+        $resolved = @()   # « terminées » encore proposées, mais dont la version a changé (autre numérotation)
         $skip = @($script:WGSkipIds)
         $targets = @($script:WGItems | Where-Object { $_.Id })
         if ($targets.Count -eq 0) {
@@ -7157,8 +7867,16 @@ if ($script:WGCount -gt 0) {
             winget upgrade --all --accept-source-agreements --accept-package-agreements
         } else {
             foreach ($it in $targets) {
+                if ($it.Id -eq 'Microsoft.AppInstaller') {
+                    # winget est dans ce paquet et ne peut pas se remplacer pendant qu'il tourne (PC-LV le 21/11/2026 :
+                    # code 0x80070002, MSIX 80073CF1 ; le Microsoft Store l'a mis à jour peu après)
+                    $selfList += $it.Name
+                    $skip += $it.Id
+                    continue
+                }
                 Write-Host ''
                 Write-Host ('   >> Mise à jour de ' + $it.Name) -ForegroundColor Cyan
+                $null = Wait-MsiIdle
                 $itStart = Get-Date
                 & winget upgrade --id $it.Id --exact --accept-source-agreements --accept-package-agreements --disable-interactivity
                 $rc = $LASTEXITCODE
@@ -7172,7 +7890,7 @@ if ($script:WGCount -gt 0) {
                     $naList += $it.Name
                     $skip += $it.Id
                 } else {
-                    $koList += ('{0} : code 0x{1:X8}' -f $it.Name, $rc)
+                    $koList += [pscustomobject]@{ Item = $it; Code = ('0x{0:X8}' -f $rc) }
                 }
             }
         }
@@ -7185,8 +7903,20 @@ if ($script:WGCount -gt 0) {
         # le 20/11/2026 : annoncé « toujours en retard », relancé seul quelques secondes plus tard, à jour au scan
         # suivant). Nouvelle lecture toutes les 20 s, 3 fois au plus, tant qu'une application annoncée « terminée » est
         # encore proposée ; une lecture illisible garde la précédente.
+        # Ligne de la nouvelle liste pour une application, $null si elle n'y est plus
+        $rowOf = {
+            param($Id, $Rows)
+            foreach ($r in @($Rows)) { if (Test-WingetStillListed $Id @($r)) { return $r } }
+            return $null
+        }
+        # Encore proposée, mais version inscrite changée : mise à jour faite, l'éditeur numérote autrement
+        $changed = {
+            param($It, $Rows)
+            $r = & $rowOf $It.Id $Rows
+            return ($null -ne $r -and (Get-WingetVersionChange $It.Installed ([string]$r.Installed)) -eq 'CHANGED')
+        }
         for ($try = 1; $try -le 3 -and $verif -ne 'UNREADABLE'; $try++) {
-            $waiting = @($okItems | Where-Object { Test-WingetStillListed $_.Id $leftAll })
+            $waiting = @($okItems | Where-Object { (Test-WingetStillListed $_.Id $leftAll) -and -not (& $changed $_ $leftAll) })
             if ($waiting.Count -eq 0) { break }
             if ($try -eq 1) {
                 Write-Host '   >> Certaines applications finissent leur mise à jour en se relançant toutes seules.' -ForegroundColor DarkCyan
@@ -7198,11 +7928,17 @@ if ($script:WGCount -gt 0) {
             if ((Get-WingetScanState $raw3 $all3.Count) -eq 'UNREADABLE') { break }
             $leftAll = $all3
         }
-        $left = @($leftAll | Where-Object { $skip -notcontains $_.Id })
         foreach ($it in $okItems) {
             # winget a répondu « terminé » : le succès n'est annoncé que si la nouvelle liste le confirme.
             $still = Test-WingetStillListed $it.Id $leftAll
             if ($verif -eq 'UNREADABLE') { Write-Action 'INFO' ($it.Name + ' : winget a répondu « terminé », résultat non vérifié') }
+            elseif ($still -and (& $changed $it $leftAll)) {
+                # Preuve : la version inscrite a changé (Google Play Games sur PC-LV, 21/11/2026)
+                $r = & $rowOf $it.Id $leftAll
+                Write-Action 'OK' ('{0} : mise à jour vérifiée ({1} -> {2})' -f $it.Name, $it.Installed, $r.Installed)
+                Write-Sub ('winget annonce encore une version {0}, numérotée autrement par l''éditeur : rien à faire' -f $r.Available)
+                $resolved += $it.Id
+            }
             elseif ($still -and $spans.ContainsKey($it.Id) -and (Test-AppxInUseBetween $spans[$it.Id][0] $spans[$it.Id][1])) {
                 # Preuve lue dans le journal de Windows (erreur 0x80073D02)
                 Write-Action 'WARN' ($it.Name + ' : nouvelle version téléchargée, mais pas installée : Windows a constaté que l''application tournait encore')
@@ -7217,7 +7953,39 @@ if ($script:WGCount -gt 0) {
             }
             else { Write-Action 'OK' ($it.Name + ' : mise à jour vérifiée') }
         }
-        foreach ($n in $koList) { Write-Action 'FAIL' $n }
+        foreach ($k in $koList) {
+            $it = $k.Item
+            $hint = Get-WingetErrorHint $k.Code
+            if ($verif -ne 'UNREADABLE' -and -not (Test-WingetStillListed $it.Id $leftAll)) {
+                # Plus proposée malgré l'erreur : faite quand même, ou application retirée par son propre installateur
+                # (Java sur PC-LV le 21/11/2026 : ancienne version désinstallée, nouvelle refusée, code 1618)
+                $null = & winget list --id $it.Id --exact --accept-source-agreements --disable-interactivity 2>&1
+                $pres = Get-WingetPresence $LASTEXITCODE
+                if ($pres -eq 'ABSENT') {
+                    Write-Action 'FAIL' ('{0} : n''est plus installée (code {1})' -f $it.Name, $k.Code)
+                    Write-Sub 'Son programme d''installation a retiré l''ancienne version, puis n''a pas pu installer la nouvelle.' 'Yellow'
+                    if ($hint) { Write-Sub ('Cause probable : ' + $hint) }
+                    Write-Sub 'Pour la remettre : clic droit sur Démarrer > Windows PowerShell (admin) ou Terminal (admin), puis :' 'Yellow'
+                    Write-Sub ('winget install --id {0} --exact' -f $it.Id) 'Yellow'
+                    $resolved += $it.Id
+                    continue
+                }
+                if ($pres -eq 'PRESENT') {
+                    Write-Action 'INFO' ('{0} : winget a signalé une erreur (code {1}), mais elle n''est plus en retard' -f $it.Name, $k.Code)
+                    continue
+                }
+            }
+            Write-Action 'FAIL' ('{0} : code {1}' -f $it.Name, $k.Code)
+            if ($hint) { Write-Sub $hint }
+        }
+        foreach ($n in $selfList) {
+            Write-Action 'INFO' ($n + ' : contient winget, qui ne peut pas se remplacer pendant qu''il tourne ; le Microsoft Store le met à jour')
+        }
+        # Toujours en retard : sans les applications que winget refuse, ni celles réglées ci-dessus
+        $left = @($leftAll | Where-Object {
+                $row = $_
+                ($skip -notcontains $row.Id) -and (@($resolved | Where-Object { Test-WingetStillListed $_ @($row) }).Count -eq 0)
+            })
         foreach ($n in $naList) {
             Write-Action 'INFO' ($n + ' : winget n''a pas de version adaptée à cette installation')
             Write-Host '          Mets-la à jour depuis l''application elle-même (souvent automatique à son ouverture).' -ForegroundColor DarkGray
