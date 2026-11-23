@@ -9,7 +9,8 @@ les tests T1 (fonctions pures, aucune dépendance au PC). Code de sortie : 0 si 
   1. Fichier    : UTF-8 avec BOM, fins de ligne CRLF, caractères interdits
   2. Syntaxe    : le vrai analyseur de Windows PowerShell 5.1
   3. Règles     : version cohérente, Read-Host, questions oui/non, Invoke-Expression,
-                  suppressions récursives, outils système appelés sans chemin, blocs catch vides
+                  suppressions (Remove-Item et alias, méthodes Delete, del/rd de cmd) sur liste blanche,
+                  outils système appelés sans chemin, options, modules, blocs catch vides
   4. Tests T1   : Invoke-SelfTestAnalyzers, hors console, en mode strict
   5. PSScriptAnalyzer (s'il est installé ; exigé avec -RequireAnalyzer)
 #>
@@ -36,13 +37,25 @@ $MaxBareTools = 0
 # « Remove-Item -Recurse » autorisés, par fonction : seulement la clé de registre de la désinstallation.
 # Les dossiers se suppriment par Remove-TreeNoJunction, qui ne suit aucune jonction.
 $RecurseAllowed = @{ 'Uninstall-Jarvis' = 1 }
-# Suppressions de bas niveau autorisées, par fonction (règle 18) : [IO.File]::Delete, [IO.Directory]::Delete,
-# vidage de la corbeille (SHEmptyRecycleBin) et suppression par CIM (Invoke-CimMethod -MethodName Delete).
+# Tous les Remove-Item (alias rm, del, erase, rd, rmdir, ri compris), récursifs ou non, par fonction (v3.25, constat T8 de
+# l'audit) : fichiers créés par JARVIS lui-même. Invoke-ProcessSpinner : sorties capturées ; Get-ReportDir et
+# Invoke-SelfTest : fichier d'essai d'écriture ; Save-Report : rapports au-delà de 30 ; Invoke-LegacyCleanup : fichiers
+# connus de l'ancien dossier C:\Outils\JARVIS (vrais fichiers seulement) ; Install-Jarvis : retour arrière d'une
+# installation ratée ; Invoke-JarvisSelfUpdate : fichier téléchargé ; Uninstall-Jarvis : raccourcis, rapports, marqueur et
+# clé de désinstallation. Un nouveau Remove-Item doit être ajouté ici, avec sa raison.
+$RemoveAllowed = @{ 'Invoke-ProcessSpinner' = 3; 'Get-ReportDir' = 1; 'Save-Report' = 1; 'Invoke-LegacyCleanup' = 1;
+                    'Install-Jarvis' = 4; 'Invoke-JarvisSelfUpdate' = 1; 'Uninstall-Jarvis' = 5; 'Invoke-SelfTest' = 1 }
+# Suppressions de bas niveau autorisées, par fonction (règle 18) : [IO.File]::Delete, [IO.Directory]::Delete, toute méthode
+# Delete... d'un objet (FileInfo.Delete(), Scripting.FileSystemObject.DeleteFile...) depuis la v3.25, vidage de la corbeille
+# (SHEmptyRecycleBin) et suppression par CIM (Invoke-CimMethod -MethodName Delete).
 # Invoke-SelfTest : jonctions et fichiers des bacs à sable des tests T5 seulement.
 $LowDeleteAllowed = @{ 'Remove-TempCandidates' = 2; 'Remove-EmptyDir' = 1; 'Remove-TreeNoJunction' = 1; 'Clear-CleanTarget' = 1;
                        'Clear-RecycleBinChecked' = 1; 'Clear-DoCache' = 1; 'Invoke-SelfTest' = 5 }
+# Commandes de suppression de cmd (del, erase, rd, rmdir) écrites dans une chaîne, par fonction (v3.25) : seulement la
+# suppression différée de l'ancien JARVIS.cmd, qui ne peut pas s'effacer lui-même pendant qu'il tourne.
+$CmdDeleteAllowed = @{ 'Start-DelayedDelete' = 1 }
 # Nombre minimal de tests T1 attendus (garde-fou contre un lot de tests vidé par erreur).
-$MinT1 = 76
+$MinT1 = 81
 
 $script:Fails = New-Object System.Collections.Generic.List[string]
 function Add-Fail([string]$Message) {
@@ -168,13 +181,32 @@ $iex = @($commands | Where-Object { [string]$_.GetCommandName() -match '^(Invoke
 if ($iex.Count -eq 0) { Add-Pass 'aucun Invoke-Expression' }
 else { foreach ($c in $iex) { Add-Fail ("ligne {0} : Invoke-Expression interdit" -f $c.Extent.StartLineNumber) } }
 
-# Suppressions récursives : liste blanche par fonction (règle 6)
-$recurse = @($commands | Where-Object {
-    [string]$_.GetCommandName() -eq 'Remove-Item' -and
+# Suppressions par Remove-Item et ses alias : liste blanche par fonction (règles 6 et 18). v3.25 (constat T8) : les alias
+# (rm, del...) et l'option abrégée (-r, -rec : PowerShell accepte tout début non ambigu de -Recurse) étaient invisibles.
+$removeNames = @('Remove-Item', 'Microsoft.PowerShell.Management\Remove-Item', 'rm', 'del', 'erase', 'rd', 'rmdir', 'ri', 'Clear-RecycleBin')
+$removes = @($commands | Where-Object { $removeNames -contains [string]$_.GetCommandName() })
+$recurse = @($removes | Where-Object {
     @($_.CommandElements | Where-Object {
-        $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -like 'Rec*'
+        $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName.Length -ge 1 -and
+        'Recurse'.StartsWith($_.ParameterName, [StringComparison]::OrdinalIgnoreCase)
     }).Count -gt 0
 })
+$removeOk = $true
+foreach ($g in ($removes | Group-Object { Get-OuterFunction $_ })) {
+    $allowed = 0
+    if ($RemoveAllowed.ContainsKey($g.Name)) { $allowed = $RemoveAllowed[$g.Name] }
+    if ($g.Count -gt $allowed) {
+        $removeOk = $false
+        $where = ($g.Group | ForEach-Object { '{0} l.{1}' -f $_.GetCommandName(), $_.Extent.StartLineNumber }) -join ', '
+        Add-Fail ("Remove-Item dans {0} : {1} trouvé(s), {2} autorisé(s) ({3}) : passer par une fonction à garde-fou (règle 18) ou justifier dans `$RemoveAllowed" -f $g.Name, $g.Count, $allowed, $where)
+    }
+}
+foreach ($k in $RemoveAllowed.Keys) {
+    $n = @($removes | Where-Object { (Get-OuterFunction $_) -eq $k }).Count
+    if ($n -lt $RemoveAllowed[$k]) { $removeOk = $false; Add-Fail ("Remove-Item dans {0} : {1} trouvé(s) pour {2} autorisé(s) : baisse la valeur dans `$RemoveAllowed" -f $k, $n, $RemoveAllowed[$k]) }
+}
+if ($removeOk) { Add-Pass ("Remove-Item (alias compris) : {0}, tous sur liste blanche" -f $removes.Count) }
+
 $recurseOk = $true
 foreach ($g in ($recurse | Group-Object { Get-OuterFunction $_ })) {
     $allowed = 0
@@ -190,10 +222,12 @@ if ($recurseOk) { Add-Pass ("Remove-Item -Recurse : {0}, tous sur liste blanche"
 # Suppressions de bas niveau : liste blanche par fonction (règle 18)
 $lowDel = @($ast.FindAll({
     param($n)
-    if (-not ($n -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) -or -not $n.Static) { return $false }
+    if (-not ($n -is [System.Management.Automation.Language.InvokeMemberExpressionAst])) { return $false }
     $m = [string]$n.Member.Extent.Text
-    $ty = [string]$n.Expression.Extent.Text
-    return (($m -eq 'Delete' -and $ty -match '^\[(System\.)?IO\.(File|Directory)\]$') -or $m -eq 'SHEmptyRecycleBin')
+    if ($n.Member -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $m = [string]$n.Member.Value }
+    # v3.25 (constat T8) : toute méthode Delete... (statique ou d'un objet : FileInfo.Delete(), DeleteFile de
+    # Scripting.FileSystemObject, DeleteSubKeyTree du registre, FileSystem.DeleteDirectory de VisualBasic)
+    return ($m -match '^(Delete\w*|SHEmptyRecycleBin)$')
 }, $true))
 $lowDel += @($commands | Where-Object { [string]$_.GetCommandName() -eq 'Invoke-CimMethod' -and $_.Extent.Text -match '-MethodName\s+[''"]?Delete\b' })
 $lowOk = $true
@@ -207,6 +241,25 @@ foreach ($g in ($lowDel | Group-Object { Get-OuterFunction $_ })) {
     }
 }
 if ($lowOk) { Add-Pass ("suppressions de bas niveau : {0}, toutes sur liste blanche" -f $lowDel.Count) }
+
+# Commandes de suppression de cmd écrites dans une chaîne (« cmd /c del ... », « rd /s ») : liste blanche par fonction (v3.25)
+$cmdDelRx = '(?i)(^|[\s&|("])(del|erase|rd|rmdir)\s+(/|"|''|\$|%|[A-Za-z]:|\\)'
+$cmdDel = @($ast.FindAll({
+    param($n)
+    ($n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or
+     $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) -and [string]$n.Value -match $cmdDelRx
+}, $true))
+$cmdOk = $true
+foreach ($g in ($cmdDel | Group-Object { Get-OuterFunction $_ })) {
+    $allowed = 0
+    if ($CmdDeleteAllowed.ContainsKey($g.Name)) { $allowed = $CmdDeleteAllowed[$g.Name] }
+    if ($g.Count -gt $allowed) {
+        $cmdOk = $false
+        $where = ($g.Group | ForEach-Object { $_.Extent.StartLineNumber }) -join ', '
+        Add-Fail ("commande de suppression de cmd (del, rd...) dans {0} : {1} trouvée(s), {2} autorisée(s) (lignes {3})" -f $g.Name, $g.Count, $allowed, $where)
+    }
+}
+if ($cmdOk) { Add-Pass ("commandes de suppression de cmd : {0}, toutes sur liste blanche" -f $cmdDel.Count) }
 
 # Outils système appelés par leur seul nom : un programme du même nom placé dans le PATH serait lancé en admin
 $bare = @($commands | Where-Object {
@@ -324,6 +377,8 @@ if (@($errors).Count -gt 0) {
             function Test-Case([string]$Name, [scriptblock]$Body, [switch]$NeedAdmin) {
                 try {
                     $r = & $Body | Select-Object -Last 1
+                    # Un test T1 ne dépend ni du PC ni des droits : il ne peut être ni sauté, ni « lecture impossible »
+                    if ($NeedAdmin -or ($r -is [string] -and $r -match '^(SKIP|UNREAD):')) { throw ('test T1 sauté ou non lu : ' + [string]$r) }
                     $t1.Add([pscustomobject]@{ Name = $Name; Ok = $true; Detail = [string]$r })
                 } catch {
                     $t1.Add([pscustomobject]@{ Name = $Name; Ok = $false; Detail = $_.Exception.Message })

@@ -1,5 +1,9 @@
-# Contrôle automatique à chaque envoi : la source passe tools/check.ps1 sous Windows PowerShell 5.1,
-# et le JARVIS.cmd du dépôt est bien celui que build.py fabrique à partir de la source.
+# Contrôle automatique à chaque envoi :
+# - controle : la source passe tools/check.ps1 sous Windows PowerShell 5.1, et le JARVIS.cmd du dépôt est bien celui
+#   que build.py fabrique à partir de la source ;
+# - scan : le JARVIS.cmd du dépôt fait un vrai scan rapide, sans clavier, sans aucune action (tools/scan-essai.ps1,
+#   v3.25, constat T1 de l'audit : le programme principal n'était exécuté par aucun test).
+# tools/publier.py exige ces deux contrôles réussis sur le commit avant de publier une version.
 name: Controle
 
 on:
@@ -34,3 +38,22 @@ jobs:
         run: |
           git diff --exit-code -- JARVIS.cmd
           if ($LASTEXITCODE -ne 0) { Write-Host 'JARVIS.cmd ne correspond pas a la source : lance python build.py avant le commit.'; exit 1 }
+
+  scan:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan rapide de JARVIS.cmd (sans clavier, aucune action)
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\scan-essai.ps1 -Mode cmd -OutDir "$env:RUNNER_TEMP\scan-essai"
+
+      - name: Journal et rapport du scan
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-essai
+          path: ${{ runner.temp }}/scan-essai/
+          retention-days: 7
+          if-no-files-found: ignore

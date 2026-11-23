@@ -1,5 +1,5 @@
 ﻿<#
-    J.A.R.V.I.S. // Check-up système v3.24
+    J.A.R.V.I.S. // Check-up système v3.25
     -----------------------------------------------------------------
     Modules :
       [01] Système        : version Windows, uptime, redémarrage en attente
@@ -210,7 +210,7 @@ if (-not $PSCommandPath -and $env:JARVIS_SELF -and $env:JARVIS_ARGS) {
 # ------------------------------------------------------------------
 # Identité du programme et emplacement
 # ------------------------------------------------------------------
-$JarvisVersion = '3.24'
+$JarvisVersion = '3.25'
 $JarvisSelf = $env:JARVIS_SELF                     # défini par JARVIS.cmd
 if (-not $JarvisSelf) { $JarvisSelf = $PSCommandPath }  # lancement direct du .ps1
 $JarvisHome = $null
@@ -356,7 +356,7 @@ function Show-Banner {
         foreach ($l in $plain) { Write-Host $l -ForegroundColor Cyan; Pause-Ms 70 }
         Write-Host ''
         Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-        Write-Host '      module check-up v3.24' -ForegroundColor DarkGray
+        Write-Host '      module check-up v3.25' -ForegroundColor DarkGray
         Write-Host ''
         return
     }
@@ -376,7 +376,7 @@ function Show-Banner {
     }
     Write-Host ''
     Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-    Write-Host '      module check-up v3.24' -ForegroundColor DarkGray
+    Write-Host '      module check-up v3.25' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -671,7 +671,13 @@ function Read-Answer([string]$Prompt) {
     Clear-KeyBuffer
     $interactive = $true
     try { $null = [Console]::KeyAvailable } catch { $interactive = $false }
-    if (-not $interactive) { return (Microsoft.PowerShell.Utility\Read-Host -Prompt $Prompt) }
+    if (-not $interactive) {
+        $a = Microsoft.PowerShell.Utility\Read-Host -Prompt $Prompt
+        # Entrée redirigée (banc d'essai, scan d'essai de GitHub) : la fin de l'entrée vaut annulation ; elle est écrite
+        # pour que le journal montre chaque question posée (v3.25, tools/scan-essai.ps1 les compte)
+        if ($null -eq $a) { Write-Host ($Prompt + ' : [annulé, fin de l''entrée]') -ForegroundColor DarkGray }
+        return $a
+    }
     Write-Host ($Prompt + ' : ') -NoNewline
     $sb = New-Object System.Text.StringBuilder
     while ($true) {
@@ -5157,11 +5163,12 @@ function Invoke-SelfTestAnalyzers {
         Assert-True ((Get-YesNo $null $true) -eq 'NO') 'annulation acceptée comme oui'
         Assert-True ((Get-YesNo '' $true) -eq 'YES') 'Entrée : réponse par défaut « oui » non appliquée'
         Assert-True ((Get-YesNo '' $false) -eq 'NO') 'Entrée : réponse par défaut « non » non appliquée'
-        foreach ($u in @('ok', 'ouais', 'x', '1', 'on', 'nope', 'oo', 'o n')) {
+        # « peut-être » : repris du test T5 « Réponses annulées = non », retiré en v3.25 (il ne faisait que répéter ce test)
+        foreach ($u in @('ok', 'ouais', 'x', '1', 'on', 'nope', 'oo', 'o n', 'peut-être')) {
             Assert-True ((Get-YesNo $u $true) -eq 'UNKNOWN') ('réponse floue acceptée : ' + $u)
             Assert-True ((Get-YesNo $u $false) -eq 'UNKNOWN') ('réponse floue acceptée : ' + $u)
         }
-        '33/33 cas'
+        '35/35 cas'
     }
     Test-Case 'Menus : seules les touches affichées' {
         $keys = @('1', '2', 'U', 'R')
@@ -6123,15 +6130,91 @@ function Invoke-SelfTestAnalyzers {
         }
         '{0} cas' -f $cases.Count
     }
+
+    # ---- Garde-fous purs, rangés en T5 jusqu'à la v3.24 (audit, constat T5) : ils n'étaient vérifiés ni avant la
+    # fabrication ni sur GitHub. Seulement des lectures (variables, dossiers demandés à Windows, type du disque C:) :
+    # aucun dossier n'est créé ni vidé ici. Les variables du programme n'existent pas en T1 (tools/check.ps1).
+    Test-Case 'Temp : chemins dangereux refusés' {
+        # v3.24 : %TEMP% redéfini vers le dossier Temp d'un programme installé ou de Windows (chemins non créés ici)
+        $win = [Environment]::GetFolderPath('Windows')
+        $bad = @("$env:SystemDrive\", $env:USERPROFILE, $env:SystemRoot, $env:ProgramFiles, $env:LOCALAPPDATA, '',
+                 (Join-Path (Get-ProgramFilesDir) 'Editeur\Temp'), (Join-Path $win 'System32\Temp'),
+                 (Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'Editeur\Temp'))
+        foreach ($p in $bad) { Assert-True (-not (Test-SafeTempPath $p)) ('accepté à tort : ' + $p) }
+        Assert-True (Test-SafeTempPath (Join-Path $env:SystemRoot 'Temp')) 'Windows\Temp refusé à tort'
+        Assert-True (Test-SafeTempPath (Join-Path $win 'Temp')) 'Windows\Temp (dossier demandé à Windows) refusé à tort'
+        '{0} refus, 2 acceptations' -f $bad.Count
+    }
+    Test-Case 'Installation : chemins interdits refusés' {
+        $bad = @($env:SystemRoot, [Environment]::GetFolderPath('Windows'), [Environment]::GetFolderPath('Desktop'),
+                 (Join-Path $env:USERPROFILE 'Downloads'), 'dossier\relatif', 'C:\Program Files\JA?RVIS', '\\serveur\partage\JARVIS', '')
+        foreach ($p in $bad) { Assert-True (-not (Resolve-InstallDir $p).Ok) ('accepté à tort : ' + $p) }
+        # Dossier proposé par défaut (Program Files demandé à Windows, comme $DefaultInstallDir) : \JARVIS ajouté
+        $pf = Get-ProgramFilesDir
+        $ok = Resolve-InstallDir $pf
+        Assert-True ($ok.Ok -and $ok.Path -eq (Join-Path $pf 'JARVIS')) ('Program Files mal traité : ' + $ok.Path + ' ' + $ok.Reason)
+        '{0} refus, \JARVIS ajouté automatiquement' -f $bad.Count
+    }
+    Test-Case 'Prénom : caractères dangereux filtrés' {
+        # Le prénom est retransmis à la relance administrateur : rien qui puisse y devenir une commande
+        $n = Get-SafeName 'Bob"; calc $(whoami) `x & y | z % ^'
+        Assert-True ($n -notmatch '[";$`()&|%^]') ('non filtré : ' + $n)
+        Assert-True ((Get-SafeName "D'Artagnan") -eq "D'Artagnan") 'apostrophe perdue'
+        Assert-True ((Get-SafeName 'Jean-Pierre') -eq 'Jean-Pierre') 'tiret perdu'
+        Assert-True ((Get-SafeName 'Éloïse') -eq 'Éloïse') 'accents perdus'
+        Assert-True ($null -eq (Get-SafeName '$();')) 'saisie vide non rejetée'
+        Assert-True ($null -eq (Get-SafeName $null)) 'valeur nulle'
+        Assert-True ((Get-SafeName ('a' * 50)).Length -eq 30) 'prénom trop long non coupé'
+        '7/7 cas'
+    }
+    Test-Case 'Mises à jour : comparaison de versions' {
+        Assert-True ((Compare-JarvisVersion '3.3' '3.2') -gt 0) '3.3 > 3.2'
+        Assert-True ((Compare-JarvisVersion '3.10' '3.9') -gt 0) '3.10 > 3.9 (pas un tri alphabétique)'
+        Assert-True ((Compare-JarvisVersion '3.2' '3.3') -lt 0) '3.2 < 3.3'
+        Assert-True ((Compare-JarvisVersion '3.3' '3.3') -eq 0) 'égalité'
+        Assert-True ($null -eq (Compare-JarvisVersion 'abc' '3.3')) 'version illisible traitée comme une version'
+        Assert-True ($null -eq (Compare-JarvisVersion '3.3' '')) 'version absente traitée comme « égale »'
+        '6/6 cas'
+    }
+    Test-Case 'Windows Update : mises à jour exclues' {
+        # Une mise à niveau de Windows ne s'installe jamais sans surveillance. Objets construits comme ceux de Windows
+        # Update (BrowseOnly toujours présent : le mode strict de T1 refuse une propriété absente)
+        $mk = { param($t, $cat, $ui, $browse) [pscustomobject]@{ Title = $t; BrowseOnly = [bool]$browse
+                Categories = @($cat | ForEach-Object { [pscustomobject]@{ CategoryID = $_ } })
+                InstallationBehavior = [pscustomobject]@{ CanRequestUserInput = $ui } } }
+        Assert-True ([bool](Test-SkipWuUpdate (& $mk 'Windows 11, version 25H2' @('3689bdc8-b205-4af4-8d4b-a63924c5e9d5') $false $false))) 'mise à niveau (catégorie) non exclue'
+        Assert-True ([bool](Test-SkipWuUpdate (& $mk 'Mise à jour de fonctionnalité vers Windows 11' @() $false $false))) 'mise à niveau (titre) non exclue'
+        Assert-True ([bool](Test-SkipWuUpdate (& $mk 'Feature update to Windows 11, version 25H2' @() $false $false))) 'mise à niveau (titre anglais) non exclue'
+        Assert-True ([bool](Test-SkipWuUpdate (& $mk 'Pilote interactif' @() $true $false))) 'mise à jour interactive non exclue'
+        Assert-True ($null -eq (Test-SkipWuUpdate (& $mk '2026-11 Mise à jour cumulative' @('0fa1201d-4330-4fa8-8ae9-b877473b6441') $false $false))) 'mise à jour normale exclue à tort'
+        Assert-True ((Test-SkipWuUpdate (& $mk 'Pilote facultatif' @() $false $true)) -eq 'facultative') 'mise à jour facultative non exclue'
+        '6/6 cas'
+    }
+}
+
+function Test-OtherAvListed {
+    # Auto-test (v3.25) : $true si le Centre de sécurité montre un antivirus actif autre que Defender. Sert à distinguer
+    # « Defender illisible » (lecture en échec) de « Defender remplacé par un autre antivirus » (non applicable).
+    $avs = $null
+    try { $avs = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop) } catch { return $false }
+    foreach ($av in $avs) {
+        if ([string]$av.displayName -match 'Defender') { continue }
+        $st = Get-AvState $av.productState
+        if ($st -and $st.On) { return $true }
+    }
+    return $false
 }
 
 function Invoke-SelfTest {
     $results = New-Object System.Collections.Generic.List[object]
     $log = New-Object System.Collections.Generic.List[string]
 
+    # États : PASS, FAIL, SKIP (non applicable : droits, équipement, lancement hors installation) et, depuis la v3.25
+    # (audit, constat T4), WARN : une lecture a échoué (journal, état de Defender, GitHub). Jusqu'à la v3.24 elle
+    # comptait comme SKIP et le bilan restait vert ; le test renvoie alors 'UNREAD:raison'.
     function Add-Result([string]$Name, [string]$State, [string]$Detail, [double]$Ms) {
         $results.Add([pscustomobject]@{ Name = $Name; State = $State; Detail = $Detail })
-        $col = @{ PASS = 'Green'; FAIL = 'Red'; SKIP = 'DarkGray' }[$State]
+        $col = @{ PASS = 'Green'; FAIL = 'Red'; WARN = 'Yellow'; SKIP = 'DarkGray' }[$State]
         Write-Host '   ' -NoNewline
         Write-Host ('[{0}]' -f $State) -NoNewline -ForegroundColor $col
         Write-Host (' {0,-42}' -f (Cut $Name 42)) -NoNewline -ForegroundColor Gray
@@ -6147,6 +6230,7 @@ function Invoke-SelfTest {
             $r = & $Body | Select-Object -Last 1
             $sw.Stop()
             if ($r -is [string] -and $r.StartsWith('SKIP:')) { Add-Result $Name 'SKIP' $r.Substring(5) $sw.Elapsed.TotalMilliseconds }
+            elseif ($r -is [string] -and $r.StartsWith('UNREAD:')) { Add-Result $Name 'WARN' ('lecture impossible : ' + $r.Substring(7)) $sw.Elapsed.TotalMilliseconds }
             else { Add-Result $Name 'PASS' ([string]$r) $sw.Elapsed.TotalMilliseconds }
         } catch {
             $sw.Stop()
@@ -6314,7 +6398,7 @@ function Invoke-SelfTest {
     Test-Case 'Journal des disques branchés' {
         # Sert à reconnaître les erreurs d'un appareil débranché (section 10) ; illisible, elles restent en alerte
         $a = Get-DiskArrivals ((Get-Date).AddDays(-37))
-        if ($null -eq $a) { return 'SKIP:journal Partition/Diagnostic illisible : les erreurs disque restent toutes en alerte' }
+        if ($null -eq $a) { return 'UNREAD:journal Partition/Diagnostic illisible, les erreurs disque restent toutes en alerte' }
         $p = @(Get-CimInstance Win32_DiskDrive -ErrorAction Stop)
         Assert-True ($p.Count -gt 0) 'aucun disque branché lu'
         $bad = @(@($a) | Where-Object { $null -eq $_.DiskNumber })
@@ -6343,7 +6427,12 @@ function Invoke-SelfTest {
     }
     Test-Case 'Sécurité : réglages de Defender' {
         $mp3 = Get-MpComputerStatus
-        if (-not $mp3 -or -not $mp3.AntivirusEnabled) { return 'SKIP:Defender n''est pas l''antivirus en service' }
+        if (-not $mp3) {
+            # Illisible : non applicable seulement si le Centre de sécurité montre un autre antivirus (v3.25, constat T4)
+            if (Test-OtherAvListed) { return 'SKIP:Defender n''est pas l''antivirus en service' }
+            return 'UNREAD:état de Defender illisible (Get-MpComputerStatus)'
+        }
+        if (-not $mp3.AntivirusEnabled) { return 'SKIP:Defender n''est pas l''antivirus en service' }
         $t = Get-OnOffVerdict $mp3.IsTamperProtected
         $pref = Get-MpPreference
         Assert-True ($null -ne $pref) 'préférences de Defender illisibles'
@@ -6438,7 +6527,8 @@ function Invoke-SelfTest {
             'NEW'      { 'v' + $u.Info.Version + ' disponible (installée : v' + $JarvisVersion + ')' }
             'UPTODATE' { 'à jour (dernière publiée : v' + $u.Info.Version + ')' }
             'NONE'     { 'SKIP:aucune version publiée sur GitHub' }
-            'OFFLINE'  { 'SKIP:' + $u.Detail }
+            # v3.25 (constat T4) : sans réponse, la recherche de version est en échec (connexion, TLS), pas « non applicable »
+            'OFFLINE'  { 'UNREAD:' + $u.Detail + ', le menu [U] ne proposera pas les nouvelles versions' }
             default    { throw $u.Detail }
         }
     }
@@ -6453,11 +6543,16 @@ function Invoke-SelfTest {
     }
     Test-Case 'Accès contrôlé aux dossiers (Defender)' {
         $pref = Get-MpPreference
-        if ($null -eq $pref) { return 'SKIP:état illisible' }
+        if ($null -eq $pref) {
+            if (Test-OtherAvListed) { return 'SKIP:Defender n''est pas l''antivirus en service' }
+            return 'UNREAD:réglages de Defender illisibles (Get-MpPreference)'
+        }
         $docs = [Environment]::GetFolderPath('MyDocuments')
         $od = ''
         if ($docs -match 'OneDrive') { $od = '  //  Documents dans OneDrive' }
-        switch ([int]$pref.EnableControlledFolderAccess) {
+        # Règle 24 : [int]$null vaudrait 0, soit « inactif », pour une valeur illisible (v3.25)
+        switch (ConvertTo-IntOrNull $pref.EnableControlledFolderAccess) {
+            $null { 'UNREAD:valeur EnableControlledFolderAccess absente' }
             1 { 'actif, Documents et Bureau protégés' + $od }
             2 { 'mode audit' + $od }
             default { 'inactif' + $od }
@@ -6509,18 +6604,8 @@ function Invoke-SelfTest {
         Assert-True ($st -eq 'OK') 'fichier modifié ou incomplet'
         'empreinte SHA-256 conforme'
     }
-    Test-Case 'Temp : chemins dangereux refusés' {
-        # v3.24 : %TEMP% redéfini vers le dossier Temp d'un programme installé ou de Windows (chemins non créés ici)
-        $win = [Environment]::GetFolderPath('Windows')
-        foreach ($p in @("$env:SystemDrive\", $env:USERPROFILE, $env:SystemRoot, $env:ProgramFiles, $env:LOCALAPPDATA, '',
-                         (Join-Path (Get-ProgramFilesDir) 'Editeur\Temp'), (Join-Path $win 'System32\Temp'),
-                         (Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'Editeur\Temp'))) {
-            Assert-True (-not (Test-SafeTempPath $p)) ('accepté à tort : ' + $p)
-        }
-        Assert-True (Test-SafeTempPath (Join-Path $env:SystemRoot 'Temp')) 'Windows\Temp refusé à tort'
-        Assert-True (Test-SafeTempPath (Join-Path $win 'Temp')) 'Windows\Temp (dossier demandé à Windows) refusé à tort'
-        '9 refus, 2 acceptations'
-    }
+    # v3.25 (audit, constat T5) : les garde-fous purs (chemins Temp et d'installation, prénom, versions, mises à jour
+    # Windows exclues) sont passés en T1, donc contrôlés avant chaque fabrication et sur GitHub
     Test-Case 'Temp : nettoyage en bac à sable' {
         $root = Join-Path $env:TEMP ('jarvis_garde_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
         $sand = Join-Path $root 'Temp'
@@ -6762,52 +6847,6 @@ function Invoke-SelfTest {
         Assert-True (@(Get-WeakWriters @($env:ProgramFiles)).Count -eq 0) 'Program Files vu comme modifiable sans droits admin'
         'refusé avant toute copie, dossier d''essai retiré'
     }
-    Test-Case 'Installation : chemins interdits refusés' {
-        $badPaths = @($env:SystemRoot, [Environment]::GetFolderPath('Desktop'), (Join-Path $env:USERPROFILE 'Downloads'),
-                      'dossier\relatif', 'C:\Program Files\JA?RVIS')
-        foreach ($p in $badPaths) {
-            $r = Resolve-InstallDir $p
-            Assert-True (-not $r.Ok) ('accepté à tort : ' + $p)
-        }
-        $ok = Resolve-InstallDir (Split-Path -Parent $DefaultInstallDir)
-        Assert-True ($ok.Ok -and $ok.Path -eq $DefaultInstallDir) ('Program Files mal traité : ' + $ok.Path + ' ' + $ok.Reason)
-        '5 refus, \JARVIS ajouté automatiquement'
-    }
-    Test-Case 'Prénom : caractères dangereux filtrés' {
-        $n = Get-SafeName 'Bob"; calc $(whoami) `x'
-        Assert-True ($n -notmatch '[";$`()]') ('non filtré : ' + $n)
-        Assert-True ((Get-SafeName "D'Artagnan") -eq "D'Artagnan") 'apostrophe perdue'
-        Assert-True ((Get-SafeName 'Jean-Pierre') -eq 'Jean-Pierre') 'tiret perdu'
-        Assert-True ($null -eq (Get-SafeName '$();')) 'saisie vide non rejetée'
-        '4/4 cas'
-    }
-    Test-Case 'Mises à jour : comparaison de versions' {
-        Assert-True ((Compare-JarvisVersion '3.3' '3.2') -gt 0) '3.3 > 3.2'
-        Assert-True ((Compare-JarvisVersion '3.10' '3.9') -gt 0) '3.10 > 3.9 (pas un tri alphabétique)'
-        Assert-True ((Compare-JarvisVersion '3.2' '3.3') -lt 0) '3.2 < 3.3'
-        Assert-True ((Compare-JarvisVersion '3.3' '3.3') -eq 0) 'égalité'
-        Assert-True ($null -eq (Compare-JarvisVersion 'abc' '3.3')) 'version illisible traitée comme une version'
-        Assert-True ($null -eq (Compare-JarvisVersion '3.3' '')) 'version absente traitée comme « égale »'
-        '6/6 cas'
-    }
-    Test-Case 'Réponses annulées = non' {
-        Assert-True ((Get-YesNo $null $true) -eq 'NO') 'annulation acceptée comme oui'
-        Assert-True ((Get-YesNo 'peut-être' $true) -ne 'YES') 'réponse floue acceptée comme oui'
-        Assert-True ($null -eq (Get-MenuChoice $null @('1', '2') '1')) 'annulation d''un menu prise pour le choix par défaut'
-        Assert-True ((Get-MenuChoice 'x' @('1', '2') '1') -eq '') 'touche non affichée prise pour le choix par défaut'
-        '4/4 cas'
-    }
-    Test-Case 'Windows Update : mises à jour exclues' {
-        $mk = { param($t, $cat, $ui) [pscustomobject]@{ Title = $t; Categories = @($cat | ForEach-Object { [pscustomobject]@{ CategoryID = $_ } }); InstallationBehavior = [pscustomobject]@{ CanRequestUserInput = $ui } } }
-        Assert-True ([bool](Test-SkipWuUpdate (& $mk 'Windows 11, version 25H2' @('3689bdc8-b205-4af4-8d4b-a63924c5e9d5') $false))) 'mise à niveau (catégorie) non exclue'
-        Assert-True ([bool](Test-SkipWuUpdate (& $mk 'Mise à jour de fonctionnalité vers Windows 11' @() $false))) 'mise à niveau (titre) non exclue'
-        Assert-True ([bool](Test-SkipWuUpdate (& $mk 'Pilote interactif' @() $true))) 'mise à jour interactive non exclue'
-        Assert-True ($null -eq (Test-SkipWuUpdate (& $mk '2026-11 Mise à jour cumulative' @('0fa1201d-4330-4fa8-8ae9-b877473b6441') $false))) 'mise à jour normale exclue à tort'
-        $opt = & $mk 'Pilote facultatif' @() $false
-        $opt | Add-Member -NotePropertyName BrowseOnly -NotePropertyValue $true
-        Assert-True ((Test-SkipWuUpdate $opt) -eq 'facultative') 'mise à jour facultative non exclue'
-        '5/5 cas'
-    }
     Test-Case 'Windows Update : installateur accessible' {
         $wus = New-Object -ComObject Microsoft.Update.Session -ErrorAction Stop
         $inst = $wus.CreateUpdateInstaller()
@@ -6836,6 +6875,7 @@ function Invoke-SelfTest {
     # ---------------- Bilan
     $pass = @($results | Where-Object { $_.State -eq 'PASS' }).Count
     $fail = @($results | Where-Object { $_.State -eq 'FAIL' }).Count
+    $warn = @($results | Where-Object { $_.State -eq 'WARN' }).Count
     $skip = @($results | Where-Object { $_.State -eq 'SKIP' }).Count
 
     Write-Host ''
@@ -6845,13 +6885,18 @@ function Invoke-SelfTest {
     Write-Host '║' -ForegroundColor Cyan
     Write-Host ('  ╚' + ('═' * 64) + '╝') -ForegroundColor Cyan
     $col = 'Green'
-    if ($fail -gt 0) { $col = 'Red' }
-    Write-Host ("   Réussis : {0}   //   Échecs : {1}   //   Ignorés : {2}" -f $pass, $fail, $skip) -ForegroundColor $col
+    if ($fail -gt 0) { $col = 'Red' } elseif ($warn -gt 0) { $col = 'Yellow' }
+    Write-Host ("   Réussis : {0}   //   Échecs : {1}   //   Lectures impossibles : {2}   //   Ignorés : {3}" -f $pass, $fail, $warn, $skip) -ForegroundColor $col
+    foreach ($r in ($results | Where-Object { $_.State -eq 'FAIL' })) {
+        Write-Host ('   ! {0} : {1}' -f $r.Name, $r.Detail) -ForegroundColor Red
+    }
+    foreach ($r in ($results | Where-Object { $_.State -eq 'WARN' })) {
+        Write-Host ('   ? {0} : {1}' -f $r.Name, $r.Detail) -ForegroundColor Yellow
+    }
     if ($fail -gt 0) {
-        foreach ($r in ($results | Where-Object { $_.State -eq 'FAIL' })) {
-            Write-Host ('   ! {0} : {1}' -f $r.Name, $r.Detail) -ForegroundColor Red
-        }
         Type-Line '   >> Certains composants ne sont pas fiables sur ce PC. Les sections concernées peuvent donner des résultats faux ou incomplets.' 'Red'
+    } elseif ($warn -gt 0) {
+        Type-Line '   >> Les composants testés fonctionnent, mais certaines lectures ont échoué : le scan affichera « lecture impossible » pour ces points.' 'Yellow'
     } elseif ($skip -gt 0) {
         Type-Line '   >> Tous les composants testés fonctionnent. Les tests ignorés dépendent des droits ou de l''équipement.' 'Green'
     } else {
@@ -6859,7 +6904,7 @@ function Invoke-SelfTest {
     }
 
     $head = @('J.A.R.V.I.S. // Auto-test', ('Date : {0}   Hôte : {1}   Admin : {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm'), $env:COMPUTERNAME, $isAdmin), '')
-    $null = Save-Report 'selftest' ([string[]]($head + $log + @('', ("Réussis {0} / Échecs {1} / Ignorés {2}" -f $pass, $fail, $skip))))
+    $null = Save-Report 'selftest' ([string[]]($head + $log + @('', ("Réussis {0} / Échecs {1} / Lectures impossibles {2} / Ignorés {3}" -f $pass, $fail, $warn, $skip))))
 
     return $fail
 }
