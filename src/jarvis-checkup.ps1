@@ -1307,6 +1307,7 @@ function Clear-WuCache {
         if ($s.Status -ne 'Stopped') { $wasRunning += $n }
     }
     $stopped = $true
+    $deleting = $false
     # v3.26 (audit, constat S8) : relance dans un finally. Avant, une erreur imprévue entre l'arrêt et la relance
     # (dans la suppression par exemple) laissait Windows Update et BITS arrêtés.
     try {
@@ -1328,6 +1329,7 @@ function Clear-WuCache {
                 if ($null -eq $s -or $s.Status -ne 'Stopped') { $stopped = $false }
             }
             if ($stopped) {
+                $deleting = $true
                 $c = Clear-CleanTarget 'WuCache' 0
                 $res.Ok = $c.Ok; $res.FreedBytes = $c.FreedBytes; $res.LeftBytes = $c.LeftBytes; $res.Reason = $c.Reason
             } else {
@@ -1336,7 +1338,9 @@ function Clear-WuCache {
         }
     } catch {
         $res.Ok = $false
-        $res.Reason = 'erreur pendant le nettoyage : ' + $_.Exception.Message
+        # Erreur après le début des suppressions : une partie a pu partir, ne pas laisser croire « rien de fait »
+        if ($deleting) { $res.Reason = 'erreur pendant le nettoyage, une partie a pu être supprimée : ' + $_.Exception.Message }
+        else { $res.Reason = 'erreur avant le nettoyage, rien n''a été supprimé : ' + $_.Exception.Message }
     } finally {
         # Relance, dans l'ordre inverse de l'arrêt, de ce qui tournait au départ
         foreach ($n in @('bits', 'wuauserv')) {
@@ -2286,22 +2290,37 @@ function Open-WindowsUpdateGuided {
     Write-Host ''
 }
 
+function Test-ReportDirSafe([string]$Dir) {
+    # Vrai si le dossier de rapports et, pour %LOCALAPPDATA%\JARVIS\Rapports, le dossier JARVIS au-dessus (les
+    # dossiers que JARVIS crée lui-même) ne sont ni une jonction ni un lien. Un dossier pas encore créé ne compte
+    # pas ; une lecture en échec, si. Rien au-dessus : un AppData déplacé ailleurs reste accepté (v3.26, S8).
+    $own = @($Dir)
+    if ($Dir -eq $ReportRoot) { $own += (Split-Path -Parent $ReportRoot) }
+    foreach ($p in $own) {
+        $at = $null
+        $absent = $false
+        try { $at = [IO.File]::GetAttributes($p) }
+        catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] { $absent = $true }
+        catch { return $false }
+        if ($absent) { continue }
+        if ($at -band [IO.FileAttributes]::ReparsePoint) { return $false }
+    }
+    return $true
+}
+
 function Get-ReportDir {
     # Premier emplacement réellement inscriptible : profil local, puis dossier
     # temporaire. Évite Documents (souvent dans OneDrive ou protégé par
     # l'Accès contrôlé aux dossiers) et le dossier du programme (lecture seule).
-    # v3.26 (audit, constat S8) : dossiers créés par JARVIS refusés s'ils sont une jonction ou un lien (contrôlés
-    # jusqu'au dossier JARVIS compris, pas au-dessus : un AppData déplacé ailleurs reste accepté). Sinon, lancé en
-    # administrateur, JARVIS écrivait ses rapports là où mène la jonction et y supprimait les plus anciens.
-    $candidates = @(
-        @($ReportRoot, (Split-Path -Parent $ReportRoot)),
-        @((Join-Path $env:TEMP 'JARVIS'), (Join-Path $env:TEMP 'JARVIS'))
-    )
-    foreach ($cand in $candidates) {
-        $d = $cand[0]
+    # v3.26 (audit, constat S8) : dossier refusé s'il est, ou si son dossier JARVIS est, une jonction ou un lien
+    # (Test-ReportDirSafe, contrôlé avant la création puis après). Sinon, lancé en administrateur, JARVIS écrivait
+    # ses rapports là où mène la jonction et y supprimait les plus anciens.
+    $candidates = @($ReportRoot, (Join-Path $env:TEMP 'JARVIS'))
+    foreach ($d in $candidates) {
         try {
+            if (-not (Test-ReportDirSafe $d)) { continue }
             if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force -ErrorAction Stop | Out-Null }
-            if (-not (Test-NoLinkInChain $cand[1] (Join-Path $d '.jarvis_write_test'))) { continue }
+            if (-not (Test-ReportDirSafe $d)) { continue }
             $f = Join-Path $d '.jarvis_write_test'
             Set-Content -Path $f -Value 'ok' -ErrorAction Stop
             $back = Get-Content -Path $f -Raw -ErrorAction Stop
@@ -2322,9 +2341,12 @@ function Save-Report([string]$Prefix, [string[]]$Lines) {
         $file = Join-Path $dir ('{0}_{1}.txt' -f $Prefix, (Get-Date -Format 'yyyyMMdd_HHmm'))
         $Lines | Set-Content -Path $file -Encoding UTF8 -ErrorAction Stop
         if (-not (Test-Path $file)) { throw 'fichier absent après écriture' }
-        # Rotation : 30 rapports conservés par type
-        Get-ChildItem -LiteralPath $dir -File -Filter ($Prefix + '_*.txt') | Sort-Object LastWriteTime -Descending |
-            Select-Object -Skip 30 | Remove-Item -Force
+        # Rotation : 30 rapports conservés par type. Dossier recontrôlé juste avant (v3.26, relecture : une jonction
+        # posée après Get-ReportDir aurait été suivie)
+        if (Test-ReportDirSafe $dir) {
+            Get-ChildItem -LiteralPath $dir -File -Filter ($Prefix + '_*.txt') | Sort-Object LastWriteTime -Descending |
+                Select-Object -Skip 30 | Remove-Item -Force
+        }
         Write-Host ("   >> Rapport enregistré : {0}" -f $file) -ForegroundColor DarkGray
         return $file
     } catch {
@@ -2401,10 +2423,12 @@ function Invoke-LegacyCleanup([string]$NewCmd, [string[]]$ExtraDirs) {
         }
         if (-not (Read-YesNo ("   >> Ancienne installation trouvée dans {0}. La nettoyer (rapports conservés) ?" -f $old))) { continue }
         $oldRep = Join-Path $oldFull 'Rapports'
-        if ((Test-Path -LiteralPath $oldRep) -and (Test-NoLinkUpward $oldRep)) {
-            New-Item -ItemType Directory -Path $ReportRoot -Force | Out-Null
+        # v3.26 (relecture) : rapports déplacés seulement vers le vrai dossier des rapports, contrôlé par Get-ReportDir
+        $repDest = $null
+        if ((Test-Path -LiteralPath $oldRep) -and (Test-NoLinkUpward $oldRep)) { $repDest = Get-ReportDir }
+        if ($repDest -and $repDest -eq $ReportRoot) {
             Get-ChildItem -LiteralPath $oldRep -File | Where-Object { $_.Name -match '^(checkup|selftest)_\d{8}_\d{4}\.txt$' } |
-                Move-Item -Destination $ReportRoot -Force
+                Move-Item -Destination $repDest -Force
             if (-not (Get-ChildItem -LiteralPath $oldRep -Force)) { $null = Remove-EmptyDir $oldRep }
         }
         $running = $null
@@ -3880,12 +3904,13 @@ function Get-StartupCount($Entries) {
     return $r
 }
 
-function Get-StartupEntries {
+function Get-StartupEntries([switch]$MachineOnly) {
     # Programmes lancés à l'ouverture de session, lus comme le Gestionnaire des tâches (v3.26, constat V11) : clés
     # Run du compte et de la machine (64 et 32 bits, registre en vue 64 bits même depuis une console 32 bits),
     # dossiers Démarrage du compte et de tous les utilisateurs, chacun avec sa valeur StartupApproved
     # ('ABSENT' si Windows ne l'a jamais écrite). Les applications du Store qui démarrent seules n'y sont pas.
-    # Rend un tableau (vide possible) ; $null = lecture impossible.
+    # -MachineOnly : partie commune seulement (JARVIS élevé sous un autre compte : HKCU et le dossier Démarrage
+    # seraient ceux de cet autre compte). Rend un tableau (vide possible) ; $null = lecture impossible.
     $apr = 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\'
     $run = 'Software\Microsoft\Windows\CurrentVersion\Run'
     $list = [System.Collections.Generic.List[object]]::new()
@@ -3895,6 +3920,11 @@ function Get-StartupEntries {
         $hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
         $sources = @(@($hkcu, $run, 'Run'), @($hklm, $run, 'Run'),
                      @($hklm, 'Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run', 'Run32'))
+        $folders = @(@('Startup', $hkcu), @('CommonStartup', $hklm))
+        if ($MachineOnly) {
+            $sources = @($sources | Where-Object { $_[0] -eq $hklm })
+            $folders = @(, @('CommonStartup', $hklm))
+        }
         foreach ($src in $sources) {
             $k = $src[0].OpenSubKey($src[1])
             if ($null -eq $k) { continue }
@@ -3909,7 +3939,7 @@ function Get-StartupEntries {
                 }
             } finally { $k.Close(); if ($null -ne $a) { $a.Close() } }
         }
-        foreach ($f in @(@('Startup', $hkcu), @('CommonStartup', $hklm))) {
+        foreach ($f in $folders) {
             $dir = [Environment]::GetFolderPath($f[0])
             if (-not $dir -or -not [IO.Directory]::Exists($dir)) { continue }
             $a = $f[1].OpenSubKey($apr + 'StartupFolder')
@@ -8230,6 +8260,16 @@ try {
         $fwSt = Get-AvState $_.productState
         $fwIsOn = $null
         if ($null -ne $fwSt) { $fwIsOn = [bool]$fwSt.On }
+        # Relecture v3.26 : un logiciel mal désinstallé peut laisser son entrée « active » figée. « Actif » n'est cru
+        # que si son programme existe encore ; sinon état illisible (INFO), jamais OK.
+        if ($fwIsOn) {
+            $fwFound = $false
+            try {
+                $fwExe = [Environment]::ExpandEnvironmentVariables(([string]$_.pathToSignedProductExe).Trim(' ', '"'))
+                if ($fwExe) { $fwFound = [IO.File]::Exists($fwExe) }
+            } catch { $fwFound = $false }
+            if (-not $fwFound) { $fwIsOn = $null }
+        }
         [pscustomobject]@{ Name = [string]$_.displayName; On = $fwIsOn }
     })
 } catch { $fwOthers = $null }
@@ -8566,19 +8606,26 @@ if ($isLaptop) {
 }
 
 # v3.26 (constat V11) : seuls les programmes actifs comptent, ceux désactivés dans le Gestionnaire des tâches à part
-$stEntries = Get-StartupEntries
-if ($null -eq $stEntries) { Write-Status 'Programmes au démarrage' 'lecture impossible' 'INFO' }
+# Élevé sous un autre compte (mot de passe d'un autre administrateur) : partie commune seulement (relecture v3.26)
+$stSame = Test-SameAccount ([string](Get-CimInstance Win32_ComputerSystem).UserName) ([Environment]::UserName)
+$stEntries = Get-StartupEntries -MachineOnly:(-not $stSame)
+$stLbl = 'Programmes au démarrage'
+if (-not $stSame) {
+    $stLbl = 'Démarrage (tous les comptes)'
+    Write-Status 'Démarrage de ton compte' 'non lu : J.A.R.V.I.S. tourne sous un autre compte que le tien' 'INFO'
+}
+if ($null -eq $stEntries) { Write-Status $stLbl 'lecture impossible' 'INFO' }
 else {
     $stc = Get-StartupCount $stEntries
     $stTxt = '{0} actif' -f $stc.On
     if ($stc.On -gt 1) { $stTxt += 's' }
     if ($stc.Off -gt 0) { $stTxt += ' ({0} désactivé{1})' -f $stc.Off, $(if ($stc.Off -gt 1) { 's' } else { '' }) }
     if ($stc.On -gt 15) {
-        Write-Status 'Programmes au démarrage' ($stTxt + ', beaucoup') 'WARN'
+        Write-Status $stLbl ($stTxt + ', beaucoup') 'WARN'
         Write-Sub 'Ils ralentissent l''allumage. Ctrl + Maj + Échap > Applications de démarrage (ou Démarrage) :'
         Write-Sub 'clic droit > Désactiver sur ce dont tu n''as pas besoin dès l''allumage.'
     }
-    else { Write-Status 'Programmes au démarrage' $stTxt 'OK' }
+    else { Write-Status $stLbl $stTxt 'OK' }
 }
 
 # ==================================================================
