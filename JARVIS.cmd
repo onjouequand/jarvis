@@ -1,6 +1,6 @@
 <# : JARVIS.cmd. Ne pas modifier ce texte
 @echo off
-rem JARVIS-SHA256=5bf7ed5f79bd0f59bc110e550e2ab1566cba079f5dcf4b7bcec36d86565a3186
+rem JARVIS-SHA256=28bfbab72bb1c434724e751dd7d5251728e8b72986d240c5f9c950aa77c010ca
 setlocal
 "%SystemRoot%\System32\chcp.com" 65001 >nul
 set "JARVIS_SELF=%~f0"
@@ -12,7 +12,7 @@ if "%JARVIS_RC%"=="4" pause
 exit /b %JARVIS_RC%
 #>
 <#
-    J.A.R.V.I.S. // Check-up système v3.25
+    J.A.R.V.I.S. // Check-up système v3.26
     -----------------------------------------------------------------
     Modules :
       [01] Système        : version Windows, uptime, redémarrage en attente
@@ -223,7 +223,7 @@ if (-not $PSCommandPath -and $env:JARVIS_SELF -and $env:JARVIS_ARGS) {
 # ------------------------------------------------------------------
 # Identité du programme et emplacement
 # ------------------------------------------------------------------
-$JarvisVersion = '3.25'
+$JarvisVersion = '3.26'
 $JarvisSelf = $env:JARVIS_SELF                     # défini par JARVIS.cmd
 if (-not $JarvisSelf) { $JarvisSelf = $PSCommandPath }  # lancement direct du .ps1
 $JarvisHome = $null
@@ -373,7 +373,7 @@ function Show-Banner {
         foreach ($l in $plain) { Write-Host $l -ForegroundColor Cyan; Pause-Ms 70 }
         Write-Host ''
         Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-        Write-Host '      module check-up v3.25' -ForegroundColor DarkGray
+        Write-Host '      module check-up v3.26' -ForegroundColor DarkGray
         Write-Host ''
         return
     }
@@ -393,7 +393,7 @@ function Show-Banner {
     }
     Write-Host ''
     Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-    Write-Host '      module check-up v3.25' -ForegroundColor DarkGray
+    Write-Host '      module check-up v3.26' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -1320,39 +1320,47 @@ function Clear-WuCache {
         if ($s.Status -ne 'Stopped') { $wasRunning += $n }
     }
     $stopped = $true
-    foreach ($n in $wasRunning) {
-        try {
-            $s = Get-Service -Name $n
-            # En cours de démarrage : attendre qu'il tourne ; en cours d'arrêt : attendre seulement
-            if ($s.Status -eq 'StartPending') { $s.WaitForStatus('Running', [TimeSpan]::FromSeconds(60)); $s.Refresh() }
-            if ($s.Status -eq 'Running' -or $s.Status -eq 'Paused') { $s.Stop() }
-            $s.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(60))
-        } catch { $stopped = $false; break }
-    }
-    if (-not $stopped) {
-        $res.Reason = 'Windows Update n''a pas pu être arrêté, rien n''a été supprimé'
-    } else {
-        # Juste avant la suppression : un déclencheur de Windows a pu relancer un service entre-temps
-        foreach ($n in @('wuauserv', 'bits')) {
-            $s = Get-Service -Name $n
-            if ($null -eq $s -or $s.Status -ne 'Stopped') { $stopped = $false }
+    # v3.26 (audit, constat S8) : relance dans un finally. Avant, une erreur imprévue entre l'arrêt et la relance
+    # (dans la suppression par exemple) laissait Windows Update et BITS arrêtés.
+    try {
+        foreach ($n in $wasRunning) {
+            try {
+                $s = Get-Service -Name $n
+                # En cours de démarrage : attendre qu'il tourne ; en cours d'arrêt : attendre seulement
+                if ($s.Status -eq 'StartPending') { $s.WaitForStatus('Running', [TimeSpan]::FromSeconds(60)); $s.Refresh() }
+                if ($s.Status -eq 'Running' -or $s.Status -eq 'Paused') { $s.Stop() }
+                $s.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(60))
+            } catch { $stopped = $false; break }
         }
-        if ($stopped) {
-            $c = Clear-CleanTarget 'WuCache' 0
-            $res.Ok = $c.Ok; $res.FreedBytes = $c.FreedBytes; $res.LeftBytes = $c.LeftBytes; $res.Reason = $c.Reason
+        if (-not $stopped) {
+            $res.Reason = 'Windows Update n''a pas pu être arrêté, rien n''a été supprimé'
         } else {
-            $res.Reason = 'Windows Update s''est relancé tout seul, rien n''a été supprimé : réessaie plus tard'
+            # Juste avant la suppression : un déclencheur de Windows a pu relancer un service entre-temps
+            foreach ($n in @('wuauserv', 'bits')) {
+                $s = Get-Service -Name $n
+                if ($null -eq $s -or $s.Status -ne 'Stopped') { $stopped = $false }
+            }
+            if ($stopped) {
+                $c = Clear-CleanTarget 'WuCache' 0
+                $res.Ok = $c.Ok; $res.FreedBytes = $c.FreedBytes; $res.LeftBytes = $c.LeftBytes; $res.Reason = $c.Reason
+            } else {
+                $res.Reason = 'Windows Update s''est relancé tout seul, rien n''a été supprimé : réessaie plus tard'
+            }
         }
-    }
-    # Relance, dans l'ordre inverse de l'arrêt, de ce qui tournait au départ
-    foreach ($n in @('bits', 'wuauserv')) {
-        if ($wasRunning -notcontains $n) { continue }
-        try {
-            $s = Get-Service -Name $n
-            if ($s.Status -eq 'StopPending') { $s.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(60)); $s.Refresh() }
-            if ($s.Status -eq 'Stopped') { $s.Start() }
-            $s.WaitForStatus('Running', [TimeSpan]::FromSeconds(60))
-        } catch { $res.Restarted = $false }
+    } catch {
+        $res.Ok = $false
+        $res.Reason = 'erreur pendant le nettoyage : ' + $_.Exception.Message
+    } finally {
+        # Relance, dans l'ordre inverse de l'arrêt, de ce qui tournait au départ
+        foreach ($n in @('bits', 'wuauserv')) {
+            if ($wasRunning -notcontains $n) { continue }
+            try {
+                $s = Get-Service -Name $n
+                if ($s.Status -eq 'StopPending') { $s.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(60)); $s.Refresh() }
+                if ($s.Status -eq 'Stopped') { $s.Start() }
+                $s.WaitForStatus('Running', [TimeSpan]::FromSeconds(60))
+            } catch { $res.Restarted = $false }
+        }
     }
     return $res
 }
@@ -2295,12 +2303,18 @@ function Get-ReportDir {
     # Premier emplacement réellement inscriptible : profil local, puis dossier
     # temporaire. Évite Documents (souvent dans OneDrive ou protégé par
     # l'Accès contrôlé aux dossiers) et le dossier du programme (lecture seule).
-    $candidates = @()
-    $candidates += $ReportRoot
-    $candidates += (Join-Path $env:TEMP 'JARVIS')
-    foreach ($d in $candidates) {
+    # v3.26 (audit, constat S8) : dossiers créés par JARVIS refusés s'ils sont une jonction ou un lien (contrôlés
+    # jusqu'au dossier JARVIS compris, pas au-dessus : un AppData déplacé ailleurs reste accepté). Sinon, lancé en
+    # administrateur, JARVIS écrivait ses rapports là où mène la jonction et y supprimait les plus anciens.
+    $candidates = @(
+        @($ReportRoot, (Split-Path -Parent $ReportRoot)),
+        @((Join-Path $env:TEMP 'JARVIS'), (Join-Path $env:TEMP 'JARVIS'))
+    )
+    foreach ($cand in $candidates) {
+        $d = $cand[0]
         try {
             if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force -ErrorAction Stop | Out-Null }
+            if (-not (Test-NoLinkInChain $cand[1] (Join-Path $d '.jarvis_write_test'))) { continue }
             $f = Join-Path $d '.jarvis_write_test'
             Set-Content -Path $f -Value 'ok' -ErrorAction Stop
             $back = Get-Content -Path $f -Raw -ErrorAction Stop
@@ -2750,6 +2764,9 @@ function Get-JarvisHttpClient {
     }
     $c = New-Object System.Net.Http.HttpClient
     $c.Timeout = [TimeSpan]::FromSeconds(90)
+    # v3.26 (audit, constat S8) : réception plafonnée (fichier refusé au-delà de 5 Mo après coup ; sans plafond,
+    # un fichier énorme était d'abord reçu en entier en mémoire, jusqu'à 2 Go)
+    $c.MaxResponseContentBufferSize = 8MB
     $c.DefaultRequestHeaders.UserAgent.ParseAdd('JARVIS-checkup/' + $JarvisVersion)
     $script:JarvisHttp = $c
     return $c
@@ -3393,12 +3410,17 @@ function Invoke-CleanTarget($Target) {
 }
 
 function Get-ChkdskVerdict($Code) {
-    switch ([int]$Code) {
-        0 { return 'CLEAN' }
-        1 { return 'FIXED' }
-        2 { return 'MINOR' }
-        default { return 'ERRORS' }
-    }
+    # Code de sortie de « chkdsk X: /scan » (documentation de chkdsk : 0 aucune erreur, 1 corrigées, 2 nettoyage,
+    # 3 erreurs non corrigées). v3.26 (audit, constat V7) : code absent ou non numérique = UNKNOWN (avant,
+    # [int]$null valait 0, soit « aucune erreur », règle 24) ; code hors 0 à 3 (outil en panne ou refusé) =
+    # UNKNOWN, plus « erreurs détectées, correction nécessaire » en rouge. Fonction pure, T1.
+    $n = ConvertTo-IntOrNull $Code
+    if ($null -eq $n) { return 'UNKNOWN' }
+    if ($n -eq 0) { return 'CLEAN' }
+    if ($n -eq 1) { return 'FIXED' }
+    if ($n -eq 2) { return 'MINOR' }
+    if ($n -eq 3) { return 'ERRORS' }
+    return 'UNKNOWN'
 }
 
 function ConvertFrom-WingetText {
@@ -3797,6 +3819,131 @@ function Get-AvState($ProductState) {
         On       = ($hex.Substring(2, 2) -in @('10', '11'))
         UpToDate = ($hex.Substring(4, 2) -eq '00')
     }
+}
+
+function Get-FirewallVerdict($Off, $Others) {
+    # Pare-feu (section 06). v3.26 (audit, constats V14 et V16) : le pare-feu d'un autre logiciel de sécurité,
+    # déclaré actif au Centre de sécurité de Windows (classe FirewallProduct, même productState que les
+    # antivirus), compte : quand un tel logiciel s'installe, il coupe normalement le pare-feu de Windows, qui
+    # sortait alors en FAIL. Le pare-feu de Windows lui-même n'est pas dans cette liste. Fonction pure, T1.
+    # $Off    : profils du pare-feu de Windows désactivés (noms affichés) ; $null = lecture impossible
+    # $Others : autres pare-feu, objets { Name ; On } (On = $null : état illisible) ; $null = Centre de sécurité illisible
+    # Rend { Level ; Text ; Subs } (Level : OK, FAIL ou INFO ; Subs : lignes de conseil).
+    $on = @(); $offOthers = @(); $unread = @()
+    foreach ($o in @($Others)) {
+        if ($null -eq $o) { continue }
+        $n = [string]$o.Name
+        if ($null -eq $o.On) { $unread += $n } elseif ($o.On) { $on += $n } else { $offOthers += $n }
+    }
+    $r = [pscustomobject]@{ Level = 'INFO'; Text = 'lecture impossible'; Subs = @() }
+    if ($null -ne $Off -and @($Off).Count -eq 0) {
+        $r.Level = 'OK'; $r.Text = 'actif sur tous les profils'
+        return $r
+    }
+    if ($on.Count -gt 0) {
+        $r.Level = 'OK'; $r.Text = 'géré par ' + ($on -join ', ')
+        if ($null -ne $Off) { $r.Text += ' (celui de Windows est coupé, c''est normal)' }
+        return $r
+    }
+    if ($null -eq $Off) { return $r }
+    $where = 'réseau ' + (@($Off) -join ', ')
+    if ($unread.Count -gt 0) {
+        # Pare-feu de Windows coupé, celui de l'autre logiciel illisible : rien ne permet de conclure
+        $r.Text = 'celui de Windows désactivé (' + $where + '), état de ' + ($unread -join ', ') + ' illisible'
+        $r.Subs = @('Ouvre ' + ($unread -join ', ') + ' et vérifie que son pare-feu est actif. Sinon : Sécurité Windows',
+                    '> Pare-feu et protection du réseau > chaque réseau désactivé > Activé.')
+        return $r
+    }
+    $r.Level = 'FAIL'; $r.Text = 'désactivé : ' + $where
+    if ($offOthers.Count -gt 0) {
+        $r.Subs = @('Le pare-feu de ' + ($offOthers -join ', ') + ' est coupé lui aussi : rouvre ce logiciel et réactive-le,',
+                    'ou Sécurité Windows > Pare-feu et protection du réseau > chaque réseau désactivé > Activé.')
+    } else {
+        $r.Subs = @('Sécurité Windows > Pare-feu et protection du réseau > chaque réseau désactivé > Activé.',
+                    'Si un autre logiciel de sécurité gère ton pare-feu, vérifie plutôt qu''il est actif.')
+    }
+    return $r
+}
+
+function Get-StartupApprovedState($Bytes) {
+    # Programmes au démarrage (section 08). Valeur « StartupApproved » de l'entrée, écrite par le Gestionnaire des
+    # tâches (Applications de démarrage) : premier octet pair = activé (02, 06), impair = désactivé (03, 07). Valeur
+    # absente = activé (Windows ne l'écrit qu'au premier changement) : l'appelant passe 'ABSENT'. Relevé le
+    # 23/11/2026 sur le PC de Thomas : Steam et Docker Desktop désactivés = 03. Fonction pure, T1.
+    if ($Bytes -is [string] -and $Bytes -eq 'ABSENT') { return 'ON' }
+    if ($null -eq $Bytes -or $Bytes -isnot [byte[]] -or $Bytes.Length -lt 1) { return 'UNKNOWN' }
+    if ($Bytes[0] -band 1) { return 'OFF' }
+    return 'ON'
+}
+
+function Get-StartupCount($Entries) {
+    # v3.26 (audit, constat V11) : seules les entrées actives comptent ; avant, celles désactivées dans le
+    # Gestionnaire des tâches comptaient aussi (Win32_StartupCommand ne regarde pas StartupApproved, et ne
+    # voyait pas les programmes 32 bits de HKLM). $Entries : objets { Name ; Approved } (Approved : octets lus,
+    # 'ABSENT' ou $null si illisible). État illisible = compté comme actif (rien ne dit qu'il est coupé). Pure, T1.
+    $r = [pscustomobject]@{ On = 0; Off = 0; Unknown = 0 }
+    foreach ($e in @($Entries)) {
+        if ($null -eq $e) { continue }
+        switch (Get-StartupApprovedState $e.Approved) {
+            'ON' { $r.On++ }
+            'OFF' { $r.Off++ }
+            default { $r.On++; $r.Unknown++ }
+        }
+    }
+    return $r
+}
+
+function Get-StartupEntries {
+    # Programmes lancés à l'ouverture de session, lus comme le Gestionnaire des tâches (v3.26, constat V11) : clés
+    # Run du compte et de la machine (64 et 32 bits, registre en vue 64 bits même depuis une console 32 bits),
+    # dossiers Démarrage du compte et de tous les utilisateurs, chacun avec sa valeur StartupApproved
+    # ('ABSENT' si Windows ne l'a jamais écrite). Les applications du Store qui démarrent seules n'y sont pas.
+    # Rend un tableau (vide possible) ; $null = lecture impossible.
+    $apr = 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\'
+    $run = 'Software\Microsoft\Windows\CurrentVersion\Run'
+    $list = [System.Collections.Generic.List[object]]::new()
+    $hkcu = $null; $hklm = $null
+    try {
+        $hkcu = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::CurrentUser, [Microsoft.Win32.RegistryView]::Registry64)
+        $hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+        $sources = @(@($hkcu, $run, 'Run'), @($hklm, $run, 'Run'),
+                     @($hklm, 'Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run', 'Run32'))
+        foreach ($src in $sources) {
+            $k = $src[0].OpenSubKey($src[1])
+            if ($null -eq $k) { continue }
+            $a = $src[0].OpenSubKey($apr + $src[2])
+            try {
+                foreach ($n in $k.GetValueNames()) {
+                    if (-not $n) { continue }   # valeur par défaut de la clé
+                    $b = $null
+                    if ($null -ne $a) { $b = $a.GetValue($n) }
+                    if ($null -eq $b) { $b = 'ABSENT' }
+                    $list.Add([pscustomobject]@{ Name = $n; Approved = $b })
+                }
+            } finally { $k.Close(); if ($null -ne $a) { $a.Close() } }
+        }
+        foreach ($f in @(@('Startup', $hkcu), @('CommonStartup', $hklm))) {
+            $dir = [Environment]::GetFolderPath($f[0])
+            if (-not $dir -or -not [IO.Directory]::Exists($dir)) { continue }
+            $a = $f[1].OpenSubKey($apr + 'StartupFolder')
+            try {
+                foreach ($fi in [IO.Directory]::GetFiles($dir)) {
+                    $n = [IO.Path]::GetFileName($fi)
+                    if ($n -eq 'desktop.ini') { continue }
+                    $b = $null
+                    if ($null -ne $a) { $b = $a.GetValue($n) }
+                    if ($null -eq $b) { $b = 'ABSENT' }
+                    $list.Add([pscustomobject]@{ Name = $n; Approved = $b })
+                }
+            } finally { if ($null -ne $a) { $a.Close() } }
+        }
+    } catch {
+        return $null
+    } finally {
+        if ($null -ne $hkcu) { $hkcu.Close() }
+        if ($null -ne $hklm) { $hklm.Close() }
+    }
+    return , ($list.ToArray())
 }
 
 # ------------------------------------------------------------------
@@ -4971,13 +5118,19 @@ function Invoke-SelfTestAnalyzers {
         '{0}/{0} cas' -f $cases.Count
     }
 
-    Test-Case 'CHKDSK : codes de sortie 0-3' {
-        $exp = @{ 0 = 'CLEAN'; 1 = 'FIXED'; 2 = 'MINOR'; 3 = 'ERRORS' }
-        foreach ($k in $exp.Keys) {
-            $got = Get-ChkdskVerdict $k
-            Assert-True ($got -eq $exp[$k]) "code $k -> $got, attendu $($exp[$k])"
+    Test-Case 'CHKDSK : codes de sortie 0-3, code absent ou inattendu' {
+        # v3.26 (constat V7) : code absent = UNKNOWN (avant [int]$null = 0 = « aucune erreur ») ; code hors 0 à 3 =
+        # UNKNOWN (avant « erreurs détectées » en rouge)
+        $cases = @(
+            @(0, 'CLEAN'), @(1, 'FIXED'), @(2, 'MINOR'), @(3, 'ERRORS'), @('0', 'CLEAN'), @(' 3 ', 'ERRORS'),
+            @($null, 'UNKNOWN'), @('', 'UNKNOWN'), @('abc', 'UNKNOWN'), @(4, 'UNKNOWN'), @(-1, 'UNKNOWN'),
+            @(-1073741819, 'UNKNOWN')
+        )
+        foreach ($c in $cases) {
+            $got = Get-ChkdskVerdict $c[0]
+            Assert-True ($got -eq $c[1]) ("code « {0} » -> {1}, attendu {2}" -f $c[0], $got, $c[1])
         }
-        '4/4 cas'
+        '{0}/{0} cas' -f $cases.Count
     }
 
     Test-Case 'winget : tableau FR + bruit de progression' {
@@ -5291,6 +5444,58 @@ function Invoke-SelfTestAnalyzers {
         Assert-True ($null -eq (Get-AvState 'abc')) 'valeur non numérique lue comme un état'
         $d = Get-AvState '397568'; Assert-True ($d.On -and $d.UpToDate) '397568 (texte) : attendu actif + à jour'
         '7/7 cas'
+    }
+    Test-Case 'Pare-feu : Windows et autres logiciels' {
+        # v3.26 (constats V14 et V16) : un pare-feu tiers actif au Centre de sécurité remplace celui de Windows
+        $on = [pscustomobject]@{ Name = 'Norton'; On = $true }
+        $off = [pscustomobject]@{ Name = 'Norton'; On = $false }
+        $unk = [pscustomobject]@{ Name = 'Norton'; On = $null }
+        $cases = @(
+            @(@(), @(), 'OK', 'actif sur tous'),
+            @(@(), $null, 'OK', 'actif sur tous'),
+            @(@('privé', 'public'), @(), 'FAIL', 'désactivé : réseau privé, public'),
+            @(@('public'), $null, 'FAIL', 'désactivé'),
+            @(@('public'), @($on), 'OK', 'géré par Norton (celui de Windows'),
+            @($null, @($on), 'OK', 'géré par Norton'),
+            @(@('public'), @($off), 'FAIL', 'désactivé'),
+            @(@('public'), @($unk), 'INFO', 'celui de Windows désactivé (réseau public), état de Norton illisible'),
+            @(@('public'), @($off, [pscustomobject]@{ Name = 'Bitdefender'; On = $true }), 'OK', 'géré par Bitdefender'),
+            @($null, @(), 'INFO', 'lecture impossible'),
+            @($null, $null, 'INFO', 'lecture impossible')
+        )
+        foreach ($c in $cases) {
+            $v = Get-FirewallVerdict $c[0] $c[1]
+            Assert-True ($v.Level -eq $c[2] -and $v.Text.StartsWith($c[3])) ("{0} / « {1} », attendu {2} / « {3} »" -f $v.Level, $v.Text, $c[2], $c[3])
+            if ($v.Level -eq 'FAIL' -or $v.Level -eq 'WARN') { Assert-True (@($v.Subs).Count -gt 0) ("{0} sans conseil" -f $v.Text) }
+            if ($v.Level -eq 'INFO') { Assert-True (Test-UnreadValue $v.Text) ("« {0} » absent de « Non vérifié »" -f $v.Text) }
+        }
+        '{0}/{0} cas' -f $cases.Count
+    }
+    Test-Case 'Démarrage : programmes actifs et désactivés' {
+        # v3.26 (constat V11) : octets relevés le 23/11/2026 (02 activé, 03 désactivé, 06 activé)
+        $b = { param([int[]]$x) , ([byte[]]$x) }   # virgule : le tableau d'octets sort entier, pas octet par octet
+        $states = @(
+            @((& $b 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 'ON'), @((& $b 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 'OFF'),
+            @((& $b 6, 0, 0, 0), 'ON'), @((& $b 7, 0, 0, 0), 'OFF'), @('ABSENT', 'ON'),
+            @($null, 'UNKNOWN'), @('03', 'UNKNOWN'), @([byte[]]@(), 'UNKNOWN')
+        )
+        foreach ($s in $states) {
+            $got = Get-StartupApprovedState $s[0]
+            Assert-True ($got -eq $s[1]) ("état -> {0}, attendu {1}" -f $got, $s[1])
+        }
+        $entries = @(
+            [pscustomobject]@{ Name = 'OneDrive'; Approved = (& $b 2, 0, 0, 0) },
+            [pscustomobject]@{ Name = 'Steam'; Approved = (& $b 3, 0, 0, 0) },
+            [pscustomobject]@{ Name = 'Docker Desktop'; Approved = (& $b 3, 0, 0, 0) },
+            [pscustomobject]@{ Name = 'SecurityHealth'; Approved = (& $b 6, 0, 0, 0) },
+            [pscustomobject]@{ Name = 'Handy'; Approved = 'ABSENT' },
+            [pscustomobject]@{ Name = 'Bizarre'; Approved = 'texte' }
+        )
+        $n = Get-StartupCount $entries
+        Assert-True ($n.On -eq 4 -and $n.Off -eq 2 -and $n.Unknown -eq 1) ("actifs {0}, désactivés {1}, illisibles {2}, attendu 4, 2, 1" -f $n.On, $n.Off, $n.Unknown)
+        $z = Get-StartupCount @()
+        Assert-True ($z.On -eq 0 -and $z.Off -eq 0) 'liste vide'
+        '{0}/{0} cas' -f ($states.Count + 2)
     }
     Test-Case 'Synthèse : contrôles non vérifiés' {
         # Lignes INFO réelles du scan qui disent qu'une lecture a échoué, et lignes qui n'en sont pas
@@ -7536,7 +7741,7 @@ if ($NoWinget) {
         # tous les utilisateurs, winget ne propose qu'une installation par utilisateur) étaient proposés
         # puis refusés par winget ; le module, lui, savait que Hytale n'était pas applicable.
         $out = [pscustomobject]@{ Mode = 'text'; Items = @(); Unknown = 0; UnknownNames = @(); NotApplicable = @(); Error = $null
-                                  Raw = ''; Err = ''; Code = $null; Parsed = 0 }
+                                  Raw = ''; Err = ''; Code = $null; Parsed = 0; ModuleErr = '' }
         if (-not $WgExe -or -not (Test-Path -LiteralPath $WgExe -PathType Leaf)) {
             $out.Error = 'NOWINGET'
             return $out
@@ -7554,14 +7759,19 @@ if ($NoWinget) {
         $out.Items = @(& ([scriptblock]::Create($ParserText)) $raw)
         $out.Parsed = @($out.Items).Count
         $out.Unknown = [int](& ([scriptblock]::Create($UnknownText)) $raw)
+        # v3.26 (audit, constat T9) : le résultat du module n'est pris qu'une fois le filtrage fini. Avant, le mode
+        # « avec module » était écrit d'abord : une erreur en cours de route laissait une liste non filtrée annoncée
+        # filtrée. Chaque ligne est complétée sur une copie, la liste de winget reste intacte si le module échoue.
         try {
             if (Get-Module -ListAvailable -Name Microsoft.WinGet.Client) {
                 Import-Module Microsoft.WinGet.Client -ErrorAction Stop
-                $all = @(Get-WinGetPackage)
-                $out.Mode = 'text+module'
+                $all = @(Get-WinGetPackage -ErrorAction Stop)
+                if ($all.Count -eq 0) { throw 'aucun paquet lu par le module' }
                 $ell = [string][char]0x2026
                 $keep = @()
-                foreach ($it in $out.Items) {
+                $na = @()
+                foreach ($src in $out.Items) {
+                    $it = $src.PSObject.Copy()
                     $p = $null
                     $cliId = [string]$it.Id
                     if ($it.Id.EndsWith($ell)) {
@@ -7577,17 +7787,20 @@ if ($NoWinget) {
                         $av = [string]($p.AvailableVersions | Select-Object -First 1)
                         if ($av) { $it.Available = $av }
                         if (-not $p.IsUpdateAvailable) {
-                            $out.NotApplicable += [pscustomobject]@{ Name = $it.Name; Ids = @($it.Id, $cliId) }
+                            $na += [pscustomobject]@{ Name = $it.Name; Ids = @($it.Id, $cliId) }
                             continue
                         }
                     }
                     $keep += $it
                 }
+                $unk = @($all | Where-Object { $_.IsUpdateAvailable -and [string]$_.InstalledVersion -eq 'Unknown' } |
+                         ForEach-Object { [string]$_.Name })
                 $out.Items = $keep
-                $out.UnknownNames = @($all | Where-Object { $_.IsUpdateAvailable -and [string]$_.InstalledVersion -eq 'Unknown' } |
-                                      ForEach-Object { [string]$_.Name })
+                $out.NotApplicable = $na
+                $out.UnknownNames = $unk
+                $out.Mode = 'text+module'
             }
-        } catch {}
+        } catch { $out.ModuleErr = [string]$_.Exception.Message }
         return $out
     } 300 -ArgumentList $wgParser, $wgUnknown, $wgSplit, $wgExe
 
@@ -7632,7 +7845,11 @@ if ($NoWinget) {
             Write-Status 'Applications à mettre à jour' 'aucune' 'OK'
         } else {
             Write-Status 'Applications à mettre à jour' ([string]$items.Count) 'WARN'
-            if ($wg.Mode -eq 'text' -and (Test-ShowWingetOffer)) {
+            if ($wg.ModuleErr) {
+                # Module présent mais en échec : liste de winget seule, sans le tri du module (v3.26, constat T9)
+                Write-Sub 'Liste de winget seule (module winget illisible) : certaines peuvent être refusées par winget.'
+            }
+            if ($wg.Mode -eq 'text' -and -not $wg.ModuleErr -and (Test-ShowWingetOffer)) {
                 Write-Sub 'Versions détaillées possibles avec le module winget : menu [M]'
             }
             foreach ($it in $items) {
@@ -8012,20 +8229,26 @@ if ($mp -and -not $mp.RealTimeProtectionEnabled -and $avOther.Count -gt 0) {
     Write-Status 'Microsoft Defender' 'statut indisponible' 'INFO'
 }
 
+# Pare-feu de Windows, puis ceux d'autres logiciels déclarés au Centre de sécurité (v3.26, constat V14)
+$fwOff = $null
 $fw = @(Get-NetFirewallProfile)
 if ($fw.Count -gt 0) {
-    $off = @($fw | Where-Object { -not $_.Enabled } | ForEach-Object {
+    $fwOff = @($fw | Where-Object { -not $_.Enabled } | ForEach-Object {
         switch ([string]$_.Name) { 'Domain' { 'domaine' } 'Private' { 'privé' } 'Public' { 'public' } default { [string]$_.Name } }
     })
-    if ($off.Count -eq 0) { Write-Status 'Pare-feu' 'actif sur tous les profils' 'OK' }
-    else {
-        Write-Status 'Pare-feu' ('désactivé : réseau ' + ($off -join ', ')) 'FAIL'
-        Write-Sub 'Sécurité Windows > Pare-feu et protection du réseau > chaque réseau désactivé > Activé.'
-        Write-Sub 'Si un autre logiciel de sécurité gère ton pare-feu, vérifie plutôt qu''il est actif.'
-    }
-} else {
-    Write-Status 'Pare-feu' 'lecture impossible' 'INFO'
 }
+$fwOthers = $null
+try {
+    $fwOthers = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName FirewallProduct -ErrorAction Stop | ForEach-Object {
+        $fwSt = Get-AvState $_.productState
+        $fwIsOn = $null
+        if ($null -ne $fwSt) { $fwIsOn = [bool]$fwSt.On }
+        [pscustomobject]@{ Name = [string]$_.displayName; On = $fwIsOn }
+    })
+} catch { $fwOthers = $null }
+$fv = Get-FirewallVerdict $fwOff $fwOthers
+Write-Status 'Pare-feu' $fv.Text $fv.Level
+foreach ($fwSub in @($fv.Subs)) { Write-Sub $fwSub }
 
 if ($isAdmin) {
     try {
@@ -8355,15 +8578,21 @@ if ($isLaptop) {
     }
 }
 
-$startup = $null
-try { $startup = @(Get-CimInstance Win32_StartupCommand -ErrorAction Stop) } catch { $startup = $null }
-if ($null -eq $startup) { Write-Status 'Programmes au démarrage' 'lecture impossible' 'INFO' }
-elseif ($startup.Count -gt 15) {
-    Write-Status 'Programmes au démarrage' ("{0} (beaucoup)" -f $startup.Count) 'WARN'
-    Write-Sub 'Ils ralentissent l''allumage. Ctrl + Maj + Échap > Applications de démarrage (ou Démarrage) :'
-    Write-Sub 'clic droit > Désactiver sur ce dont tu n''as pas besoin dès l''allumage.'
+# v3.26 (constat V11) : seuls les programmes actifs comptent, ceux désactivés dans le Gestionnaire des tâches à part
+$stEntries = Get-StartupEntries
+if ($null -eq $stEntries) { Write-Status 'Programmes au démarrage' 'lecture impossible' 'INFO' }
+else {
+    $stc = Get-StartupCount $stEntries
+    $stTxt = '{0} actif' -f $stc.On
+    if ($stc.On -gt 1) { $stTxt += 's' }
+    if ($stc.Off -gt 0) { $stTxt += ' ({0} désactivé{1})' -f $stc.Off, $(if ($stc.Off -gt 1) { 's' } else { '' }) }
+    if ($stc.On -gt 15) {
+        Write-Status 'Programmes au démarrage' ($stTxt + ', beaucoup') 'WARN'
+        Write-Sub 'Ils ralentissent l''allumage. Ctrl + Maj + Échap > Applications de démarrage (ou Démarrage) :'
+        Write-Sub 'clic droit > Désactiver sur ce dont tu n''as pas besoin dès l''allumage.'
+    }
+    else { Write-Status 'Programmes au démarrage' $stTxt 'OK' }
 }
-else { Write-Status 'Programmes au démarrage' ([string]$startup.Count) 'OK' }
 
 # ==================================================================
 # [09] RÉSEAU
@@ -8832,13 +9061,19 @@ if ($script:DeepMode) {
         if ($ck) { $code = $ck.Code }
 
         $lbl = "Disque {0}: (CHKDSK)" -f $L
+        $ckv = Get-ChkdskVerdict $code
         if ($null -eq $code) { Write-Status $lbl 'délai dépassé' 'WARN'; Write-Sub $later }
-        elseif ((Get-ChkdskVerdict $code) -eq 'CLEAN') { Write-Status $lbl 'aucune erreur' 'OK' }
-        elseif ((Get-ChkdskVerdict $code) -eq 'FIXED') {
+        elseif ($ckv -eq 'CLEAN') { Write-Status $lbl 'aucune erreur' 'OK' }
+        elseif ($ckv -eq 'FIXED') {
             Write-Status $lbl 'erreurs trouvées et corrigées' 'WARN'
             Write-Sub 'Rien d''autre à faire. Si elles reviennent au prochain scan complet, sauvegarde tes fichiers.'
         }
-        elseif ((Get-ChkdskVerdict $code) -eq 'MINOR') { Write-Status $lbl 'nettoyage mineur nécessaire' 'INFO' }
+        elseif ($ckv -eq 'MINOR') { Write-Status $lbl 'nettoyage mineur nécessaire' 'INFO' }
+        elseif ($ckv -eq 'UNKNOWN') {
+            # v3.26 (constat V7) : code inattendu = l'analyse n'a pas abouti, pas « erreurs » en rouge
+            Write-Status $lbl ('résultat non reconnu (code {0})' -f $code) 'INFO'
+            Write-Sub $later
+        }
         else {
             Write-Status $lbl 'erreurs détectées, correction nécessaire' 'FAIL'
             $script:ChkdskFix.Add($L)

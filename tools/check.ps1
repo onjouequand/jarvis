@@ -30,7 +30,7 @@ $Settings = Join-Path $Root 'PSScriptAnalyzerSettings.psd1'
 # Plafonds : ils ne peuvent que BAISSER. Chaque valeur est le nombre de cas connus et justifiés.
 # ------------------------------------------------------------------
 # Blocs « catch {} » vides (échec ignoré en silence).
-$MaxEmptyCatch = 24
+$MaxEmptyCatch = 23
 # Outils système appelés par leur seul nom (recherche dans le PATH) : plus aucun depuis la v3.13,
 # tous passent par Get-SystemToolPath.
 $MaxBareTools = 0
