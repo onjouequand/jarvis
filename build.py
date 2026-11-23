@@ -12,7 +12,7 @@ Usage : python build.py   (sous Windows : le contrôle utilise Windows PowerShel
 Ne jamais modifier JARVIS.cmd à la main : l'empreinte ne correspondrait plus.
 
 v3.25 (audit, constat T7) : chaque contrôle arrête la fabrication par refuse(), jamais par « assert »,
-que « python -O » désactive ; PSScriptAnalyzer est exigé comme sur GitHub (copie locale dans .modules\).
+que « python -O » désactive ; PSScriptAnalyzer est exigé comme sur GitHub (copie locale dans le dossier .modules).
 """
 import hashlib, os, re, subprocess, sys
 ROOT = os.path.dirname(os.path.abspath(__file__))

@@ -29,6 +29,13 @@ def stop(message):
     sys.exit('PUBLICATION REFUSÉE.')
 
 
+def stop_published(tag, message):
+    # Après « gh release create », la version est en ligne et immuable : ne jamais dire « refusée » (relecture du lot D)
+    print('[FAIL] ' + message)
+    sys.exit('VERSION %s PUBLIÉE, MAIS VÉRIFICATION INCOMPLÈTE : ne rien republier, relancer '
+             '« python -X utf8 tools/publier.py --verifier %s » dans quelques minutes.' % (tag, tag))
+
+
 def ok(message):
     print('[ OK ] ' + message)
 
@@ -49,6 +56,20 @@ def run(cmd, binary=False, check=True):
     return r.stdout if binary else r.stdout.decode('utf-8', 'replace').strip()
 
 
+def try_run(cmd, tries=1, wait=15):
+    """Commande qui peut échouer un moment (attestation de GitHub pas encore prête) : message d'erreur ou None."""
+    import time
+    msg = None
+    for i in range(tries):
+        r = subprocess.run(cmd, cwd=ROOT, capture_output=True)
+        if r.returncode == 0:
+            return None
+        msg = '%s : code %d, %s' % (' '.join(cmd[1:4]), r.returncode, r.stderr.decode('utf-8', 'replace').strip()[:300])
+        if i + 1 < tries:
+            time.sleep(wait)
+    return msg
+
+
 def git(*args, **kw):
     return run(['git'] + list(args), **kw)
 
@@ -66,7 +87,8 @@ def file_facts(data):
     m = re.search(rb'rem JARVIS-SHA256=([0-9a-f]{64})', data[:e])
     if not m or m.group(1).decode() != h:
         return None, 'empreinte de l\'en-tête différente du contenu'
-    v = re.search(rb"\$JarvisVersion = '([0-9.]+)'", data)
+    # Ancrée en début de ligne, comme dans tools/check.ps1 : un commentaire qui cite la ligne ne compte pas
+    v = re.search(rb"(?m)^\$JarvisVersion = '([0-9.]+)'", data)
     if not v:
         return None, '$JarvisVersion introuvable'
     if not (1000 < len(data) < 5 * 1024 * 1024):
@@ -84,7 +106,7 @@ def check_runs(sha, required):
             last[n] = c
     missing = [n for n in required if n not in last]
     if missing:
-        return 'contrôle(s) GitHub absent(s) sur %s : %s' % (sha[:10], ', '.join(missing))
+        return 'ABSENT:contrôle(s) GitHub absent(s) sur %s : %s' % (sha[:10], ', '.join(missing))
     bad = ['%s (%s/%s)' % (n, last[n].get('status'), last[n].get('conclusion')) for n in required
            if last[n].get('status') != 'completed' or last[n].get('conclusion') != 'success']
     if bad:
@@ -116,14 +138,19 @@ def verify_release(tag):
     ok('empreinte interne conforme, version %s' % v)
     err = check_runs(sha, ('controle',))
     if err:
-        stop(err)
+        stop(err.replace('ABSENT:', ''))
     ok('contrôle GitHub « controle » réussi sur ce commit')
-    if check_runs(sha, ('scan',)):
-        print('[INFO] pas de scan d\'essai GitHub sur ce commit (ajouté en v3.25)')
-    else:
+    err = check_runs(sha, ('scan',))
+    if err is None:
         ok('scan d\'essai GitHub réussi sur ce commit')
-    gh('release', 'verify', tag, '-R', REPO)
-    gh('release', 'verify-asset', tag, os.path.join(tmp, 'JARVIS.cmd'), '-R', REPO)
+    elif err.startswith('ABSENT:') and vkey(v) < (3, 25):
+        print('[INFO] pas de scan d\'essai GitHub sur ce commit (il existe depuis la v3.25)')
+    else:
+        stop(err.replace('ABSENT:', ''))
+    err = try_run([gh_path(), 'release', 'verify', tag, '-R', REPO]) or \
+        try_run([gh_path(), 'release', 'verify-asset', tag, os.path.join(tmp, 'JARVIS.cmd'), '-R', REPO])
+    if err:
+        stop(err)
     ok('gh release verify et verify-asset : version immuable, fichier attesté par GitHub')
     print('VERSION PUBLIÉE CONFORME.')
 
@@ -152,7 +179,7 @@ def publish(tag, notes, really):
 
     err = check_runs(sha, REQUIRED)
     if err:
-        stop(err)
+        stop(err.replace('ABSENT:', ''))
     ok('contrôles GitHub réussis sur ce commit : %s' % ', '.join(REQUIRED))
 
     blob = git('cat-file', 'blob', sha + ':JARVIS.cmd', binary=True)
@@ -186,13 +213,18 @@ def publish(tag, notes, really):
         stop('origin/main a changé pendant les contrôles : relance')
     gh(*cmd)
     ok('version %s créée sur GitHub' % tag)
+    # À partir d'ici la version est publiée : un échec ne se dit plus « refusée » (stop_published)
     back = tempfile.mkdtemp(prefix='jarvis-relu-')
-    gh('release', 'download', tag, '-R', REPO, '-p', 'JARVIS.cmd', '-D', back)
+    err = try_run([gh_path(), 'release', 'download', tag, '-R', REPO, '-p', 'JARVIS.cmd', '-D', back], tries=3)
+    if err:
+        stop_published(tag, 'relecture du fichier sur GitHub impossible : ' + err)
     if open(os.path.join(back, 'JARVIS.cmd'), 'rb').read() != blob:
-        stop('fichier relu sur GitHub différent du fichier envoyé : version immuable, à corriger par une nouvelle version')
+        stop_published(tag, 'fichier relu sur GitHub différent du fichier envoyé : à corriger par une nouvelle version')
     ok('fichier relu sur GitHub = fichier du commit')
-    gh('release', 'verify', tag, '-R', REPO)
-    gh('release', 'verify-asset', tag, asset, '-R', REPO)
+    err = try_run([gh_path(), 'release', 'verify', tag, '-R', REPO], tries=4) or \
+        try_run([gh_path(), 'release', 'verify-asset', tag, asset, '-R', REPO], tries=4)
+    if err:
+        stop_published(tag, err)
     ok('gh release verify et verify-asset réussis')
     print('PUBLIÉE : https://github.com/%s/releases/tag/%s' % (REPO, tag))
 

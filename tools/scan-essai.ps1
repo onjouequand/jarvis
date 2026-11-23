@@ -10,15 +10,19 @@ scan) et refuse le résultat à la moindre erreur PowerShell. Lancé par GitHub 
                de l'entrée : chaque question suivante reçoit une annulation, qui vaut « non » (règle 4). Refusé hors de
                GitHub : sur un PC où J.A.R.V.I.S. est installé, le premier menu est un autre et « 2 » y veut dire
                « Réinstaller ».
--Mode source : tout PC. Copie de la source avec un autre nom de verrou (règle 25), lancée par -File, sans aucune
-               réponse ; rapports et préférences dans le dossier d'essai (LOCALAPPDATA et APPDATA redirigés), jamais
-               dans ceux du compte. Ne montre pas les erreurs propres au lancement par JARVIS.cmd (règle 29).
+-Mode source : tout PC. Copie de la source (ou de -Source) avec un autre nom de verrou (règle 25), lancée par -File,
+               dans sa propre fenêtre cachée, sans aucune réponse ; rapports et préférences dans le dossier d'essai
+               (LOCALAPPDATA et APPDATA redirigés), jamais dans ceux du compte. Ne montre pas les erreurs propres au
+               lancement par JARVIS.cmd (règle 29).
+Entrée redirigée : le programme n'avale plus ses propres erreurs (v3.25, $ErrorActionPreference = 'Continue'), qui
+arrivent sur la sortie d'erreur et font échouer l'essai.
 Aucune action n'est lancée : toutes les questions de fin de scan ont « non » pour réponse par défaut ou reçoivent une
 annulation, et le script vérifie qu'aucune n'a tourné. Code de sortie : 0 si tout est conforme, 1 sinon.
 #>
 param(
     [ValidateSet('cmd', 'source')] [string]$Mode = 'source',
     [string]$OutDir,
+    [string]$Source,
     [int]$TimeoutMin = 25
 )
 
@@ -33,14 +37,16 @@ function Add-Fail([string]$Message) { $Fails.Add($Message); Write-Host ('  [FAIL
 function Add-Pass([string]$Message) { Write-Host ('  [ OK ] ' + $Message) -ForegroundColor Green }
 
 $regKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\JARVIS'
+# Get-InstalledJarvis reconnaît une installation par la clé de registre ou par ce marqueur
+$marker = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'JARVIS\.jarvis-install'
 $envOver = @{}
 if ($Mode -eq 'cmd') {
     if ($env:GITHUB_ACTIONS -ne 'true') {
         Write-Host 'Mode cmd réservé à GitHub : sur ce PC, utilise -Mode source.' -ForegroundColor Red
         exit 1
     }
-    if (Test-Path -LiteralPath $regKey) {
-        Write-Host 'J.A.R.V.I.S. est inscrit comme installé sur cette machine : la réponse « 2 » y voudrait dire « Réinstaller ».' -ForegroundColor Red
+    if ((Test-Path -LiteralPath $regKey) -or (Test-Path -LiteralPath $marker)) {
+        Write-Host 'J.A.R.V.I.S. est installé sur cette machine : la réponse « 2 » y voudrait dire autre chose que « Lancer sans installer ».' -ForegroundColor Red
         exit 1
     }
     $file = Join-Path $System 'cmd.exe'
@@ -50,7 +56,8 @@ if ($Mode -eq 'cmd') {
     $reportDirs = @((Join-Path $env:LOCALAPPDATA 'JARVIS\Rapports'), (Join-Path $env:TEMP 'JARVIS'))
 } else {
     # Copie avec un autre verrou : une fenêtre J.A.R.V.I.S. ouverte sur ce PC ne bloque pas l'essai, et inversement
-    $src = [IO.File]::ReadAllText((Join-Path $Root 'src\jarvis-checkup.ps1'))
+    if (-not $Source) { $Source = Join-Path $Root 'src\jarvis-checkup.ps1' }
+    $src = [IO.File]::ReadAllText($Source)
     $n = ([regex]::Matches($src, [regex]::Escape("'Local\JARVIS_CheckUp'"))).Count
     if ($n -lt 1) { Write-Host 'Nom du verrou introuvable dans la source.' -ForegroundColor Red; exit 1 }
     $copy = Join-Path $OutDir 'jarvis-essai.ps1'
@@ -78,6 +85,10 @@ $psi.RedirectStandardError = $true
 $psi.StandardOutputEncoding = New-Object Text.UTF8Encoding $false
 $psi.StandardErrorEncoding = New-Object Text.UTF8Encoding $false
 foreach ($k in $envOver.Keys) { $psi.EnvironmentVariables[$k] = $envOver[$k] }
+# Variables d'un éventuel J.A.R.V.I.S. parent : en mode source, JARVIS_SELF ferait croire à un lancement par JARVIS.cmd
+foreach ($k in @('JARVIS_SELF', 'JARVIS_ARGS', 'JARVIS_RC')) { $psi.EnvironmentVariables.Remove($k) }
+# Mode source : fenêtre à part, pour que Clear-Host et l'agrandissement de la console ne touchent pas celle de l'appelant
+if ($Mode -eq 'source') { $psi.CreateNoWindow = $true }
 $p = [Diagnostics.Process]::Start($psi)
 $outTask = $p.StandardOutput.ReadToEndAsync()
 $errTask = $p.StandardError.ReadToEndAsync()
@@ -88,8 +99,11 @@ if ($timedOut) {
     & (Join-Path $System 'taskkill.exe') /T /F /PID $p.Id | Out-Null
     $null = $p.WaitForExit(30000)
 }
-$out = $outTask.Result
-$err = $errTask.Result
+# Un programme lancé par le scan peut garder la sortie ouverte après la fin de J.A.R.V.I.S. : attente bornée
+$flowsDone = $outTask.Wait(60000) -and $errTask.Wait(60000)
+$out = ''; $err = ''
+if ($outTask.IsCompleted) { $out = $outTask.Result }
+if ($errTask.IsCompleted) { $err = $errTask.Result }
 $code = $null
 if (-not $timedOut) { $code = $p.ExitCode }
 $elapsed = (Get-Date) - $start
@@ -98,6 +112,7 @@ $elapsed = (Get-Date) - $start
 
 Write-Host ''
 Write-Host ('Résultat ({0:N0} s)' -f $elapsed.TotalSeconds) -ForegroundColor White
+if (-not $flowsDone) { Add-Fail 'sorties du scan encore ouvertes 60 s après sa fin (programme lancé resté ouvert ?)' }
 if ($timedOut) { Add-Fail ("scan arrêté au bout de {0} min" -f $TimeoutMin) }
 elseif ($code -ne 0) { Add-Fail ('code de sortie ' + $code) }
 else { Add-Pass 'code de sortie 0' }
@@ -168,7 +183,7 @@ if (-not $rep) {
     if ($adm.Count -gt 0 -and $adm[0] -match 'Admin : (\S+)') { Write-Host ('  [INFO] droits administrateur pendant l''essai : ' + $Matches[1]) -ForegroundColor Cyan }
 }
 if ($Mode -eq 'cmd') {
-    if (Test-Path -LiteralPath $regKey) { Add-Fail 'J.A.R.V.I.S. a été installé pendant l''essai' }
+    if ((Test-Path -LiteralPath $regKey) -or (Test-Path -LiteralPath $marker)) { Add-Fail 'J.A.R.V.I.S. a été installé pendant l''essai' }
     else { Add-Pass 'rien d''installé' }
 }
 

@@ -183,12 +183,16 @@ else { foreach ($c in $iex) { Add-Fail ("ligne {0} : Invoke-Expression interdit"
 
 # Suppressions par Remove-Item et ses alias : liste blanche par fonction (règles 6 et 18). v3.25 (constat T8) : les alias
 # (rm, del...) et l'option abrégée (-r, -rec : PowerShell accepte tout début non ambigu de -Recurse) étaient invisibles.
-$removeNames = @('Remove-Item', 'Microsoft.PowerShell.Management\Remove-Item', 'rm', 'del', 'erase', 'rd', 'rmdir', 'ri', 'Clear-RecycleBin')
+# Relecture du lot D : Remove-CimInstance et Remove-WmiObject (instances WMI : points de restauration, clichés...) ;
+# options passées par « @variable » (splatting) comptées comme récursives, faute de pouvoir les lire.
+$removeNames = @('Remove-Item', 'Microsoft.PowerShell.Management\Remove-Item', 'rm', 'del', 'erase', 'rd', 'rmdir', 'ri', 'Clear-RecycleBin',
+                 'Remove-CimInstance', 'Remove-WmiObject')
 $removes = @($commands | Where-Object { $removeNames -contains [string]$_.GetCommandName() })
 $recurse = @($removes | Where-Object {
     @($_.CommandElements | Where-Object {
-        $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName.Length -ge 1 -and
-        'Recurse'.StartsWith($_.ParameterName, [StringComparison]::OrdinalIgnoreCase)
+        ($_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName.Length -ge 1 -and
+         'Recurse'.StartsWith($_.ParameterName, [StringComparison]::OrdinalIgnoreCase)) -or
+        ($_ -is [System.Management.Automation.Language.VariableExpressionAst] -and $_.Splatted)
     }).Count -gt 0
 })
 $removeOk = $true
@@ -229,7 +233,17 @@ $lowDel = @($ast.FindAll({
     # Scripting.FileSystemObject, DeleteSubKeyTree du registre, FileSystem.DeleteDirectory de VisualBasic)
     return ($m -match '^(Delete\w*|SHEmptyRecycleBin)$')
 }, $true))
-$lowDel += @($commands | Where-Object { [string]$_.GetCommandName() -eq 'Invoke-CimMethod' -and $_.Extent.Text -match '-MethodName\s+[''"]?Delete\b' })
+# Nom de méthode Delete... passé en argument : Invoke-CimMethod -MethodName Delete (ou -MethodName:Delete),
+# ForEach-Object Delete, .ForEach('Delete'). Un 'Delete' comparé (-contains 'Delete') n'est pas une suppression.
+$lowDel += @($ast.FindAll({
+    param($n)
+    if (-not ($n -is [System.Management.Automation.Language.StringConstantExpressionAst]) -or $n.Value -notmatch '^Delete\w*$') { return $false }
+    $pa = $n.Parent
+    if ($pa -is [System.Management.Automation.Language.CommandParameterAst]) { return $true }
+    if ($pa -is [System.Management.Automation.Language.CommandAst]) { return ($pa.CommandElements.IndexOf($n) -ge 1) }
+    if ($pa -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) { return ([string]$pa.Member.Extent.Text -match '^(ForEach|Where)$') }
+    return $false
+}, $true))
 $lowOk = $true
 foreach ($g in ($lowDel | Group-Object { Get-OuterFunction $_ })) {
     $allowed = 0
@@ -248,6 +262,14 @@ $cmdDel = @($ast.FindAll({
     param($n)
     ($n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or
      $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) -and [string]$n.Value -match $cmdDelRx
+}, $true))
+# Relecture du lot D : la commande en argument isolé (& $cmd /c rd /s /q $p, -ArgumentList '/c','rd','/s')
+$cmdDel += @($ast.FindAll({
+    param($n)
+    if (-not ($n -is [System.Management.Automation.Language.StringConstantExpressionAst]) -or $n.Value -notmatch '^(?i)(del|erase|rd|rmdir)$') { return $false }
+    $pa = $n.Parent
+    if ($pa -is [System.Management.Automation.Language.CommandAst]) { return ($pa.CommandElements.IndexOf($n) -ge 1) }
+    return ($pa -is [System.Management.Automation.Language.ArrayLiteralAst] -or $pa -is [System.Management.Automation.Language.CommandParameterAst])
 }, $true))
 $cmdOk = $true
 foreach ($g in ($cmdDel | Group-Object { Get-OuterFunction $_ })) {

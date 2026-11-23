@@ -237,7 +237,11 @@ $StartLnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'JARVIS.lnk'
 $DeskLnk  = Join-Path ([Environment]::GetFolderPath('Desktop')) 'JARVIS.lnk'
 
 $ErrorActionPreference = 'SilentlyContinue'
-# Lancé par JARVIS.cmd (ScriptBlock), la ligne ci-dessus n'atteint pas les commandes de Windows écrites en
+# v3.25 (relecture du lot D) : entrée redirigée (scan d'essai de GitHub, banc d'essai), les erreurs du programme lui-même
+# ne sont plus masquées : un essai qui en rencontre échoue (tools/scan-essai.ps1 refuse toute sortie d'erreur). Une
+# erreur rattrapée par try/catch reste silencieuse ; les commandes de Windows gardent le réglage ci-dessous.
+try { if ([Console]::IsInputRedirected) { $ErrorActionPreference = 'Continue' } } catch { $null = $_ }
+# Lancé par JARVIS.cmd (ScriptBlock), la ligne SilentlyContinue ci-dessus n'atteint pas les commandes de Windows écrites en
 # modules CIM (Get-PnpDevice, Get-NetRoute, Get-MpComputerStatus...) : leurs erreurs s'affichaient en rouge
 # (PC sans Bluetooth, capture du 19/11/2026 ; reproduit avec JARVIS.cmd, pas avec -File). Réglage par défaut
 # de chaque commande ; un -ErrorAction écrit dans l'appel (Stop, pour un OK) reste prioritaire.
@@ -6149,8 +6153,9 @@ function Invoke-SelfTestAnalyzers {
         $bad = @($env:SystemRoot, [Environment]::GetFolderPath('Windows'), [Environment]::GetFolderPath('Desktop'),
                  (Join-Path $env:USERPROFILE 'Downloads'), 'dossier\relatif', 'C:\Program Files\JA?RVIS', '\\serveur\partage\JARVIS', '')
         foreach ($p in $bad) { Assert-True (-not (Resolve-InstallDir $p).Ok) ('accepté à tort : ' + $p) }
-        # Dossier proposé par défaut (Program Files demandé à Windows, comme $DefaultInstallDir) : \JARVIS ajouté
-        $pf = Get-ProgramFilesDir
+        # Dossier choisi sous Program Files (demandé à Windows, comme $DefaultInstallDir) : \JARVIS ajouté. Dossier qui
+        # n'existe pas : le résultat ne dépend pas du contenu d'une installation présente sur le PC (relecture du lot D)
+        $pf = Join-Path (Get-ProgramFilesDir) ('Essai JARVIS ' + [guid]::NewGuid().ToString('N').Substring(0, 8))
         $ok = Resolve-InstallDir $pf
         Assert-True ($ok.Ok -and $ok.Path -eq (Join-Path $pf 'JARVIS')) ('Program Files mal traité : ' + $ok.Path + ' ' + $ok.Reason)
         '{0} refus, \JARVIS ajouté automatiquement' -f $bad.Count
