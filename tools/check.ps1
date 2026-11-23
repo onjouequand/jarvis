@@ -29,7 +29,7 @@ $Settings = Join-Path $Root 'PSScriptAnalyzerSettings.psd1'
 # Plafonds : ils ne peuvent que BAISSER. Chaque valeur est le nombre de cas connus et justifiés.
 # ------------------------------------------------------------------
 # Blocs « catch {} » vides (échec ignoré en silence).
-$MaxEmptyCatch = 25
+$MaxEmptyCatch = 24
 # Outils système appelés par leur seul nom (recherche dans le PATH) : plus aucun depuis la v3.13,
 # tous passent par Get-SystemToolPath.
 $MaxBareTools = 0
@@ -42,7 +42,7 @@ $RecurseAllowed = @{ 'Uninstall-Jarvis' = 1 }
 $LowDeleteAllowed = @{ 'Remove-TempCandidates' = 2; 'Remove-EmptyDir' = 1; 'Remove-TreeNoJunction' = 1; 'Clear-CleanTarget' = 1;
                        'Clear-RecycleBinChecked' = 1; 'Clear-DoCache' = 1; 'Invoke-SelfTest' = 5 }
 # Nombre minimal de tests T1 attendus (garde-fou contre un lot de tests vidé par erreur).
-$MinT1 = 65
+$MinT1 = 76
 
 $script:Fails = New-Object System.Collections.Generic.List[string]
 function Add-Fail([string]$Message) {
@@ -210,7 +210,24 @@ if ($lowOk) { Add-Pass ("suppressions de bas niveau : {0}, toutes sur liste blan
 
 # Outils système appelés par leur seul nom : un programme du même nom placé dans le PATH serait lancé en admin
 $bare = @($commands | Where-Object {
-    [string]$_.GetCommandName() -match '^(dism|sfc|chkdsk|shutdown|powercfg|bcdedit|reg|netsh|wevtutil|cleanmgr|cmd|powershell)(\.exe)?$'
+    [string]$_.GetCommandName() -match '^(dism|sfc|chkdsk|shutdown|powercfg|bcdedit|reg|netsh|wevtutil|cleanmgr|cmd|powershell|winget|explorer|timeout|notepad|UsoClient)(\.exe)?$'
+})
+# Start-Process sur un nom de programme sans chemin (v3.24 : explorer.exe, powershell.exe) ; une adresse ms-settings: passe
+$bare += @($commands | Where-Object {
+    $cn = [string]$_.GetCommandName()
+    if ($cn -ne 'Start-Process') { return $false }
+    $els = @($_.CommandElements)
+    $fp = $null
+    for ($k = 1; $k -lt $els.Count; $k++) {
+        if ($els[$k] -is [System.Management.Automation.Language.CommandParameterAst]) {
+            if ($els[$k].ParameterName -like 'F*' -and $k + 1 -lt $els.Count) { $fp = $els[$k + 1] }
+            if ($els[$k].ParameterName -notmatch '^(NoNewWindow|PassThru|Wait|UseNewEnvironment)$') { $k++ }
+            continue
+        }
+        if (-not $fp) { $fp = $els[$k] }
+        break
+    }
+    return ($fp -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $fp.Value -match '^[\w.\-]+$')
 })
 $bareWhere = ($bare | ForEach-Object { '{0} l.{1}' -f $_.GetCommandName(), $_.Extent.StartLineNumber }) -join ', '
 if ($bare.Count -gt $MaxBareTools) {
@@ -221,6 +238,48 @@ if ($bare.Count -gt $MaxBareTools) {
     Add-Pass 'outils système tous appelés par chemin complet'
 } else {
     Add-Note ("outils système sans chemin : {0} connus, à corriger ({1})" -f $bare.Count, $bareWhere)
+}
+
+# Options : le bloc param et les listes lues par ConvertFrom-JarvisArgLine doivent être identiques (v3.24). Une option
+# ajoutée au bloc param mais oubliée dans la liste serait refusée au lancement par JARVIS.cmd.
+$pSw = @(); $pStr = @()
+if ($ast.ParamBlock) {
+    foreach ($pp in $ast.ParamBlock.Parameters) {
+        if (@($pp.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.TypeConstraintAst] -and $_.TypeName.Name -eq 'switch' }).Count -gt 0) { $pSw += $pp.Name.VariablePath.UserPath }
+        else { $pStr += $pp.Name.VariablePath.UserPath }
+    }
+}
+$lSw = @(); $lStr = @()
+foreach ($st in $ast.EndBlock.Statements) {
+    if ($st -isnot [System.Management.Automation.Language.AssignmentStatementAst]) { continue }
+    $vals = @($st.Right.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { $_.Value })
+    if ($st.Left.Extent.Text -eq '$JarvisSwitchArgs') { $lSw = $vals }
+    if ($st.Left.Extent.Text -eq '$JarvisStringArgs') { $lStr = $vals }
+}
+if ($pSw.Count -gt 0 -and (($pSw | Sort-Object) -join ',') -eq (($lSw | Sort-Object) -join ',') -and (($pStr | Sort-Object) -join ',') -eq (($lStr | Sort-Object) -join ',')) {
+    Add-Pass ('options : bloc param = listes de ConvertFrom-JarvisArgLine ({0} options)' -f ($pSw.Count + $pStr.Count))
+} else {
+    Add-Fail ('options : bloc param ({0} | {1}) différent de $JarvisSwitchArgs / $JarvisStringArgs ({2} | {3})' -f ($pSw -join ','), ($pStr -join ','), ($lSw -join ','), ($lStr -join ','))
+}
+
+# Aucune commande d'un module avant la réduction des dossiers de modules (v3.24, S2) : PowerShell irait chercher ce
+# module dans l'ancienne liste, dossier Documents en tête (un faux Microsoft.PowerShell.Utility fournissant New-Object
+# y était chargé, vérifié le 23/11/2026). Seules les commandes du noyau et les fonctions de JARVIS sont admises.
+$trim = @($ast.EndBlock.Statements | Where-Object {
+    $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and $_.Left.Extent.Text -eq '$env:PSModulePath'
+})
+# Fonctions de premier niveau définies AVANT la ligne (une fonction définie plus loin n'existe pas encore)
+$ownFunctions = @($ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $trim.Count -eq 1 -and $_.Extent.EndOffset -lt $trim[0].Extent.StartOffset } | ForEach-Object { $_.Name })
+$coreOk = @('Where-Object', 'ForEach-Object')
+if ($trim.Count -ne 1) {
+    Add-Fail ("réduction des dossiers de modules : 1 ligne « `$env:PSModulePath = » attendue au premier niveau, {0} trouvée(s)" -f $trim.Count)
+} else {
+    $early = @($commands | Where-Object {
+        $_.Extent.StartOffset -lt $trim[0].Extent.EndOffset -and
+        $coreOk -notcontains [string]$_.GetCommandName() -and $ownFunctions -notcontains [string]$_.GetCommandName()
+    })
+    if ($early.Count -eq 0) { Add-Pass ('aucune commande de module avant la réduction des dossiers de modules (ligne {0})' -f $trim[0].Extent.StartLineNumber) }
+    else { foreach ($c in $early) { Add-Fail ("ligne {0} : {1} avant la réduction des dossiers de modules (ligne {2})" -f $c.Extent.StartLineNumber, $c.GetCommandName(), $trim[0].Extent.StartLineNumber) } }
 }
 
 # Blocs catch vides

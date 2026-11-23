@@ -1,18 +1,18 @@
 <# : JARVIS.cmd. Ne pas modifier ce texte
 @echo off
-rem JARVIS-SHA256=280c556502c0b7016e0340cfa373b50dc62c1514a24742f0a72938aa6aeb972f
+rem JARVIS-SHA256=f1b801fdd9a05869d7974b2682f5bc6175798b3e6f0a8d2c618cf198e35c450c
 setlocal
 "%SystemRoot%\System32\chcp.com" 65001 >nul
 set "JARVIS_SELF=%~f0"
 set "JARVIS_ARGS=%*"
-"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -Command "if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { Write-Host 'PowerShell est en mode restreint sur ce PC (Controle intelligent des applications ou strategie d entreprise) : JARVIS ne peut pas fonctionner ici.' -ForegroundColor Red; exit 4 }; $t = [IO.File]::ReadAllText($env:JARVIS_SELF); $e = $t.IndexOf([string][char]10 + '#' + '>'); $b = $t.Substring($e + 3); $h = -join ([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($b)) | %% { $_.ToString('x2') }); if ($e -lt 0 -or $t -notmatch ('JARVIS-SHA256=' + $h)) { Write-Host 'JARVIS.cmd est modifie ou incomplet : telecharge-le a nouveau.' -ForegroundColor Red; exit 3 }; $sb = [ScriptBlock]::Create($t); Invoke-Expression ('& $sb ' + $env:JARVIS_ARGS)"
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -Command "if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { Write-Host 'PowerShell est en mode restreint sur ce PC (Controle intelligent des applications ou strategie d entreprise) : JARVIS ne peut pas fonctionner ici.' -ForegroundColor Red; exit 4 }; $t = [IO.File]::ReadAllText($env:JARVIS_SELF); $e = $t.IndexOf([string][char]10 + '#' + '>'); $b = $t.Substring($e + 3); $h = -join ([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($b)) | %% { $_.ToString('x2') }); if ($e -lt 0 -or $t -notmatch ('JARVIS-SHA256=' + $h)) { Write-Host 'JARVIS.cmd est modifie ou incomplet : telecharge-le a nouveau.' -ForegroundColor Red; exit 3 }; $sb = [ScriptBlock]::Create($t); & $sb # options lues par JARVIS, sans execution"
 set "JARVIS_RC=%errorlevel%"
 if "%JARVIS_RC%"=="3" pause
 if "%JARVIS_RC%"=="4" pause
 exit /b %JARVIS_RC%
 #>
 <#
-    J.A.R.V.I.S. // Check-up système v3.23
+    J.A.R.V.I.S. // Check-up système v3.24
     -----------------------------------------------------------------
     Modules :
       [01] Système        : version Windows, uptime, redémarrage en attente
@@ -108,9 +108,122 @@ param(
 )
 
 # ------------------------------------------------------------------
+# Démarrage sûr (v3.24, audit du 23/11/2026, constats S1 et S2)
+# Ce bloc passe avant toute commande qui charge un module : seulement du .NET et le langage.
+# ------------------------------------------------------------------
+# Noms des options du bloc param ci-dessus : tools\check.ps1 vérifie que les deux listes sont identiques
+$JarvisSwitchArgs = @('Quick', 'Deep', 'NoAnim', 'NoWinget', 'NoElevate', 'ResetName', 'ResetChoices', 'Ascii',
+                      'SelfTest', 'Install', 'Uninstall', 'Update')
+$JarvisStringArgs = @('InstallDir', 'Name', 'WinRect')
+
+function Get-ProgramFilesDir {
+    # « Program Files » 64 bits, demandé à Windows (jamais $env:ProgramW6432, qu'un programme du compte peut redéfinir,
+    # constat S3) ; console 32 bits : lu dans le registre en vue 64 bits. Seulement du .NET : appelée avant
+    # la réduction des dossiers de modules.
+    $p = $null
+    if ([Environment]::Is64BitProcess -or -not [Environment]::Is64BitOperatingSystem) { $p = [Environment]::GetFolderPath('ProgramFiles') }
+    else {
+        try {
+            $hk = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+            $p = [string]$hk.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion').GetValue('ProgramFilesDir')
+        } catch { $p = $null }
+    }
+    if (-not $p) { $p = $env:ProgramW6432 }
+    if (-not $p) { $p = $env:ProgramFiles }
+    return $p
+}
+
+function Get-SafeModulePath([string]$WinDir, [string[]]$ProgramFiles) {
+    # Dossiers de modules PowerShell gardés : seulement ceux installés avec Windows PowerShell, que seul un
+    # administrateur peut modifier : <Program Files>\WindowsPowerShell\Modules (64 et 32 bits) et
+    # <Windows>\System32\WindowsPowerShell\v1.0\Modules. Tout le reste est retiré : le dossier Documents, ajouté d'office
+    # par PowerShell, où un programme du compte pouvait poser un module du même nom qu'un module de Windows (même
+    # Microsoft.PowerShell.Utility, qui fournit New-Object : vérifié le 23/11/2026), et tout autre dossier, car le compte
+    # peut redéfinir PSModulePath (HKCU\Environment) et certains dossiers sous Windows lui sont ouverts en écriture
+    # (C:\Windows\tracing, vérifié le 23/11/2026). Seulement du langage, aucune commande de module. Fonction pure, T1.
+    $keep = [System.Collections.Generic.List[string]]::new()
+    foreach ($d in @($ProgramFiles)) {
+        if (-not $d) { continue }
+        $m = ([string]$d).TrimEnd('\') + '\WindowsPowerShell\Modules'
+        if (-not ($keep -contains $m)) { $keep.Add($m) }
+    }
+    if ($WinDir) { $keep.Add(([string]$WinDir).TrimEnd('\') + '\System32\WindowsPowerShell\v1.0\Modules') }
+    return ($keep.ToArray() -join ';')
+}
+
+function ConvertFrom-JarvisArgLine {
+    # Options de JARVIS.cmd lues dans le texte brut transmis par l'en-tête (variable JARVIS_ARGS), sans jamais
+    # l'exécuter. Jusqu'à la v3.23, l'en-tête le passait à Invoke-Expression : « -InstallDir "C:\x$(commande)" »,
+    # retransmis entre guillemets à la relance en administrateur, y faisait exécuter la commande (constat S1).
+    # Mots séparés par des espaces ; "..." ou '...' gardent les espaces, le texte est pris tel quel. -Nom : nom exact,
+    # ou début sans ambiguïté comme PowerShell. Ok : tout est compris ; Values : nom -> valeur ; Bad : premier mot
+    # refusé (les options sont alors toutes ignorées). Fonction pure, T1.
+    param([string]$Line, [string[]]$Switches, [string[]]$Strings)
+    $r = [pscustomobject]@{ Ok = $false; Values = @{}; Bad = '' }
+    $words = [System.Collections.Generic.List[object]]::new()
+    $s = [string]$Line
+    $i = 0
+    while ($i -lt $s.Length) {
+        $c = [string]$s[$i]
+        if ($c -eq ' ' -or $c -eq "`t") { $i++; continue }
+        if ($c -eq '"' -or $c -eq "'") {
+            $end = $s.IndexOf($c, $i + 1)
+            if ($end -lt 0) { $r.Bad = $s.Substring($i); return $r }
+            $words.Add([pscustomobject]@{ Text = $s.Substring($i + 1, $end - $i - 1); Quoted = $true })
+            $i = $end + 1
+            if ($i -lt $s.Length -and [string]$s[$i] -ne ' ' -and [string]$s[$i] -ne "`t") { $r.Bad = $s.Substring($i); return $r }
+            continue
+        }
+        $end = $i
+        while ($end -lt $s.Length -and [string]$s[$end] -ne ' ' -and [string]$s[$end] -ne "`t") { $end++ }
+        $w = $s.Substring($i, $end - $i)
+        if ($w.IndexOf('"') -ge 0 -or $w.IndexOf("'") -ge 0) { $r.Bad = $w; return $r }
+        $words.Add([pscustomobject]@{ Text = $w; Quoted = $false })
+        $i = $end
+    }
+    $all = @($Switches) + @($Strings)
+    $k = 0
+    while ($k -lt $words.Count) {
+        $w = $words[$k]
+        if ($w.Quoted -or $w.Text -notmatch '^-[A-Za-z]+$') { $r.Bad = $w.Text; return $r }
+        $p = $w.Text.Substring(1)
+        $hit = @($all | Where-Object { $_ -eq $p })
+        if ($hit.Count -eq 0) { $hit = @($all | Where-Object { $_.StartsWith($p, [StringComparison]::OrdinalIgnoreCase) }) }
+        if ($hit.Count -ne 1 -or $r.Values.ContainsKey($hit[0])) { $r.Bad = $w.Text; return $r }
+        $n = $hit[0]
+        if ($Switches -contains $n) { $r.Values[$n] = $true; $k++; continue }
+        if ($k + 1 -ge $words.Count) { $r.Bad = $w.Text; return $r }
+        $v = $words[$k + 1]
+        if (-not $v.Quoted -and $v.Text -match '^-[A-Za-z]+$') { $r.Bad = $w.Text; return $r }
+        $r.Values[$n] = $v.Text
+        $k += 2
+    }
+    $r.Ok = $true
+    return $r
+}
+
+# Dossiers de modules réduits (constat S2), ici et dans chaque job (Invoke-Spinner) : PowerShell remet le dossier
+# Documents au démarrage de tout nouveau processus, job compris (vérifié le 23/11/2026). tools\check.ps1 refuse toute
+# commande d'un module avant cette ligne (elle chargerait ce module depuis l'ancienne liste).
+$SafeModulePath = [string](Get-SafeModulePath ([Environment]::GetFolderPath('Windows')) @((Get-ProgramFilesDir), [Environment]::GetFolderPath('ProgramFilesX86')))
+$env:PSModulePath = $SafeModulePath
+$script:JobInit = [ScriptBlock]::Create('$env:PSModulePath = ''' + $SafeModulePath.Replace("'", "''") + '''')
+
+# Lancé par JARVIS.cmd (ScriptBlock, $PSCommandPath vide) : l'en-tête ne transmet plus d'arguments, ils sont lus ici
+$script:ArgRefused = ''
+if (-not $PSCommandPath -and $env:JARVIS_SELF -and $env:JARVIS_ARGS) {
+    $ja = ConvertFrom-JarvisArgLine $env:JARVIS_ARGS $JarvisSwitchArgs $JarvisStringArgs
+    if ($ja.Ok) {
+        foreach ($an in $ja.Values.Keys) { $ExecutionContext.SessionState.PSVariable.Set($an, $ja.Values[$an]) }
+    } else {
+        $script:ArgRefused = $ja.Bad
+    }
+}
+
+# ------------------------------------------------------------------
 # Identité du programme et emplacement
 # ------------------------------------------------------------------
-$JarvisVersion = '3.23'
+$JarvisVersion = '3.24'
 $JarvisSelf = $env:JARVIS_SELF                     # défini par JARVIS.cmd
 if (-not $JarvisSelf) { $JarvisSelf = $PSCommandPath }  # lancement direct du .ps1
 $JarvisHome = $null
@@ -119,9 +232,13 @@ $JarvisInstalled = [bool]($JarvisHome -and (Test-Path -LiteralPath (Join-Path $J
 # L'utilisateur a déjà accepté l'avertissement « Éditeur inconnu » pour ce fichier : on retire la marque
 # « téléchargé depuis Internet » afin que la relance en administrateur ne pose pas la question une 2e fois.
 if ($JarvisSelf -like '*.cmd') { Unblock-File -LiteralPath $JarvisSelf -ErrorAction SilentlyContinue }
-$pf = $env:ProgramW6432
-if (-not $pf) { $pf = $env:ProgramFiles }
-$DefaultInstallDir = Join-Path $pf 'JARVIS'
+# Dossiers de Windows demandés à Windows, jamais lus dans les variables d'environnement (windir, ProgramW6432...) :
+# un programme du compte peut les redéfinir dans le profil, et JARVIS les utilisait en administrateur pour lancer
+# un outil, écrire la commande de désinstallation et choisir un dossier à nettoyer (v3.24, constat S3).
+$WinDir = [Environment]::GetFolderPath('Windows')
+if (-not $WinDir) { $WinDir = $env:windir }
+$SysDrive = $WinDir.Substring(0, 2)
+$DefaultInstallDir = Join-Path (Get-ProgramFilesDir) 'JARVIS'
 $ReportRoot = Join-Path $env:LOCALAPPDATA 'JARVIS\Rapports'
 $JarvisRepo = 'onjouequand/jarvis'                 # dépôt GitHub des versions publiées
 $JarvisReleasePage = 'https://github.com/' + $JarvisRepo + '/releases/latest'
@@ -206,6 +323,8 @@ $script:ScanDetected = $null    # défauts du magasin de composants vus par DISM
 $script:WUManual    = 0
 $script:WGItems     = @()
 $script:WGCount     = 0
+$script:WingetExe   = $null    # winget.exe par son chemin complet (Get-WingetPath), v3.24
+$script:WingetLookup = ''      # '' tant que non cherché, puis OK, ABSENT ou UNREADABLE
 $script:WGSkipIds   = @()      # applications que winget refuse de mettre à jour (exclues de la vérification)
 $script:CleanTargets = @()      # cibles du nettoyage mesurées par la section 11 (New-CleanTarget)
 $script:KeepSysDumps = $true     # vidages système gardés (écran bleu récent ou journal illisible)
@@ -250,7 +369,7 @@ function Show-Banner {
         foreach ($l in $plain) { Write-Host $l -ForegroundColor Cyan; Pause-Ms 70 }
         Write-Host ''
         Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-        Write-Host '      module check-up v3.23' -ForegroundColor DarkGray
+        Write-Host '      module check-up v3.24' -ForegroundColor DarkGray
         Write-Host ''
         return
     }
@@ -270,7 +389,7 @@ function Show-Banner {
     }
     Write-Host ''
     Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-    Write-Host '      module check-up v3.23' -ForegroundColor DarkGray
+    Write-Host '      module check-up v3.24' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -424,8 +543,11 @@ function Invoke-Spinner {
     )
     # Retour $null : $script:SpinState dit pourquoi, TIMEOUT (délai dépassé) ou STOPPED (arrêté à la demande)
     $script:SpinState = 'RUNNING'
-    if ($ArgumentList) { $job = Start-Job -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList }
-    else { $job = Start-Job -ScriptBlock $ScriptBlock }
+    # Dossiers de modules du programme repris dans le job (PowerShell y remet celui de Documents, constat S2)
+    $sj = @{ ScriptBlock = $ScriptBlock }
+    if ($script:JobInit) { $sj.InitializationScript = $script:JobInit }
+    if ($ArgumentList) { $sj.ArgumentList = $ArgumentList }
+    $job = Start-Job @sj
     $frames = @('|', '/', '-', '\')
     $blank = "`r" + (' ' * ($Label.Length + 30)) + "`r"
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -658,16 +780,37 @@ function Get-SafeName([string]$Text) {
     return $t
 }
 
+function Test-SafeArgValue([string]$Text) {
+    # Valeur qu'une relance peut retransmettre entre guillemets (dossier d'installation) : lettres, chiffres, espaces
+    # et \ : . _ - ( ) ' seulement. L'en-tête de JARVIS.cmd recopie les arguments par « set "JARVIS_ARGS=%*" » :
+    # un & ou un ^ y deviendrait une commande de cmd, lancée en administrateur après une relance (v3.24). T1.
+    if ([string]::IsNullOrEmpty($Text)) { return $false }
+    return ($Text -match '^[\p{L}\p{M}0-9 \\:._()''\-]+$')
+}
+
 function Test-SafeTempPath([string]$Path) {
     # N'accepte qu'un vrai dossier « Temp », jamais une racine ou un dossier système
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
     try { $full = [IO.Path]::GetFullPath($Path).TrimEnd('\') } catch { return $false }
     if ($full -match '^[A-Za-z]:$') { return $false }
     if ((Split-Path -Leaf $full) -ne 'Temp') { return $false }
+    # Variables d'environnement et dossiers demandés à Windows (une variable peut être redéfinie, v3.24)
     $forbidden = @($env:SystemDrive, $env:SystemRoot, $env:USERPROFILE, $env:ProgramFiles, ${env:ProgramFiles(x86)},
-                   $env:ProgramData, $env:LOCALAPPDATA, $env:APPDATA, $env:PUBLIC) |
+                   $env:ProgramData, $env:LOCALAPPDATA, $env:APPDATA, $env:PUBLIC,
+                   [Environment]::GetFolderPath('Windows'), [Environment]::GetFolderPath('ProgramFiles'),
+                   [Environment]::GetFolderPath('ProgramFilesX86'), [Environment]::GetFolderPath('CommonApplicationData'),
+                   [Environment]::GetFolderPath('UserProfile')) |
                  Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') }
     if ($forbidden -contains $full) { return $false }
+    # Sous Windows, Program Files ou ProgramData, seul Windows\Temp est accepté : %TEMP% est une variable du compte, qui
+    # pourrait désigner le dossier « Temp » d'un programme installé, vidé ensuite en administrateur (v3.24, relecture S3)
+    $win = [Environment]::GetFolderPath('Windows')
+    if ($full -ne (([string]$win).TrimEnd('\') + '\Temp')) {
+        foreach ($top in @($win, (Get-ProgramFilesDir), [Environment]::GetFolderPath('ProgramFiles'),
+                           [Environment]::GetFolderPath('ProgramFilesX86'), [Environment]::GetFolderPath('CommonApplicationData'))) {
+            if ($top -and $full.StartsWith(([string]$top).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { return $false }
+        }
+    }
     $item = Get-Item -LiteralPath $full -Force
     if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $false }
     return $true
@@ -1286,7 +1429,9 @@ function Resolve-InstallDir([string]$Dir) {
     if (-not $drv -or -not $drv.IsReady -or [string]$drv.DriveType -ne 'Fixed') { $r.Reason = 'disque local requis (pas de clé USB ni de lecteur réseau)'; return $r }
     $blocked = @(
         @{ P = $env:SystemRoot; N = 'dossier Windows' },
+        @{ P = [Environment]::GetFolderPath('Windows'); N = 'dossier Windows' },
         @{ P = $env:ProgramData; N = 'ProgramData' },
+        @{ P = [Environment]::GetFolderPath('CommonApplicationData'); N = 'ProgramData' },
         @{ P = [Environment]::GetFolderPath('Desktop'); N = 'Bureau' },
         @{ P = [Environment]::GetFolderPath('MyDocuments'); N = 'Documents' },
         @{ P = (Join-Path $env:USERPROFILE 'Downloads'); N = 'Téléchargements' },
@@ -1690,12 +1835,17 @@ function Test-JarvisIntegrity {
 
 function Confirm-DeepScan {
     # Conditions sûres pour SFC / DISM / CHKDSK
-    $bat = Get-CimInstance Win32_Battery | Select-Object -First 1
-    while ($bat -and $bat.BatteryStatus -in @(1, 4, 5)) {
+    $st = Get-PowerSource
+    while ($st -eq 'BATTERY') {
         Write-Host '   [!] PC sur batterie : une coupure pendant SFC ou DISM peut interrompre une réparation de Windows.' -ForegroundColor Yellow
         $a = Read-Answer '   >> Branche le chargeur puis appuie sur Entrée, ou tape R pour un scan rapide'
         if ($null -eq $a -or $a -match '^[rR]') { return $false }
-        $bat = Get-CimInstance Win32_Battery | Select-Object -First 1
+        $st = Get-PowerSource
+    }
+    if ($st -eq 'UNKNOWN') {
+        Write-Host '   [!] Impossible de savoir si le PC est sur secteur : une coupure pendant SFC ou DISM peut interrompre une réparation.' -ForegroundColor Yellow
+        Write-Host '       Sur un PC portable, branche le chargeur avant de continuer.' -ForegroundColor Yellow
+        if (-not (Read-YesNo '   >> Continuer le scan complet (chargeur branché, ou PC fixe) ?')) { return $false }
     }
     $reasons = @()
     $rebootPending = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
@@ -1773,10 +1923,42 @@ function Set-JarvisConfigValue([string]$Key, $Value) {
 # ------------------------------------------------------------------
 function Test-WingetModule { return [bool](Get-Module -ListAvailable -Name Microsoft.WinGet.Client) }
 
+function Get-WingetExeCandidates {
+    # Chemins possibles de winget.exe, le plus récent d'abord, tirés des paquets « Programme d'installation
+    # d'application » (Get-AppxPackage). Seulement le paquet de Microsoft installé sous <Program Files>\WindowsApps,
+    # que seul Windows peut modifier. Appelé par son nom, winget passait par le PATH et par l'alias du dossier
+    # %LOCALAPPDATA%\Microsoft\WindowsApps, que le compte peut remplacer (v3.24, constat S2). Fonction pure, T1.
+    param($Packages, [string]$ProgramFiles)
+    if (-not $ProgramFiles) { return @() }
+    $base = $ProgramFiles.TrimEnd('\') + '\WindowsApps\'
+    $ok = @(@($Packages) | Where-Object {
+        $null -ne $_ -and [string]$_.PackageFamilyName -eq 'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe' -and
+        ([string]$_.InstallLocation).StartsWith($base, [StringComparison]::OrdinalIgnoreCase) -and
+        ([string]$_.InstallLocation).IndexOf('..') -lt 0
+    })
+    $sorted = @($ok | Sort-Object { $v = $null; if ([version]::TryParse([string]$_.Version, [ref]$v)) { $v } else { [version]'0.0' } } -Descending)
+    return @($sorted | ForEach-Object { ([string]$_.InstallLocation).TrimEnd('\') + '\winget.exe' })
+}
+
+function Get-WingetPath {
+    # winget.exe par son chemin complet, lu une fois par session ; $null si introuvable.
+    # $script:WingetLookup : OK, ABSENT (aucun paquet) ou UNREADABLE (lecture des paquets en échec).
+    if ($script:WingetLookup) { return $script:WingetExe }
+    $script:WingetExe = $null
+    $pk = $null
+    try { $pk = @(Get-AppxPackage -Name 'Microsoft.DesktopAppInstaller' -ErrorAction Stop) }
+    catch { $script:WingetLookup = 'UNREADABLE'; return $null }
+    foreach ($c in (Get-WingetExeCandidates $pk (Get-ProgramFilesDir))) {
+        if (Test-Path -LiteralPath $c -PathType Leaf) { $script:WingetExe = $c; break }
+    }
+    if ($script:WingetExe) { $script:WingetLookup = 'OK' } else { $script:WingetLookup = 'ABSENT' }
+    return $script:WingetExe
+}
+
 function Test-ShowWingetOffer {
     if (-not $isAdmin) { return $false }
     if (Test-WingetModule) { return $false }
-    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { return $false }
+    if (-not (Get-WingetPath)) { return $false }
     $c = Get-JarvisConfig
     return ([string]$c['WingetModule'] -ne 'never')
 }
@@ -1885,13 +2067,44 @@ function Test-SkipWuUpdate {
     return $null
 }
 
+function Get-PowerVerdict {
+    # Alimentation : AC (secteur, ou PC sans batterie), BATTERY ou UNKNOWN. $Line : état du secteur lu par Windows
+    # (Online, Offline, Unknown ; vide = lecture en échec). $NoBattery : $true si Windows dit « aucune batterie »,
+    # $null si inconnu. Jusqu'à la v3.23, une batterie illisible valait « sur secteur » : DISM, SFC ou Windows Update
+    # pouvaient partir sur batterie sans avertissement (constat S7). Fonction pure, T1.
+    param([string]$Line, $NoBattery)
+    if ($Line -eq 'Online') { return 'AC' }
+    if ($Line -eq 'Offline') { return 'BATTERY' }
+    if ($NoBattery -is [bool] -and $NoBattery) { return 'AC' }
+    return 'UNKNOWN'
+}
+
+function Get-PowerSource {
+    # Lecture de Windows (GetSystemPowerStatus, par SystemInformation.PowerStatus), puis Get-PowerVerdict
+    $line = ''
+    $noBat = $null
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $ps = [System.Windows.Forms.SystemInformation]::PowerStatus
+        $line = [string]$ps.PowerLineStatus
+        $cs = [int]$ps.BatteryChargeStatus
+        if ($cs -ne 255) { $noBat = [bool]($cs -band 128) }
+    } catch { $line = '' }
+    return (Get-PowerVerdict $line $noBat)
+}
+
 function Wait-ACPower([string]$Reason) {
-    $bat = Get-CimInstance Win32_Battery | Select-Object -First 1
-    while ($bat -and $bat.BatteryStatus -in @(1, 4, 5)) {
+    $st = Get-PowerSource
+    while ($st -eq 'BATTERY') {
         Write-Host ('   [!] PC sur batterie : ' + $Reason) -ForegroundColor Yellow
         $a = Read-Answer '   >> Branche le chargeur puis appuie sur Entrée (Échap pour annuler)'
         if ($null -eq $a) { return $false }
-        $bat = Get-CimInstance Win32_Battery | Select-Object -First 1
+        $st = Get-PowerSource
+    }
+    if ($st -eq 'UNKNOWN') {
+        Write-Host ('   [!] Impossible de savoir si le PC est sur secteur : ' + $Reason) -ForegroundColor Yellow
+        Write-Host '       Sur un PC portable, branche le chargeur avant de continuer.' -ForegroundColor Yellow
+        return (Read-YesNo '   >> Continuer (chargeur branché, ou PC fixe) ?')
     }
     return $true
 }
@@ -2041,7 +2254,7 @@ function Open-WindowsUpdateGuided {
     # Lance la recherche en arrière-plan (sans effet si indisponible), puis ouvre la page avec un mode d'emploi.
     # ms-settings:windowsupdate-action n'est pas utilisé : sans effet sur Windows 11, et il peut redémarrer
     # immédiatement le PC si un redémarrage est en attente.
-    $uso = Join-Path $env:windir 'System32\UsoClient.exe'
+    $uso = Get-SystemToolPath 'UsoClient.exe'
     if (Test-Path -LiteralPath $uso) { Start-Process -FilePath $uso -ArgumentList 'StartInteractiveScan' -WindowStyle Hidden }
     Start-Process 'ms-settings:windowsupdate'
     # Le cache de Windows Update ne sera plus proposé pendant cette session : le vider arrête Windows Update
@@ -2117,7 +2330,7 @@ function New-JarvisShortcut([string]$Path, [string]$Target, [string]$WorkDir) {
     $sc = $ws.CreateShortcut($Path)
     $sc.TargetPath = $Target
     $sc.WorkingDirectory = $WorkDir
-    $sc.IconLocation = (Join-Path $env:windir 'System32\shell32.dll') + ',15'
+    $sc.IconLocation = (Join-Path $WinDir 'System32\shell32.dll') + ',15'
     $sc.Description = 'J.A.R.V.I.S. // Check-up système'
     $sc.Save()
     if (-not (Test-Path -LiteralPath $Path)) { throw 'raccourci non créé' }
@@ -2134,34 +2347,68 @@ function Start-DelayedDelete([string]$File, [string]$Dir) {
     Start-Process -FilePath (Get-SystemToolPath 'cmd.exe') -ArgumentList $line -WindowStyle Hidden
 }
 
+function Test-PlainFile([string]$Path) {
+    # Vrai fichier : ni dossier, ni jonction, ni lien. Remove-Item sur une jonction vers un dossier plein demande
+    # « l'élément a des enfants » et, sur un oui, descend dans la cible (PowerShell 5.1). v3.24, constat S6.
+    $at = $null
+    try { $at = [IO.File]::GetAttributes($Path) } catch { return $false }
+    return (-not ($at -band [IO.FileAttributes]::Directory) -and -not ($at -band [IO.FileAttributes]::ReparsePoint))
+}
+
+function Test-NoLinkUpward([string]$Path) {
+    # Vrai si ni $Path ni aucun dossier au-dessus, jusqu'à la racine du disque, n'est une jonction ou un lien.
+    # Chemin illisible ou absent : faux. Resolve-Path ne déplie pas une jonction (v3.24, constat S6).
+    $cur = $null
+    try { $cur = [IO.Path]::GetFullPath($Path) } catch { return $false }
+    while ($cur) {
+        $at = $null
+        try { $at = [IO.File]::GetAttributes($cur) } catch { return $false }
+        if ($at -band [IO.FileAttributes]::ReparsePoint) { return $false }
+        $cur = [IO.Path]::GetDirectoryName($cur)
+    }
+    return $true
+}
+
 function Invoke-LegacyCleanup([string]$NewCmd, [string[]]$ExtraDirs) {
     # Anciennes installations (avant v3.1, ou dossier précédent refusé depuis la v3.13) :
-    # rapports déplacés, fichiers JARVIS supprimés
-    $newDir = Split-Path -Parent $NewCmd
+    # rapports déplacés, fichiers JARVIS supprimés.
+    # v3.24 (constat S6) : C:\Outils peut être créé par n'importe quel compte. Un ancien dossier qui est, ou dont un
+    # dossier au-dessus est, une jonction mènerait ailleurs : il est laissé tel quel, contrôle refait avant chaque
+    # suppression. Réponse par défaut : non (règle 5).
+    $newFull = $null
+    try { $newFull = [IO.Path]::GetFullPath((Split-Path -Parent $NewCmd)).TrimEnd('\') } catch { return }
     foreach ($old in (@($LegacyDirs) + @($ExtraDirs) | Where-Object { $_ } | Select-Object -Unique)) {
         if (-not (Test-Path -LiteralPath $old)) { continue }
-        if ((Resolve-Path -LiteralPath $old).Path -eq (Resolve-Path -LiteralPath $newDir).Path) { continue }
-        $files = @('JARVIS.cmd', 'jarvis-checkup.ps1', '.jarvis-install') | Where-Object { Test-Path -LiteralPath (Join-Path $old $_) }
+        $oldFull = $null
+        try { $oldFull = [IO.Path]::GetFullPath($old).TrimEnd('\') } catch { continue }
+        if ($oldFull -eq $newFull) { continue }
+        $files = @('JARVIS.cmd', 'jarvis-checkup.ps1', '.jarvis-install') | Where-Object { Test-PlainFile (Join-Path $oldFull $_) }
         if ($files.Count -eq 0) { continue }
-        if (-not (Read-YesNo ("   >> Ancienne installation trouvée dans {0}. La nettoyer (rapports conservés) ?" -f $old) -DefaultYes)) { continue }
-        $oldRep = Join-Path $old 'Rapports'
-        if (Test-Path -LiteralPath $oldRep) {
+        if (-not (Test-NoLinkUpward $oldFull)) {
+            Write-Host ("   [!] Ancienne installation dans {0} laissée telle quelle : ce dossier mène vers un autre emplacement (jonction ou lien)." -f $old) -ForegroundColor Yellow
+            continue
+        }
+        if (-not (Read-YesNo ("   >> Ancienne installation trouvée dans {0}. La nettoyer (rapports conservés) ?" -f $old))) { continue }
+        $oldRep = Join-Path $oldFull 'Rapports'
+        if ((Test-Path -LiteralPath $oldRep) -and (Test-NoLinkUpward $oldRep)) {
             New-Item -ItemType Directory -Path $ReportRoot -Force | Out-Null
             Get-ChildItem -LiteralPath $oldRep -File | Where-Object { $_.Name -match '^(checkup|selftest)_\d{8}_\d{4}\.txt$' } |
                 Move-Item -Destination $ReportRoot -Force
-            if (-not (Get-ChildItem -LiteralPath $oldRep -Force)) { Remove-Item -LiteralPath $oldRep -Force }
+            if (-not (Get-ChildItem -LiteralPath $oldRep -Force)) { $null = Remove-EmptyDir $oldRep }
         }
         $running = $null
-        if ($JarvisSelf) { try { $running = (Resolve-Path -LiteralPath $JarvisSelf).Path } catch {} }
+        if ($JarvisSelf) { try { $running = [IO.Path]::GetFullPath($JarvisSelf) } catch { $running = $null } }
         $delayed = @()
         foreach ($f in $files) {
-            $fp = (Resolve-Path -LiteralPath (Join-Path $old $f)).Path
+            $fp = Join-Path $oldFull $f
+            if (-not (Test-NoLinkUpward $oldFull)) { break }
+            if (-not (Test-PlainFile $fp)) { continue }
             if ($fp -eq $running) { $delayed += $fp } else { Remove-Item -LiteralPath $fp -Force }
         }
         if ($delayed.Count -gt 0) {
-            Start-DelayedDelete $delayed[0] $old
-        } elseif (-not (Get-ChildItem -LiteralPath $old -Force)) {
-            Remove-Item -LiteralPath $old -Force
+            Start-DelayedDelete $delayed[0] $oldFull
+        } elseif (-not (Get-ChildItem -LiteralPath $oldFull -Force)) {
+            $null = Remove-EmptyDir $oldFull
         }
         Show-Bar ('Nettoyage ' + (Cut $old 20))
     }
@@ -2194,8 +2441,8 @@ function Register-Jarvis([string]$Dir, [string]$Cmd, [string]$Version = $JarvisV
         DisplayVersion  = $Version
         Publisher       = 'J.A.R.V.I.S.'
         InstallLocation = $Dir
-        DisplayIcon     = (Join-Path $env:windir 'System32\shell32.dll') + ',15'
-        UninstallString = ('"{0}" /c ""{1}" -Uninstall"' -f (Join-Path $env:windir 'System32\cmd.exe'), $Cmd)
+        DisplayIcon     = (Join-Path $WinDir 'System32\shell32.dll') + ',15'
+        UninstallString = ('"{0}" /c ""{1}" -Uninstall"' -f (Join-Path $WinDir 'System32\cmd.exe'), $Cmd)
         InstallDate     = (Get-Date -Format 'yyyyMMdd')
     }
     foreach ($n in $str.Keys) { New-ItemProperty -LiteralPath $RegKey -Name $n -Value $str[$n] -PropertyType String -Force -ErrorAction Stop | Out-Null }
@@ -3024,7 +3271,7 @@ function Invoke-CleanTarget($Target) {
     if ($script:CleanUser) { $who = ', compte ' + $script:CleanUser }
     switch ($Target.Key) {
         'Temp' {
-            $dirs = @((Join-Path $env:windir 'Temp'))
+            $dirs = @((Join-Path $WinDir 'Temp'))
             if (Test-SafeTempPath $env:TEMP) { $dirs = @($env:TEMP) + $dirs }
             # Taille relue juste avant la question : les installations faites depuis le scan ont pu en ajouter
             # (PC-LV le 21/11/2026 : environ 135 Mo mesurés pendant le scan, 578 Mo supprimés)
@@ -5819,6 +6066,76 @@ function Invoke-SelfTestAnalyzers {
         Assert-True ($got -eq '#.+-+...') "obtenu $got"
         'OK'
     }
+    Test-Case 'Options de JARVIS.cmd lues sans exécution (S1)' {
+        $sw = @('Quick', 'Deep', 'NoAnim', 'NoWinget', 'NoElevate', 'ResetName', 'ResetChoices', 'Ascii', 'SelfTest', 'Install', 'Uninstall', 'Update')
+        $st = @('InstallDir', 'Name', 'WinRect')
+        $r = ConvertFrom-JarvisArgLine '' $sw $st
+        Assert-True ($r.Ok -and $r.Values.Count -eq 0) 'texte vide refusé'
+        # Relances réelles de JARVIS (installation, administrateur)
+        $r = ConvertFrom-JarvisArgLine '-Install -InstallDir "C:\Program Files (x86)\JARVIS" -WinRect R-8_234_1200_1053' $sw $st
+        Assert-True ($r.Ok -and $r.Values['Install'] -eq $true -and $r.Values['InstallDir'] -eq 'C:\Program Files (x86)\JARVIS' -and
+                     $r.Values['WinRect'] -eq 'R-8_234_1200_1053' -and $r.Values.Count -eq 3) 'relance d''installation mal lue'
+        $r = ConvertFrom-JarvisArgLine ("-Name `"Marie-Claire O'Neil`"`t-ResetName -NoAnim -Quick") $sw $st
+        Assert-True ($r.Ok -and $r.Values['Name'] -eq "Marie-Claire O'Neil" -and $r.Values['ResetName'] -and $r.Values['Quick']) 'relance administrateur mal lue'
+        $r = ConvertFrom-JarvisArgLine "-selftest -Q -name 'Jo'" $sw $st
+        Assert-True ($r.Ok -and $r.Values['SelfTest'] -and $r.Values['Quick'] -and $r.Values['Name'] -eq 'Jo') 'casse ou début de nom refusé'
+        # Code dans un argument : texte gardé tel quel, jamais exécuté
+        $mark = 'jarvisT1Pwned' + [guid]::NewGuid().ToString('N').Substring(0, 6)
+        $evil = '-InstallDir "C:\x$(Set-Variable -Name ' + $mark + ' -Value 1 -Scope Global)"'
+        $r = ConvertFrom-JarvisArgLine $evil $sw $st
+        Assert-True ($null -eq (Get-Variable -Name $mark -Scope Global -ErrorAction SilentlyContinue)) 'code de l''argument exécuté'
+        Assert-True ($r.Ok -and $r.Values['InstallDir'] -eq ('C:\x$(Set-Variable -Name ' + $mark + ' -Value 1 -Scope Global)')) 'texte de l''argument modifié'
+        $bad = @('-Quick; calc', 'Thomas', '-Quick -Quick', '-N', '-Inconnu', '-Name', '-Name -Quick', '-Name "Jean', '-Name a"b"',
+                 '-Name "a"b', '-InstallDir:C:\x', '"-Quick"', '-Quick & calc', '-Quick:$false')
+        foreach ($b in $bad) {
+            $r = ConvertFrom-JarvisArgLine $b $sw $st
+            Assert-True (-not $r.Ok -and $r.Bad) ('accepté à tort : ' + $b)
+        }
+        '{0} cas' -f (6 + $bad.Count)
+    }
+    Test-Case 'Valeur retransmise à une relance (S1)' {
+        $good = @('C:\Program Files\JARVIS', 'C:\Program Files (x86)\JARVIS', 'D:\Logiciels\Été 2026\JARVIS', "D:\Jeux d'Hiver\JARVIS", 'E:\Outils_1.2\JARVIS')
+        $bad = @('', 'C:\a&calc', 'C:\a^b', 'C:\x$(calc)', 'C:\a%PATH%', 'C:\a"b', 'C:\a|b', 'C:\a`b', 'C:\a!b', 'C:\a<b', 'C:\a;b',
+                 ('C:\a' + [char]10 + 'b'))
+        foreach ($g in $good) { Assert-True (Test-SafeArgValue $g) ('refusé à tort : ' + $g) }
+        foreach ($b in $bad) { Assert-True (-not (Test-SafeArgValue $b)) ('accepté à tort : ' + $b) }
+        '{0} cas' -f ($good.Count + $bad.Count)
+    }
+    Test-Case 'Dossiers de modules PowerShell (S2)' {
+        # Liste fixe : ni Documents, ni un dossier ajouté par le compte (C:\Windows\tracing est ouvert en écriture)
+        $sys = 'C:\WINDOWS\System32\WindowsPowerShell\v1.0\Modules'
+        $got = Get-SafeModulePath 'C:\WINDOWS\' @('C:\Program Files', 'C:\Program Files (x86)\')
+        Assert-True ($got -ceq ('C:\Program Files\WindowsPowerShell\Modules;C:\Program Files (x86)\WindowsPowerShell\Modules;' + $sys)) ('obtenu ' + $got)
+        # Console 64 bits sur un Windows 32 bits (pas de Program Files (x86)), doublon, valeur vide
+        $got = Get-SafeModulePath 'C:\WINDOWS' @('C:\Program Files', '', 'C:\Program Files', $null)
+        Assert-True ($got -ceq ('C:\Program Files\WindowsPowerShell\Modules;' + $sys)) ('obtenu ' + $got)
+        Assert-True ((Get-SafeModulePath '' @()) -eq '') 'aucun dossier : liste non vide'
+        Assert-True ($got -notmatch 'Documents|tracing') 'dossier modifiable gardé'
+        '4 cas'
+    }
+    Test-Case 'winget par son chemin complet (S2)' {
+        $fam = 'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe'
+        $mk = { param($F, $L, $V) [pscustomobject]@{ PackageFamilyName = $F; InstallLocation = $L; Version = $V } }
+        $wa = 'C:\Program Files\WindowsApps\'
+        $old = & $mk $fam ($wa + 'Microsoft.DesktopAppInstaller_1.9.25200.0_x64__8wekyb3d8bbwe') '1.9.25200.0'
+        $new = & $mk $fam ($wa + 'Microsoft.DesktopAppInstaller_1.29.380.0_x64__8wekyb3d8bbwe') '1.29.380.0'
+        $got = @(Get-WingetExeCandidates @($old, $new) 'C:\Program Files\')
+        Assert-True ($got.Count -eq 2 -and $got[0] -eq ($wa + 'Microsoft.DesktopAppInstaller_1.29.380.0_x64__8wekyb3d8bbwe\winget.exe')) ('obtenu ' + ($got -join ' | '))
+        $bad = @((& $mk $fam 'C:\Users\x\AppData\Local\Faux' '9.0.0.0'), (& $mk 'Faux.AppInstaller_8wekyb3d8bbwe' ($wa + 'Faux') '9.0.0.0'),
+                 (& $mk $fam ($wa + '..\..\Users\x') '9.0.0.0'), (& $mk $fam 'C:\Program FilesX\WindowsApps\x' '9.0.0.0'), $null)
+        Assert-True (@(Get-WingetExeCandidates $bad 'C:\Program Files').Count -eq 0) 'paquet hors de WindowsApps accepté'
+        Assert-True (@(Get-WingetExeCandidates @($new) '').Count -eq 0) 'Program Files inconnu accepté'
+        '{0} cas' -f (3 + $bad.Count)
+    }
+    Test-Case 'Alimentation : secteur ou batterie (S7)' {
+        $cases = @(@('Online', $null, 'AC'), @('Offline', $false, 'BATTERY'), @('Offline', $true, 'BATTERY'), @('Unknown', $true, 'AC'),
+                   @('Unknown', $false, 'UNKNOWN'), @('Unknown', $null, 'UNKNOWN'), @('', $null, 'UNKNOWN'), @('Unknown', 'True', 'UNKNOWN'))
+        foreach ($c in $cases) {
+            $got = Get-PowerVerdict $c[0] $c[1]
+            Assert-True ($got -eq $c[2]) ('{0} / {1} -> {2}, attendu {3}' -f $c[0], $c[1], $got, $c[2])
+        }
+        '{0} cas' -f $cases.Count
+    }
 }
 
 function Invoke-SelfTest {
@@ -5954,8 +6271,10 @@ function Invoke-SelfTest {
         ('{0} mise(s) à jour proposée(s), mises à jour automatiques : {1}' -f @($r.Items).Count, $r.Auto)
     }
     Test-Case 'winget' {
-        if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { return 'SKIP:non installé' }
-        $v = (& winget --version 2>$null) | Select-Object -First 1
+        $wx = Get-WingetPath
+        if ($script:WingetLookup -eq 'UNREADABLE') { throw 'paquets de Windows illisibles (Get-AppxPackage) : winget introuvable par son chemin complet' }
+        if (-not $wx) { return 'SKIP:non installé' }
+        $v = (& $wx --version 2>$null) | Select-Object -First 1
         Assert-True ([string]$v -match '\d+\.\d+') "réponse inattendue : $v"
         [string]$v
     }
@@ -6204,11 +6523,16 @@ function Invoke-SelfTest {
         'empreinte SHA-256 conforme'
     }
     Test-Case 'Temp : chemins dangereux refusés' {
-        foreach ($p in @("$env:SystemDrive\", $env:USERPROFILE, $env:SystemRoot, $env:ProgramFiles, $env:LOCALAPPDATA, '')) {
+        # v3.24 : %TEMP% redéfini vers le dossier Temp d'un programme installé ou de Windows (chemins non créés ici)
+        $win = [Environment]::GetFolderPath('Windows')
+        foreach ($p in @("$env:SystemDrive\", $env:USERPROFILE, $env:SystemRoot, $env:ProgramFiles, $env:LOCALAPPDATA, '',
+                         (Join-Path (Get-ProgramFilesDir) 'Editeur\Temp'), (Join-Path $win 'System32\Temp'),
+                         (Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'Editeur\Temp'))) {
             Assert-True (-not (Test-SafeTempPath $p)) ('accepté à tort : ' + $p)
         }
         Assert-True (Test-SafeTempPath (Join-Path $env:SystemRoot 'Temp')) 'Windows\Temp refusé à tort'
-        '6 refus, 1 acceptation'
+        Assert-True (Test-SafeTempPath (Join-Path $win 'Temp')) 'Windows\Temp (dossier demandé à Windows) refusé à tort'
+        '9 refus, 2 acceptations'
     }
     Test-Case 'Temp : nettoyage en bac à sable' {
         $root = Join-Path $env:TEMP ('jarvis_garde_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -6282,6 +6606,37 @@ function Invoke-SelfTest {
             $null = Remove-TreeNoJunction $root
         }
         'chemin détourné écarté, fichier extérieur intact'
+    }
+    Test-Case 'Ancienne installation derrière une jonction (S6)' {
+        # Comme C:\Outils\JARVIS, que tout compte peut créer : un dossier au-dessus remplacé par une jonction mène ailleurs
+        if (-not (Test-NoLinkUpward $env:TEMP)) { return 'SKIP:dossier temporaire lui-même derrière un lien' }
+        $root = Join-Path $env:TEMP ('jarvis_ancien_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $real = Join-Path $root 'Outils\JARVIS'
+        $link = Join-Path $root 'Lien'
+        New-Item -ItemType Directory -Path $real -Force -ErrorAction Stop | Out-Null
+        try {
+            & (Get-SystemToolPath 'cmd.exe') /c ('mklink /J "{0}" "{1}"' -f $link, (Join-Path $root 'Outils')) | Out-Null
+            Assert-True (Test-Path -LiteralPath (Join-Path $link 'JARVIS')) 'jonction de test non créée'
+            Assert-True (Test-NoLinkUpward $real) 'dossier normal refusé'
+            Assert-True (-not (Test-NoLinkUpward (Join-Path $link 'JARVIS'))) 'dossier derrière une jonction accepté'
+            Assert-True (-not (Test-NoLinkUpward $link)) 'jonction elle-même acceptée'
+            Assert-True (-not (Test-NoLinkUpward (Join-Path $root 'absent'))) 'dossier absent accepté'
+            # Élément de l'installation remplacé par une jonction (vers un dossier plein) ou par un dossier
+            $f = Join-Path $real 'JARVIS.cmd'
+            [IO.File]::WriteAllText($f, 'x')
+            $target = Join-Path $root 'Cible'
+            New-Item -ItemType Directory -Path $target -Force -ErrorAction Stop | Out-Null
+            [IO.File]::WriteAllText((Join-Path $target 'garde.txt'), 'x')
+            & (Get-SystemToolPath 'cmd.exe') /c ('mklink /J "{0}" "{1}"' -f (Join-Path $real '.jarvis-install'), $target) | Out-Null
+            New-Item -ItemType Directory -Path (Join-Path $real 'jarvis-checkup.ps1') -Force -ErrorAction Stop | Out-Null
+            Assert-True (Test-PlainFile $f) 'vrai fichier refusé'
+            Assert-True (-not (Test-PlainFile (Join-Path $real '.jarvis-install'))) 'jonction prise pour un fichier'
+            Assert-True (-not (Test-PlainFile (Join-Path $real 'jarvis-checkup.ps1'))) 'dossier pris pour un fichier'
+            Assert-True (-not (Test-PlainFile (Join-Path $real 'absent.cmd'))) 'fichier absent accepté'
+        } finally {
+            $null = Remove-TreeNoJunction $root
+        }
+        'jonctions repérées (dossier et élément), dossier normal accepté'
     }
     Test-Case 'Nettoyage étendu : liste blanche' {
         # Lecture seule : aucun vrai dossier n'est vidé ici (règle 18)
@@ -6581,6 +6936,10 @@ if (-not $placed) {
 }
 Clear-Host
 Show-Banner
+if ($script:ArgRefused) {
+    Write-Host ('   [!] Options de lancement non reconnues, toutes ignorées : ' + (Cut (Remove-ControlChars $script:ArgRefused) 40)) -ForegroundColor Yellow
+    Write-Host '       J.A.R.V.I.S. démarre normalement. Options possibles : JARVIS.cmd -Quick, -Deep, -SelfTest, -Update...' -ForegroundColor DarkGray
+}
 if ($Name) { $Name = [string](Get-SafeName $Name) }
 if ($ResetChoices) {
     if (Set-JarvisConfigValue 'WingetModule' $null) {
@@ -6691,7 +7050,8 @@ if (-not $JarvisInstalled -and $JarvisSelf -like '*.cmd') {
     if ($choice -eq 'install' -and -not $isAdmin) {
         # Program Files exige les droits administrateur : relance élevée en mode installation
         $ia = '-Install'
-        if ($InstallDir) { $ia += " -InstallDir `"$InstallDir`"" }
+        if ($InstallDir -and (Test-SafeArgValue $InstallDir)) { $ia += " -InstallDir `"$InstallDir`"" }
+        elseif ($InstallDir) { Write-Host '   [!] Dossier demandé ignoré (caractères non pris en charge) : le dossier te sera proposé.' -ForegroundColor Yellow }
         $ia += Get-WinRectArg
         Write-Host '   >> Validation administrateur requise pour installer dans Program Files.' -ForegroundColor Cyan
         if (Start-Elevated $JarvisSelf $ia) { exit }
@@ -6735,7 +7095,7 @@ if (-not $isAdmin -and -not $NoElevate) {
         $argList += Get-WinRectArg
         $okUac = $false
         if ($JarvisSelf -like '*.cmd') { $okUac = Start-Elevated $JarvisSelf $argList.Trim() }
-        else { $okUac = Start-Elevated 'powershell.exe' ("-NoProfile -ExecutionPolicy Bypass -File `"$JarvisSelf`"" + $argList) }
+        else { $okUac = Start-Elevated (Get-SystemToolPath 'WindowsPowerShell\v1.0\powershell.exe') ("-NoProfile -ExecutionPolicy Bypass -File `"$JarvisSelf`"" + $argList) }
         if ($okUac) { exit }
         Write-Host '   >> Poursuite sans droits administrateur : contrôles réduits, scan complet indisponible.' -ForegroundColor DarkGray
     }
@@ -6780,7 +7140,7 @@ if ($SelfTest) {
     while ($m -eq 'R' -or $m -eq 'M' -or $m -eq 'U') {
         if ($m -eq 'R') {
             $rd = Get-ReportDir
-            if ($rd) { Start-Process -FilePath 'explorer.exe' -ArgumentList ('"{0}"' -f $rd) }
+            if ($rd) { Start-Process -FilePath (Join-Path $WinDir 'explorer.exe') -ArgumentList ('"{0}"' -f $rd) }
             else { Write-Host '   [!] Aucun dossier de rapports accessible.' -ForegroundColor Yellow }
         } elseif ($m -eq 'U') {
             Invoke-JarvisSelfUpdate $upd.Info      # ne revient ici qu'en cas d'annulation ou d'échec
@@ -7117,8 +7477,9 @@ if ($NoWinget) {
     $wgParser = ${function:ConvertFrom-WingetText}.ToString()
     $wgUnknown = ${function:Get-WingetUnknownCount}.ToString()
     $wgSplit = ${function:Split-NativeOutput}.ToString()
+    $wgExe = [string](Get-WingetPath)
     $wg = Invoke-Spinner 'Analyse des paquets installés' {
-        param($ParserText, $UnknownText, $SplitText)
+        param($ParserText, $UnknownText, $SplitText, $WgExe)
         # Liste de départ : « winget upgrade ». Le module (s'il est là) complète noms, identifiants et
         # versions tronqués, et écarte ce que winget refusera d'installer (IsUpdateAvailable faux).
         # Constaté le 19/11/2026 : Epson Scan 2 (version « Unknown ») et Hytale Launcher (installé pour
@@ -7126,12 +7487,12 @@ if ($NoWinget) {
         # puis refusés par winget ; le module, lui, savait que Hytale n'était pas applicable.
         $out = [pscustomobject]@{ Mode = 'text'; Items = @(); Unknown = 0; UnknownNames = @(); NotApplicable = @(); Error = $null
                                   Raw = ''; Err = ''; Code = $null; Parsed = 0 }
-        if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        if (-not $WgExe -or -not (Test-Path -LiteralPath $WgExe -PathType Leaf)) {
             $out.Error = 'NOWINGET'
             return $out
         }
         try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
-        $lines = @(& winget upgrade --accept-source-agreements --disable-interactivity 2>&1)
+        $lines = @(& $WgExe upgrade --accept-source-agreements --disable-interactivity 2>&1)
         $wgCode = $LASTEXITCODE
         # Messages d'erreur (stderr) mis à part : seul le texte normal de winget est analysé
         $sp = & ([scriptblock]::Create($SplitText)) -Lines $lines
@@ -7178,13 +7539,17 @@ if ($NoWinget) {
             }
         } catch {}
         return $out
-    } 300 -ArgumentList $wgParser, $wgUnknown, $wgSplit
+    } 300 -ArgumentList $wgParser, $wgUnknown, $wgSplit, $wgExe
 
     $wgRetry = 'Vérifie la connexion Internet puis relance le scan ; si ça revient, mets à jour'
     $wgRetry2 = '« Programme d''installation d''application » dans le Microsoft Store (Bibliothèque).'
     if ($null -eq $wg) {
         Write-Status 'winget' 'délai dépassé (5 min)' 'WARN'
         Write-Sub $wgRetry; Write-Sub $wgRetry2
+    } elseif ($wg.Error -eq 'NOWINGET' -and $script:WingetLookup -eq 'UNREADABLE') {
+        # Liste des paquets de Windows illisible : winget n'est jamais cherché par son seul nom (v3.24)
+        Write-Status 'winget' 'emplacement illisible (liste des applications de Windows)' 'INFO'
+        Write-Sub 'Vérifie toi-même : Microsoft Store > Bibliothèque > Obtenir les mises à jour'
     } elseif ($wg.Error -eq 'NOWINGET') {
         Write-Status 'winget' 'non installé' 'INFO'
         Write-Sub 'Installer « Programme d''installation d''application » depuis le Microsoft Store'
@@ -7198,8 +7563,11 @@ if ($NoWinget) {
             $it.Installed = Remove-ControlChars $it.Installed
             $it.Available = Remove-ControlChars $it.Available
         }
-        $script:WGCount = $items.Count
+        # Seules les applications dont l'identifiant est lu sont proposées à la mise à jour, une par une (v3.24 :
+        # plus de repli « winget upgrade --all », qui mettait à jour au-delà de la liste annoncée, constat S5)
         $script:WGItems = $items
+        $script:WGCount = @($items | Where-Object { $_.Id }).Count
+        $wgNoId = $items.Count - $script:WGCount
         $wgState = Get-WingetScanState ([string]$wg.Raw) ([int]$wg.Parsed)
         if ($items.Count -eq 0 -and $wgState -eq 'UNREADABLE') {
             # Ni tableau, ni message « aucune mise à niveau » : on ne conclut pas
@@ -7224,7 +7592,11 @@ if ($NoWinget) {
                     Write-Sub (Cut $it.Name 90) 'Yellow'
                 }
             }
-            Write-Sub 'J.A.R.V.I.S. te propose de les mettre à jour à la fin du scan.'
+            if ($wgNoId -eq 0) { Write-Sub 'J.A.R.V.I.S. te propose de les mettre à jour à la fin du scan.' }
+            else {
+                if ($script:WGCount -gt 0) { Write-Sub ('J.A.R.V.I.S. te propose de mettre à jour les {0} dont l''identifiant est lu, à la fin du scan.' -f $script:WGCount) }
+                Write-Sub ('{0} application(s) sans identifiant lisible : à mettre à jour depuis l''application elle-même ou Microsoft Store > Bibliothèque' -f $wgNoId)
+            }
         }
         if ($wg.Unknown -gt 0) {
             # winget ne connaît pas leur version installée : il refuse de les mettre à jour, inutile de les proposer
@@ -7813,7 +8185,7 @@ foreach ($v in $vols) {
     $label = "Volume {0}: {1}" -f $v.DriveLetter, $v.FileSystemLabel
     if ($pct -lt 20) {
         if ($pct -lt 10) { Write-Status $label $txt 'FAIL' } else { Write-Status $label $txt 'WARN' }
-        if (('{0}:' -f $v.DriveLetter) -eq $env:SystemDrive) {
+        if (('{0}:' -f $v.DriveLetter) -eq $SysDrive) {
             Write-Sub 'Windows a besoin de place pour ses mises à jour. Paramètres > Système > Stockage montre ce qui'
             Write-Sub 'la prend ; Paramètres > Applications : désinstalle les jeux et logiciels dont tu ne te sers plus.'
         } else {
@@ -7847,11 +8219,11 @@ foreach ($d in $disks) {
 }
 
 if ($isAdmin -and (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue)) {
-    $bl = Get-BitLockerVolume -MountPoint $env:SystemDrive
+    $bl = Get-BitLockerVolume -MountPoint $SysDrive
     if ($bl) {
         # v3.23 (audit, constat V9) : « protection suspendue » devient un avertissement, avec quoi faire
         $blv = Get-BitLockerVerdict ([string]$bl.ProtectionStatus) ([string]$bl.VolumeStatus)
-        Write-Status ('Chiffrement ' + $env:SystemDrive + ' (BitLocker)') $blv.Text $blv.State
+        Write-Status ('Chiffrement ' + $SysDrive + ' (BitLocker)') $blv.Text $blv.State
         if ($blv.State -eq 'WARN') {
             Write-Sub 'Tes fichiers sont chiffrés mais la clé reste lisible : le chiffrement ne protège plus.'
             Write-Sub 'Il reprend en général seul au redémarrage (après une mise à jour du BIOS ou de Windows).'
@@ -8096,7 +8468,7 @@ if (Test-SafeTempPath $env:TEMP) {
     Write-Sub 'Nettoyage désactivé pour ce dossier par sécurité'
     Write-Sub 'Un programme a changé l''emplacement des fichiers temporaires : demande de l''aide si ce n''est pas toi.'
 }
-$tmpWin = Measure-AgedFiles (Join-Path $env:windir 'Temp') 24
+$tmpWin = Measure-AgedFiles (Join-Path $WinDir 'Temp') 24
 $twTxt = Format-AgedText $tmpWin 'de plus de 24 h'
 if (-not $tmpWin.Ok -and -not $isAdmin) { $twTxt = 'lecture impossible sans droits admin' }
 Write-Status 'Temp Windows' $twTxt 'INFO'
@@ -8423,7 +8795,7 @@ if ($script:DeepMode) {
             # v3.23 : la commande de correction est aussi dans le rapport (avant, seulement à l'écran en fin de scan)
             Write-Sub 'Sauvegarde d''abord tes fichiers importants. Puis clic droit sur Démarrer > Terminal (admin)'
             Write-Sub ('ou Windows PowerShell (admin), tape  chkdsk {0}: /spotfix  et Entrée.' -f $L)
-            if (('{0}:' -f $L) -eq $env:SystemDrive) { Write-Sub 'Pour ce disque, réponds O : la correction se fait au prochain redémarrage.' }
+            if (('{0}:' -f $L) -eq $SysDrive) { Write-Sub 'Pour ce disque, réponds O : la correction se fait au prochain redémarrage.' }
         }
     }
 }
@@ -8522,7 +8894,7 @@ foreach ($L in $script:ChkdskFix) {
 if ($script:DefenderScan) {
     if (Read-YesNo '   >> Lancer une analyse antivirus rapide (Microsoft Defender, quelques minutes) ?') { Invoke-DefenderQuickScan }
 }
-if ($script:WGCount -gt 0) {
+if ($script:WGCount -gt 0 -and $script:WingetExe) {
     Write-Host '   [i] winget peut fermer les applications concernées (navigateur, jeux, messageries) pendant leur mise à jour.' -ForegroundColor DarkGray
     Write-Host '       Enregistre ton travail avant de valider.' -ForegroundColor DarkGray
     if (Read-YesNo ("   >> Mettre à jour les {0} application(s) avec winget ?" -f $script:WGCount)) {
@@ -8532,11 +8904,9 @@ if ($script:WGCount -gt 0) {
         $explained = @()  # applications dont le retard vient d'être expliqué (encore en service)
         $resolved = @()   # « terminées » encore proposées, mais dont la version a changé (autre numérotation)
         $skip = @($script:WGSkipIds)
+        # Seulement les applications annoncées, une par une : plus de repli « winget upgrade --all » (v3.24, S5)
         $targets = @($script:WGItems | Where-Object { $_.Id })
-        if ($targets.Count -eq 0) {
-            # Identifiants illisibles : repli sur la mise à jour globale
-            winget upgrade --all --accept-source-agreements --accept-package-agreements
-        } else {
+        if ($targets.Count -gt 0) {
             foreach ($it in $targets) {
                 if ($it.Id -eq 'Microsoft.AppInstaller') {
                     # winget est dans ce paquet et ne peut pas se remplacer pendant qu'il tourne (PC-LV le 21/11/2026 :
@@ -8549,7 +8919,7 @@ if ($script:WGCount -gt 0) {
                 Write-Host ('   >> Mise à jour de ' + $it.Name) -ForegroundColor Cyan
                 $null = Wait-MsiIdle
                 $itStart = Get-Date
-                & winget upgrade --id $it.Id --exact --accept-source-agreements --accept-package-agreements --disable-interactivity
+                & $script:WingetExe upgrade --id $it.Id --exact --accept-source-agreements --accept-package-agreements --disable-interactivity
                 $rc = $LASTEXITCODE
                 if ($rc -eq 0) {
                     $okItems += $it
@@ -8567,7 +8937,7 @@ if ($script:WGCount -gt 0) {
         }
         Write-Host ''
         Write-Host '   >> Vérification du résultat...' -ForegroundColor DarkCyan
-        $raw2 = (Split-NativeOutput -Lines @(& winget upgrade --accept-source-agreements --disable-interactivity 2>&1)).Out
+        $raw2 = (Split-NativeOutput -Lines @(& $script:WingetExe upgrade --accept-source-agreements --disable-interactivity 2>&1)).Out
         $leftAll = @(ConvertFrom-WingetText $raw2)
         $verif = Get-WingetScanState $raw2 $leftAll.Count
         # Certaines applications finissent leur mise à jour en se relançant après la fin de winget (Discord, autre PC
@@ -8594,7 +8964,7 @@ if ($script:WGCount -gt 0) {
             }
             Write-Host ('   >> Ancienne version encore inscrite pour {0} application(s) : nouvelle vérification dans 20 s ({1}/3)...' -f $waiting.Count, $try) -ForegroundColor DarkCyan
             Start-Sleep -Seconds 20
-            $raw3 = (Split-NativeOutput -Lines @(& winget upgrade --accept-source-agreements --disable-interactivity 2>&1)).Out
+            $raw3 = (Split-NativeOutput -Lines @(& $script:WingetExe upgrade --accept-source-agreements --disable-interactivity 2>&1)).Out
             $all3 = @(ConvertFrom-WingetText $raw3)
             if ((Get-WingetScanState $raw3 $all3.Count) -eq 'UNREADABLE') { break }
             $leftAll = $all3
@@ -8630,7 +9000,7 @@ if ($script:WGCount -gt 0) {
             if ($verif -ne 'UNREADABLE' -and -not (Test-WingetStillListed $it.Id $leftAll)) {
                 # Plus proposée malgré l'erreur : faite quand même, ou application retirée par son propre installateur
                 # (Java sur PC-LV le 21/11/2026 : ancienne version désinstallée, nouvelle refusée, code 1618)
-                $null = & winget list --id $it.Id --exact --accept-source-agreements --disable-interactivity 2>&1
+                $null = & $script:WingetExe list --id $it.Id --exact --accept-source-agreements --disable-interactivity 2>&1
                 $pres = Get-WingetPresence $LASTEXITCODE
                 if ($pres -eq 'ABSENT') {
                     Write-Action 'FAIL' ('{0} : n''est plus installée (code {1})' -f $it.Name, $k.Code)
