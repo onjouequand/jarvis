@@ -1,6 +1,6 @@
 <# : JARVIS.cmd. Ne pas modifier ce texte
 @echo off
-rem JARVIS-SHA256=2c6678d67fccef09b779c68832206db77b5d7e12b709936afb4bc3b397f04b3a
+rem JARVIS-SHA256=280c556502c0b7016e0340cfa373b50dc62c1514a24742f0a72938aa6aeb972f
 setlocal
 "%SystemRoot%\System32\chcp.com" 65001 >nul
 set "JARVIS_SELF=%~f0"
@@ -12,7 +12,7 @@ if "%JARVIS_RC%"=="4" pause
 exit /b %JARVIS_RC%
 #>
 <#
-    J.A.R.V.I.S. // Check-up système v3.22
+    J.A.R.V.I.S. // Check-up système v3.23
     -----------------------------------------------------------------
     Modules :
       [01] Système        : version Windows, uptime, redémarrage en attente
@@ -110,7 +110,7 @@ param(
 # ------------------------------------------------------------------
 # Identité du programme et emplacement
 # ------------------------------------------------------------------
-$JarvisVersion = '3.22'
+$JarvisVersion = '3.23'
 $JarvisSelf = $env:JARVIS_SELF                     # défini par JARVIS.cmd
 if (-not $JarvisSelf) { $JarvisSelf = $PSCommandPath }  # lancement direct du .ps1
 $JarvisHome = $null
@@ -198,6 +198,8 @@ $Ref = @{
 $script:Ok          = 0
 $script:Warnings    = New-Object System.Collections.Generic.List[string]
 $script:Alerts      = New-Object System.Collections.Generic.List[string]
+$script:NotChecked  = New-Object System.Collections.Generic.List[string]   # contrôles non vérifiés (lecture impossible), v3.23
+$script:CurSection  = ''        # numéro de la section en cours, repris devant chaque point de la synthèse (v3.23)
 $script:Report      = New-Object System.Collections.Generic.List[string]
 $script:WUCount     = 0
 $script:ScanDetected = $null    # défauts du magasin de composants vus par DISM /ScanHealth (CBS.log), v3.21
@@ -248,7 +250,7 @@ function Show-Banner {
         foreach ($l in $plain) { Write-Host $l -ForegroundColor Cyan; Pause-Ms 70 }
         Write-Host ''
         Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-        Write-Host '      module check-up v3.22' -ForegroundColor DarkGray
+        Write-Host '      module check-up v3.23' -ForegroundColor DarkGray
         Write-Host ''
         return
     }
@@ -268,7 +270,7 @@ function Show-Banner {
     }
     Write-Host ''
     Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-    Write-Host '      module check-up v3.22' -ForegroundColor DarkGray
+    Write-Host '      module check-up v3.23' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -304,6 +306,7 @@ function Write-Section {
     Write-Host ('  └' + ('─' * $w) + '┘') -ForegroundColor DarkCyan
     $script:Report.Add('')
     $script:Report.Add("== [$Num] $Title ==")
+    $script:CurSection = $Num
 }
 
 function Cut([string]$s, [int]$n) {
@@ -343,11 +346,45 @@ function Write-Status {
     Write-Host (' {0,-33}' -f $lbl) -NoNewline -ForegroundColor Gray
     Write-Host $Value -ForegroundColor White
     $script:Report.Add(('{0} {1,-33} {2}' -f $tags[$State], $lbl, $Value))
+    # v3.23 : chaque point de la synthèse dit dans quelle section lire son conseil ; une lecture impossible (INFO) est
+    # comptée à part, sauf au nettoyage (section 11 : des mesures de place, pas des contrôles de santé)
+    $where = ''
+    if ($script:CurSection) { $where = '[' + $script:CurSection + '] ' }
     switch ($State) {
         'OK'   { $script:Ok++ }
-        'WARN' { $script:Warnings.Add("$Label : $Value") }
-        'FAIL' { $script:Alerts.Add("$Label : $Value") }
+        'WARN' { $script:Warnings.Add("$where$Label : $Value") }
+        'FAIL' { $script:Alerts.Add("$where$Label : $Value") }
+        'INFO' { if ($script:CurSection -ne '11' -and (Test-UnreadValue $Value)) { $script:NotChecked.Add("$where$Label : $Value") } }
     }
+}
+
+function Test-UnreadValue([string]$Value) {
+    # Ligne INFO qui dit qu'un contrôle n'a pas pu être fait (règle 15 : jamais de OK sans lecture). v3.23, constat V2
+    # de l'audit du 23/11/2026 : ces lignes ne comptaient nulle part, un PC dont l'antivirus, le pare-feu et les
+    # disques étaient illisibles pouvait finir « nominal ». Vocabulaire à garder pour toute lecture en échec.
+    # Fonction pure, T1.
+    if ($null -eq $Value) { return $false }
+    return ($Value -match 'impossible|illisible|indisponible|non v.rifiable|non reconnu|\bnon lue?s?\b|n.cessite les droits admin')
+}
+
+function Get-ScanVerdict([int]$Warn, [int]$Fail, [int]$Unread) {
+    # État général de la synthèse (v3.23, constats V2 et V4 de l'audit) : remplace le pourcentage, qui comptait
+    # un FAIL comme un WARN (antivirus coupé = 91 %, PC sain = 89 %) et ignorait les lectures impossibles.
+    # Trois niveaux : ACT (au moins une alerte), WATCH (avertissements), GOOD. Sans alerte ni avertissement, « en bon
+    # état » n'est écrit que si tout a été lu. Fonction pure, T1.
+    if ($Fail -gt 0) {
+        return [pscustomobject]@{ Level = 'ACT'; Title = 'À TRAITER'; Color = 'Red'
+                                  Line = 'Au moins un point demande une intervention : commence par la liste ALERTES.' }
+    }
+    if ($Warn -gt 0) {
+        return [pscustomobject]@{ Level = 'WATCH'; Title = 'À SURVEILLER'; Color = 'Yellow'
+                                  Line = 'Rien d''urgent : quelques points à régler quand tu as le temps.' }
+    }
+    if ($Unread -gt 0) {
+        return [pscustomobject]@{ Level = 'GOOD'; Title = 'RIEN D''ANORMAL VU'; Color = 'Green'
+                                  Line = ('Rien d''anormal dans ce qui a été lu, mais {0} point(s) n''ont pas pu être vérifiés.' -f $Unread) }
+    }
+    return [pscustomobject]@{ Level = 'GOOD'; Title = 'EN BON ÉTAT'; Color = 'Green'; Line = 'Aucun point à traiter.' }
 }
 
 function Write-Sub {
@@ -3494,7 +3531,11 @@ function Get-BiosSupportLink([string]$BoardMaker, [string]$SystemMaker, [string]
 }
 
 function Get-AvState($ProductState) {
-    $hex = '{0:X6}' -f [int]$ProductState
+    # productState d'un antivirus du Centre de sécurité (SecurityCenter2). v3.23 (audit, constat T10) : valeur absente
+    # ou non numérique = $null (lecture impossible) ; avant, [int]$null valait 0, soit « installé mais inactif ».
+    $n = ConvertTo-IntOrNull $ProductState
+    if ($null -eq $n -or $n -lt 0) { return $null }
+    $hex = '{0:X6}' -f $n
     return [pscustomobject]@{
         On       = ($hex.Substring(2, 2) -in @('10', '11'))
         UpToDate = ($hex.Substring(4, 2) -eq '00')
@@ -3999,11 +4040,157 @@ function Update-StoreApps {
     }
 }
 
-function Write-EventCount([string]$Label, [bool]$ReadOk, [int]$Count, [string]$BadState) {
-    # Un compteur d'événements à 0 n'est « OK » que si le journal a vraiment été lu
+function Write-EventCount([string]$Label, [bool]$ReadOk, [int]$Count, [string]$BadState, [string[]]$Advice = @()) {
+    # Un compteur d'événements à 0 n'est « OK » que si le journal a vraiment été lu.
+    # $Advice : quoi faire, affiché sous la ligne quand le compteur n'est pas à 0 (v3.23).
     if (-not $ReadOk) { Write-Status $Label 'lecture du journal impossible' 'INFO' }
-    elseif ($Count -gt 0) { Write-Status $Label ([string]$Count) $BadState }
+    elseif ($Count -gt 0) {
+        Write-Status $Label ([string]$Count) $BadState
+        foreach ($a in $Advice) { Write-Sub $a }
+    }
     else { Write-Status $Label '0' 'OK' }
+}
+
+function Get-DiskHealthVerdict($Health, $Temperature, $Wear, $ReadErrors) {
+    # Santé d'un disque (Get-PhysicalDisk) et compteurs de fiabilité (Get-StorageReliabilityCounter, admin seulement).
+    # v3.23, constat V6 de l'audit du 23/11/2026 : l'état était FAIL par défaut (un « Unknown » donnait une alerte
+    # rouge), le texte restait en anglais et une usure de 100 % n'était qu'un avertissement.
+    # $Health : nom (Healthy, Warning, Unhealthy, Unknown) ou nombre (0, 1, 2, 5) ; compteurs $null si non lus.
+    # Rend State (OK, WARN, FAIL, INFO), Text (« santé : bonne »...) et Why : HEALTH, ERRORS, WORN (usure de 100 %),
+    # WEAR (80 %), HOT (65 °C), UNKNOWN (santé illisible, rien d'autre de grave) ou ''. Fonction pure, T1.
+    $h = ([string]$Health).Trim()
+    switch ($h) {
+        '0' { $h = 'Healthy' }
+        '1' { $h = 'Warning' }
+        '2' { $h = 'Unhealthy' }
+    }
+    $txt = 'santé illisible'
+    if ($h -eq 'Healthy') { $txt = 'santé : bonne' }
+    elseif ($h -eq 'Warning') { $txt = 'santé : à surveiller' }
+    elseif ($h -eq 'Unhealthy') { $txt = 'santé : mauvaise' }
+    $t = ConvertTo-IntOrNull $Temperature
+    $w = ConvertTo-IntOrNull $Wear
+    $e = ConvertTo-IntOrNull $ReadErrors
+    $state = 'INFO'; $why = 'UNKNOWN'
+    if ($h -eq 'Unhealthy') { $state = 'FAIL'; $why = 'HEALTH' }
+    elseif ($null -ne $e -and $e -gt 0) { $state = 'FAIL'; $why = 'ERRORS' }
+    elseif ($null -ne $w -and $w -ge 100) { $state = 'FAIL'; $why = 'WORN' }
+    elseif ($h -eq 'Warning') { $state = 'WARN'; $why = 'HEALTH' }
+    elseif ($null -ne $w -and $w -ge 80) { $state = 'WARN'; $why = 'WEAR' }
+    elseif ($null -ne $t -and $t -ge 65) { $state = 'WARN'; $why = 'HOT' }
+    elseif ($h -eq 'Healthy') { $state = 'OK'; $why = '' }
+    return [pscustomobject]@{ State = $state; Text = $txt; Why = $why }
+}
+
+function Get-DiskAdvice([string]$Why) {
+    # Quoi faire pour un disque, selon la raison rendue par Get-DiskHealthVerdict (v3.23)
+    switch ($Why) {
+        'HEALTH'  { return @('Copie dès maintenant tes fichiers importants (photos, documents) sur un disque externe',
+                             'ou un cloud : ce disque peut lâcher. Fais-le ensuite vérifier ou remplacer.') }
+        'ERRORS'  { return @('Des données n''ont pas pu être lues : copie dès maintenant tes fichiers importants ailleurs',
+                             '(disque externe ou cloud), puis fais vérifier ou remplacer ce disque.') }
+        'WORN'    { return @('Ce SSD a atteint la durée de vie prévue par son fabricant : sauvegarde tes fichiers',
+                             'importants ailleurs et prévois son remplacement.') }
+        'WEAR'    { return @('Usure avancée : sauvegarde régulièrement tes fichiers et prévois son remplacement.') }
+        'HOT'     { return @('Disque chaud : vérifie que les aérations du PC ne sont pas bouchées par la poussière.') }
+    }
+    return @()
+}
+
+function Get-BitLockerVerdict([string]$Protection, [string]$VolumeStatus) {
+    # Chiffrement du disque système (Get-BitLockerVolume). v3.23, constat V9 de l'audit : « protection suspendue »
+    # était une simple information, et un chiffrement en cours était écrit « protection suspendue ».
+    # Disque chiffré mais protection coupée : la clé est lisible sur le disque, le chiffrement ne protège plus.
+    # Rend State (INFO ou WARN) et Text. Fonction pure, T1.
+    $p = ([string]$Protection).Trim()
+    $v = ([string]$VolumeStatus).Trim()
+    if ($p -eq 'On') { return [pscustomobject]@{ State = 'INFO'; Text = 'chiffré et protégé' } }
+    switch ($v) {
+        'FullyDecrypted'       { return [pscustomobject]@{ State = 'INFO'; Text = 'non chiffré' } }
+        'EncryptionInProgress' { return [pscustomobject]@{ State = 'INFO'; Text = 'chiffrement en cours' } }
+        'DecryptionInProgress' { return [pscustomobject]@{ State = 'INFO'; Text = 'déchiffrement en cours' } }
+        'EncryptionPaused'     { return [pscustomobject]@{ State = 'INFO'; Text = 'chiffrement en pause' } }
+        'DecryptionPaused'     { return [pscustomobject]@{ State = 'INFO'; Text = 'déchiffrement en pause' } }
+        'FullyEncrypted' {
+            if ($p -eq 'Off') { return [pscustomobject]@{ State = 'WARN'; Text = 'chiffré, protection suspendue' } }
+        }
+    }
+    return [pscustomobject]@{ State = 'INFO'; Text = 'état illisible' }
+}
+
+function Test-TcpReach([string]$HostName, [int]$Port, [int]$TimeoutMs = 3000) {
+    # Connexion TCP bornée dans le temps (v3.23, constat V8 de l'audit) : certaines box et certains réseaux ne
+    # répondent pas au ping alors qu'Internet fonctionne. $true si la connexion s'établit, $false sinon.
+    $c = $null
+    try {
+        $c = New-Object Net.Sockets.TcpClient
+        $ar = $c.BeginConnect($HostName, $Port, $null, $null)
+        if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs)) { return $false }
+        $c.EndConnect($ar)
+        return [bool]$c.Connected
+    } catch {
+        return $false
+    } finally {
+        if ($null -ne $c) { $c.Close() }
+    }
+}
+
+function Get-NetworkVerdict([string]$Gateway, [bool]$GatewayReply, [int]$Sent, [int]$Replies, $AvgMs, $TcpOk, [bool]$DnsOk, $DnsMs) {
+    # Section 09 (v3.23, constat V8 de l'audit du 23/11/2026) : le ping seul ne juge plus l'accès à Internet.
+    # Une box qui ne répond pas au ping donnait « injoignable » en FAIL alors que le DNS réussissait juste après ;
+    # un seul ping perdu sur 4 donnait un avertissement. $TcpOk : connexion TCP réussie, testée seulement si aucun
+    # ping n'a répondu ($null sinon). Rend Up (Internet joignable) et Rows : Label, State, Text, Advice (lignes de
+    # conseil). Fonction pure, T1.
+    $up = ($Replies -gt 0) -or ($TcpOk -eq $true)
+    $rows = @()
+    $boxAdvice = 'vérifie le câble ou le Wi-Fi (icône près de l''horloge), puis redémarre la box (débranche-la 30 secondes).'
+    if ($Gateway) {
+        if ($GatewayReply) {
+            $rows += [pscustomobject]@{ Label = 'Box ou routeur (passerelle)'; State = 'OK'; Text = "$Gateway joignable"; Advice = @() }
+        } elseif ($up) {
+            $rows += [pscustomobject]@{ Label = 'Box ou routeur (passerelle)'; State = 'INFO'
+                                        Text = "$Gateway ne répond pas au ping (fréquent : Internet fonctionne)"; Advice = @() }
+        } else {
+            $rows += [pscustomobject]@{ Label = 'Box ou routeur (passerelle)'; State = 'FAIL'; Text = "$Gateway injoignable"
+                                        Advice = @('Le PC n''atteint pas ta box : ' + $boxAdvice) }
+        }
+    }
+    if ($Replies -gt 0) {
+        $avg = 0
+        if ($null -ne $AvgMs) { $avg = [math]::Round([double]$AvgMs) }
+        $loss = 0
+        if ($Sent -gt 0) { $loss = [math]::Round((($Sent - $Replies) / $Sent) * 100) }
+        $txt = '{0} ms en moyenne  //  perte {1}%' -f $avg, $loss
+        if ($avg -gt 100 -or $loss -ge 50) {
+            $rows += [pscustomobject]@{ Label = 'Temps de réponse Internet'; State = 'WARN'; Text = $txt
+                                        Advice = @('Connexion lente ou instable : en Wi-Fi, rapproche-toi de la box ; sinon redémarre-la.') }
+        } else {
+            $rows += [pscustomobject]@{ Label = 'Temps de réponse Internet'; State = 'OK'; Text = $txt; Advice = @() }
+        }
+    } elseif ($up) {
+        $rows += [pscustomobject]@{ Label = 'Accès Internet'; State = 'OK'
+                                    Text = 'fonctionne (ping bloqué par le réseau, temps de réponse non mesuré)'; Advice = @() }
+    } else {
+        $adv = 'Le PC n''est relié à aucun réseau : branche le câble ou connecte-toi au Wi-Fi (icône près de l''horloge).'
+        if ($Gateway -and $GatewayReply) {
+            $adv = 'Ta box répond mais pas Internet : redémarre-la (débranche-la 30 secondes) ; si ça continue, appelle ton fournisseur.'
+        } elseif ($Gateway) {
+            $adv = 'Commence par la box : ' + $boxAdvice
+        }
+        $rows += [pscustomobject]@{ Label = 'Accès Internet'; State = 'FAIL'; Text = 'aucune réponse'; Advice = @($adv) }
+    }
+    if ($DnsOk) {
+        $ms = 0
+        if ($null -ne $DnsMs) { $ms = [double]$DnsMs }
+        $rows += [pscustomobject]@{ Label = 'Noms de sites (DNS)'; State = 'OK'; Text = ('{0:N0} ms' -f $ms); Advice = @() }
+    } elseif ($up) {
+        $rows += [pscustomobject]@{ Label = 'Noms de sites (DNS)'; State = 'FAIL'; Text = 'échec'
+                                    Advice = @('Internet répond, mais les noms de sites ne sont pas traduits en adresses : redémarre la box.',
+                                               'Si ça continue : Paramètres > Réseau et Internet > ta connexion > serveur DNS : Automatique.') }
+    } else {
+        $rows += [pscustomobject]@{ Label = 'Noms de sites (DNS)'; State = 'INFO'; Text = 'échec, faute d''accès Internet'; Advice = @() }
+    }
+    return [pscustomobject]@{ Up = $up; Rows = $rows }
 }
 
 function Get-DiskErrorVerdict($Events, $Arrivals, $Present) {
@@ -4840,7 +5027,121 @@ function Invoke-SelfTestAnalyzers {
         $a = Get-AvState 266240; Assert-True ($a.On -and $a.UpToDate) '266240 : attendu actif + à jour'
         $b = Get-AvState 262144; Assert-True (-not $b.On) '262144 : attendu inactif'
         $c = Get-AvState 397584; Assert-True ($c.On -and -not $c.UpToDate) '397584 : attendu actif + obsolète'
-        '3/3 cas'
+        # v3.23 (audit T10) : valeur absente ou illisible = lecture impossible, plus « inactif »
+        Assert-True ($null -eq (Get-AvState $null)) 'valeur absente lue comme un état'
+        Assert-True ($null -eq (Get-AvState '')) 'valeur vide lue comme un état'
+        Assert-True ($null -eq (Get-AvState 'abc')) 'valeur non numérique lue comme un état'
+        $d = Get-AvState '397568'; Assert-True ($d.On -and $d.UpToDate) '397568 (texte) : attendu actif + à jour'
+        '7/7 cas'
+    }
+    Test-Case 'Synthèse : contrôles non vérifiés' {
+        # Lignes INFO réelles du scan qui disent qu'une lecture a échoué, et lignes qui n'en sont pas
+        $yes = @('lecture impossible', 'lecture du journal impossible', 'âge illisible', 'santé illisible', 'statut indisponible',
+                 'non vérifiable (BIOS ancien ?)', 'résultat non reconnu', 'non lues : J.A.R.V.I.S. tourne sous un autre compte que le tien',
+                 'non lu : J.A.R.V.I.S. tourne sous un autre compte que le tien', 'nécessite les droits admin',
+                 'v1.2  (date du pilote illisible)', 'non lues (liste visible seulement en administrateur)')
+        $no = @('aucun', 'non chiffré', 'désactivé (réglage d''origine de Windows)', '3 actif(s), dont 1 administrateur(s)',
+                'en retrait, remplacé par Avast', 'Erreurs d''un appareil débranché', '', 'échec, faute d''accès Internet',
+                '192.168.1.1 ne répond pas au ping (fréquent : Internet fonctionne)')
+        foreach ($v in $yes) { Assert-True (Test-UnreadValue $v) ("« {0} » non repéré" -f $v) }
+        foreach ($v in $no) { Assert-True (-not (Test-UnreadValue $v)) ("« {0} » pris pour une lecture impossible" -f $v) }
+        Assert-True (-not (Test-UnreadValue $null)) 'valeur absente'
+        '{0}/{0} cas' -f ($yes.Count + $no.Count + 1)
+    }
+    Test-Case 'Synthèse : état général' {
+        $cases = @(
+            @(0, 0, 0, 'GOOD', 'EN BON ÉTAT'),
+            @(0, 0, 2, 'GOOD', 'RIEN D''ANORMAL VU'),     # jamais « en bon état » avec des points non lus
+            @(3, 0, 0, 'WATCH', 'À SURVEILLER'),
+            @(3, 0, 5, 'WATCH', 'À SURVEILLER'),
+            @(0, 1, 0, 'ACT', 'À TRAITER'),
+            @(12, 1, 4, 'ACT', 'À TRAITER')                # une alerte l'emporte, quel que soit le nombre de OK
+        )
+        foreach ($c in $cases) {
+            $v = Get-ScanVerdict $c[0] $c[1] $c[2]
+            Assert-True ($v.Level -eq $c[3] -and $v.Title -eq $c[4]) ('{0} WARN, {1} FAIL, {2} non lus -> {3} « {4} »' -f $c[0], $c[1], $c[2], $v.Level, $v.Title)
+        }
+        Assert-True ((Get-ScanVerdict 0 0 2).Line -match '2 point') 'nombre de points non vérifiés absent'
+        '{0}/{0} cas' -f ($cases.Count + 1)
+    }
+    Test-Case 'Disques : santé et compteurs' {
+        $cases = @(
+            @('Healthy', 40, 3, 0, 'OK', ''),
+            @('Healthy', $null, $null, $null, 'OK', ''),          # sans droits admin : compteurs non lus
+            @('0', 40, 3, 0, 'OK', ''),                           # état rendu en nombre
+            @('Unknown', $null, $null, $null, 'INFO', 'UNKNOWN'), # avant la v3.23 : alerte rouge
+            @('', $null, $null, $null, 'INFO', 'UNKNOWN'),
+            @('Warning', 40, 3, 0, 'WARN', 'HEALTH'),
+            @('Unhealthy', 40, 3, 0, 'FAIL', 'HEALTH'),
+            @('2', $null, $null, $null, 'FAIL', 'HEALTH'),
+            @('Healthy', 40, 100, 0, 'FAIL', 'WORN'),            # avant la v3.23 : simple avertissement
+            @('Healthy', 40, 85, 0, 'WARN', 'WEAR'),
+            @('Healthy', 70, 3, 0, 'WARN', 'HOT'),
+            @('Healthy', 40, 3, 2, 'FAIL', 'ERRORS'),
+            @('Unknown', 40, 3, 2, 'FAIL', 'ERRORS'),             # santé illisible mais erreurs lues : l'alerte reste
+            @('Unknown', 40, 90, 0, 'WARN', 'WEAR')
+        )
+        foreach ($c in $cases) {
+            $v = Get-DiskHealthVerdict $c[0] $c[1] $c[2] $c[3]
+            Assert-True ($v.State -eq $c[4] -and $v.Why -eq $c[5]) ('« {0} » / {1} °C / usure {2} / {3} erreurs -> {4} {5}, attendu {6} {7}' -f $c[0], $c[1], $c[2], $c[3], $v.State, $v.Why, $c[4], $c[5])
+        }
+        Assert-True ((Get-DiskHealthVerdict 'Healthy' $null $null $null).Text -eq 'santé : bonne') 'texte de santé'
+        Assert-True ((Get-DiskHealthVerdict 'Unknown' $null $null $null).Text -eq 'santé illisible') 'texte de santé illisible'
+        foreach ($w in 'HEALTH', 'ERRORS', 'WORN', 'WEAR', 'HOT') { Assert-True (@(Get-DiskAdvice $w).Count -gt 0) "aucun conseil pour $w" }
+        Assert-True (@(Get-DiskAdvice '').Count -eq 0) 'conseil pour un disque sain'
+        '{0}/{0} cas' -f ($cases.Count + 8)
+    }
+    Test-Case 'BitLocker : état du chiffrement' {
+        $cases = @(
+            @('On', 'FullyEncrypted', 'INFO', 'chiffré et protégé'),
+            @('Off', 'FullyDecrypted', 'INFO', 'non chiffré'),
+            @('Off', 'FullyEncrypted', 'WARN', 'chiffré, protection suspendue'),
+            @('Off', 'EncryptionInProgress', 'INFO', 'chiffrement en cours'),   # avant la v3.23 : « protection suspendue »
+            @('Off', 'DecryptionInProgress', 'INFO', 'déchiffrement en cours'),
+            @('Unknown', 'FullyEncrypted', 'INFO', 'état illisible'),
+            @('', '', 'INFO', 'état illisible')
+        )
+        foreach ($c in $cases) {
+            $v = Get-BitLockerVerdict $c[0] $c[1]
+            Assert-True ($v.State -eq $c[2] -and $v.Text -eq $c[3]) ('{0} / {1} -> {2} « {3} »' -f $c[0], $c[1], $v.State, $v.Text)
+        }
+        '{0}/{0} cas' -f $cases.Count
+    }
+    Test-Case 'Réseau : box, ping, TCP et DNS' {
+        # Rend « Label=État » pour chaque ligne, dans l'ordre d'affichage
+        $sum = { param($v) (@($v.Rows) | ForEach-Object { '{0}={1}' -f $_.Label, $_.State }) -join ' | ' }
+        $box = 'Box ou routeur (passerelle)'; $rt = 'Temps de réponse Internet'; $ia = 'Accès Internet'; $dn = 'Noms de sites (DNS)'
+        $cases = @(
+            # PC de Thomas (rapport du 22/11/2026) : tout répond
+            @('192.168.1.1', $true, 4, 15, $null, $true, "$box=OK | $rt=OK | $dn=OK", $true),
+            # 1 ping perdu sur 4 : plus un avertissement
+            @('192.168.1.1', $true, 3, 20, $null, $true, "$box=OK | $rt=OK | $dn=OK", $true),
+            @('192.168.1.1', $true, 2, 20, $null, $true, "$box=OK | $rt=WARN | $dn=OK", $true),
+            @('192.168.1.1', $true, 4, 150, $null, $true, "$box=OK | $rt=WARN | $dn=OK", $true),
+            # Box muette au ping, Internet joignable : information, plus une alerte
+            @('192.168.1.1', $false, 4, 15, $null, $true, "$box=INFO | $rt=OK | $dn=OK", $true),
+            # Réseau qui bloque tout ping, connexion TCP réussie
+            @('192.168.1.1', $false, 0, $null, $true, $true, "$box=INFO | $ia=OK | $dn=OK", $true),
+            # Vraie panne : box et Internet muets, DNS en échec sans faute propre
+            @('192.168.1.1', $false, 0, $null, $false, $false, "$box=FAIL | $ia=FAIL | $dn=INFO", $false),
+            # Box joignable, Internet coupé chez le fournisseur
+            @('192.168.1.1', $true, 0, $null, $false, $false, "$box=OK | $ia=FAIL | $dn=INFO", $false),
+            # Aucun réseau (pas de passerelle)
+            @('', $false, 0, $null, $false, $false, "$ia=FAIL | $dn=INFO", $false),
+            # Internet joignable mais DNS en panne
+            @('192.168.1.1', $true, 4, 15, $null, $false, "$box=OK | $rt=OK | $dn=FAIL", $true)
+        )
+        foreach ($c in $cases) {
+            $v = Get-NetworkVerdict $c[0] $c[1] 4 $c[2] $c[3] $c[4] $c[5] 20
+            $got = & $sum $v
+            Assert-True ($got -eq $c[6] -and $v.Up -eq $c[7]) ('« {0} » attendu « {1} »' -f $got, $c[6])
+            foreach ($r in @($v.Rows | Where-Object { $_.State -eq 'WARN' -or $_.State -eq 'FAIL' })) {
+                Assert-True (@($r.Advice).Count -gt 0) ('{0} en {1} sans conseil' -f $r.Label, $r.State)
+            }
+        }
+        $v = Get-NetworkVerdict '192.168.1.1' $true 4 3 20.4 $null $true 20
+        Assert-True (@($v.Rows)[1].Text -eq '20 ms en moyenne  //  perte 25%') ('texte du temps de réponse : ' + @($v.Rows)[1].Text)
+        '{0}/{0} cas' -f ($cases.Count + 1)
     }
     Test-Case 'NVIDIA : conversion de version' {
         $cases = @{ '32.0.15.6094' = '560.94'; '31.0.15.5222' = '552.22'; '27.21.14.5671' = '456.71' }
@@ -6602,7 +6903,7 @@ Write-Section '01' 'Système'
 $os = Get-CimInstance Win32_OperatingSystem
 $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 Write-Status 'Système' ('{0} {1}' -f $os.Caption, $cv.DisplayVersion) 'INFO'
-Write-Status 'Build' ('{0}.{1}' -f $cv.CurrentBuild, $cv.UBR) 'INFO'
+Write-Status 'Numéro de version (build)' ('{0}.{1}' -f $cv.CurrentBuild, $cv.UBR) 'INFO'
 if ($cv -and $cv.CurrentBuild -and [int]$cv.CurrentBuild -lt 22000) {
     Write-Status 'Support Windows 10' 'terminé le 14/10/2025 (sauf abonnement ESU)' 'WARN'
     Write-Sub 'Passage à Windows 11 conseillé si le matériel est compatible'
@@ -6614,12 +6915,17 @@ $cs = Get-CimInstance Win32_ComputerSystem
 Write-Status 'Machine' ('{0}  //  {1}' -f $typeTxt, (Get-MachineLabel $cs.Manufacturer $cs.Model)) 'INFO'
 
 if ($os -and $os.LastBootUpTime) {
+    # v3.23 (audit, constat V10) : « Uptime » remplacé, et le conseil dit pourquoi « Arrêter » ne suffit pas
     $up = (Get-Date) - $os.LastBootUpTime
-    $upTxt = '{0} j {1} h {2} min' -f $up.Days, $up.Hours, $up.Minutes
-    if ($up.TotalDays -gt 7) { Write-Status 'Uptime' "$upTxt (redémarrage conseillé)" 'WARN' }
-    else { Write-Status 'Uptime' $upTxt 'OK' }
+    $upTxt = 'il y a {0} j {1} h {2} min' -f $up.Days, $up.Hours, $up.Minutes
+    if ($up.TotalDays -gt 7) {
+        Write-Status 'Dernier redémarrage' "$upTxt (redémarrage conseillé)" 'WARN'
+        Write-Sub 'Démarrer > Marche/Arrêt > Redémarrer. « Arrêter » ne suffit pas : avec le démarrage rapide de'
+        Write-Sub 'Windows, le PC reprend là où il s''était arrêté au lieu de repartir de zéro.'
+    }
+    else { Write-Status 'Dernier redémarrage' $upTxt 'OK' }
 } else {
-    Write-Status 'Uptime' 'lecture impossible' 'INFO'
+    Write-Status 'Dernier redémarrage' 'lecture impossible' 'INFO'
 }
 
 $pending = @()
@@ -6643,7 +6949,10 @@ try {
     if ($last) {
         $age = ((Get-Date) - [datetime]$last).Days
         $txt = "{0} (il y a {1} j)" -f (Format-Date $last), $age
-        if ($age -gt 30) { Write-Status 'Dernière installation' $txt 'WARN' }
+        if ($age -gt 30) {
+            Write-Status 'Dernière installation' $txt 'WARN'
+            Write-Sub 'Paramètres > Windows Update > Rechercher des mises à jour ; si rien ne s''installe, redémarre et réessaie.'
+        }
         else { Write-Status 'Dernière installation' $txt 'OK' }
     }
 } catch {}
@@ -6670,10 +6979,13 @@ $wu = Invoke-Spinner 'Interrogation des serveurs Microsoft' {
     }
 } 240
 
+$wuRetry = 'Vérifie la connexion Internet, redémarre le PC puis relance le scan ; sinon Paramètres > Windows Update.'
 if ($null -eq $wu) {
     Write-Status 'Recherche de mises à jour' 'délai dépassé (4 min)' 'WARN'
+    Write-Sub $wuRetry
 } elseif (-not $wu.Ok) {
     Write-Status 'Recherche de mises à jour' ('échec : ' + (Cut $wu.Error 50)) 'WARN'
+    Write-Sub $wuRetry
 } else {
     $all = @($wu.Updates)
     # Signatures de Defender : Defender les installe lui-même plusieurs fois par jour, leur âge est jugé en
@@ -6695,6 +7007,7 @@ if ($null -eq $wu) {
             if ($u.Driver) { $kind = 'PILOTE' }
             Write-Sub ("[{0}] {1}" -f $kind, (Cut $u.Title 70)) 'Yellow'
         }
+        Write-Sub 'J.A.R.V.I.S. te propose de les installer à la fin du scan.'
     }
     if ($defs.Count -gt 0) {
         Write-Status 'Signatures Defender' ("{0} en attente : Defender les installe de lui-même" -f $defs.Count) 'INFO'
@@ -6867,13 +7180,17 @@ if ($NoWinget) {
         return $out
     } 300 -ArgumentList $wgParser, $wgUnknown, $wgSplit
 
+    $wgRetry = 'Vérifie la connexion Internet puis relance le scan ; si ça revient, mets à jour'
+    $wgRetry2 = '« Programme d''installation d''application » dans le Microsoft Store (Bibliothèque).'
     if ($null -eq $wg) {
         Write-Status 'winget' 'délai dépassé (5 min)' 'WARN'
+        Write-Sub $wgRetry; Write-Sub $wgRetry2
     } elseif ($wg.Error -eq 'NOWINGET') {
         Write-Status 'winget' 'non installé' 'INFO'
         Write-Sub 'Installer « Programme d''installation d''application » depuis le Microsoft Store'
     } elseif ($wg.Error) {
         Write-Status 'winget' $wg.Error 'WARN'
+        Write-Sub $wgRetry; Write-Sub $wgRetry2
     } else {
         $items = @($wg.Items)
         foreach ($it in $items) {
@@ -6907,6 +7224,7 @@ if ($NoWinget) {
                     Write-Sub (Cut $it.Name 90) 'Yellow'
                 }
             }
+            Write-Sub 'J.A.R.V.I.S. te propose de les mettre à jour à la fin du scan.'
         }
         if ($wg.Unknown -gt 0) {
             # winget ne connaît pas leur version installée : il refuse de les mettre à jour, inutile de les proposer
@@ -6954,6 +7272,7 @@ if ($null -eq $stq -or -not $stq.Ok) {
     } else {
         Write-Status 'Applications du Store' ("{0} à mettre à jour" -f $sItems.Count) 'WARN'
         foreach ($s in $sItems) { Write-Sub (Cut $s.Name 90) 'Yellow' }
+        Write-Sub 'J.A.R.V.I.S. te propose de les mettre à jour à la fin du scan.'
     }
     switch (Get-StoreAutoVerdict ([string]$stq.Auto)) {
         'OK' { Write-Status 'Mises à jour auto. du Store' 'activées' 'OK' }
@@ -7005,6 +7324,8 @@ if ($bt) {
             Write-Sub $Ref[$wifiModel].BTNote
         } else {
             Write-Status (Cut $bt.DeviceName 32) ("$btVal  -> $refBT disponible") 'WARN'
+            Write-Sub 'Mise à jour : Intel Driver & Support Assistant (site d''Intel), ou Windows Update >'
+            Write-Sub 'Options avancées > Mises à jour facultatives si elle y est proposée.'
         }
     } else {
         Write-Status (Cut $bt.DeviceName 32) $btVal 'INFO'
@@ -7029,13 +7350,24 @@ foreach ($g in $gpus) {
     }
     if ($g.DeviceName -match 'Basic Display|Microsoft Basic Render|Carte vid.o de base') {
         Write-Status (Cut $g.DeviceName 32) 'pilote générique Microsoft, pilote constructeur absent' 'FAIL'
+        Write-Sub 'Affichage et jeux limités : Windows Update > Options avancées > Mises à jour facultatives,'
+        Write-Sub 'sinon le site du fabricant du PC ou de la carte graphique (NVIDIA, AMD, Intel).'
         continue
     }
     if ($g.Manufacturer -match 'AMD|Advanced Micro') { $v += '  (version Adrenalin : logiciel AMD)' }
     $gAge = $null
     try { $gAge = ((Get-Date) - [datetime]$g.DriverDate).Days } catch { $gAge = $null }
     if ($null -eq $gAge) { Write-Status (Cut $g.DeviceName 32) ("$v  (date du pilote illisible)") 'INFO' }
-    elseif ($gAge -gt 180) { Write-Status (Cut $g.DeviceName 32) ("$v  (> 6 mois)") 'WARN' }
+    elseif ($gAge -gt 180) {
+        # v3.23 (audit, constat V1) : INFO comme le BIOS, la date seule ne dit pas qu'une mise à jour manque
+        # (vu 30 scans sur 30 pour la puce Intel intégrée d'un PC dont la carte NVIDIA est à jour)
+        Write-Status (Cut $g.DeviceName 32) ("$v  (> 6 mois)") 'INFO'
+        $gTool = 'logiciel du fabricant de la carte graphique'
+        if ($g.Manufacturer -match 'NVIDIA') { $gTool = 'application NVIDIA App' }
+        elseif ($g.Manufacturer -match 'AMD|Advanced Micro') { $gTool = 'logiciel AMD Software (Adrenalin)' }
+        elseif ($g.Manufacturer -match 'Intel') { $gTool = 'Intel Driver & Support Assistant' }
+        Write-Sub ('Utile surtout pour les jeux ou un souci d''affichage : ' + $gTool + '.')
+    }
     else { Write-Status (Cut $g.DeviceName 32) $v 'OK' }
 }
 
@@ -7061,6 +7393,10 @@ foreach ($d in $bad) {
 }
 if (-not $pnpRead) { Write-Status 'Périphériques en erreur' 'lecture impossible' 'INFO' }
 elseif ($realBad -eq 0) { Write-Status 'Périphériques en erreur' 'aucun' 'OK' }
+else {
+    Write-Sub 'Appareil externe : débranche-le et rebranche-le. Sinon, clic droit sur Démarrer > Gestionnaire de'
+    Write-Sub 'périphériques > appareil marqué d''un triangle > clic droit > Mettre à jour le pilote, puis redémarre.'
+}
 
 # ==================================================================
 # [05] BLUETOOTH
@@ -7088,7 +7424,11 @@ if ($svc) {
     }
 }
 if ($svc -and $svc.Status -eq 'Running') { Write-Status 'Service Bluetooth (bthserv)' 'en cours' 'OK' }
-elseif ($svc -and $hasBtRadio) { Write-Status 'Service Bluetooth (bthserv)' $svcTxt 'FAIL' }
+elseif ($svc -and $hasBtRadio) {
+    Write-Status 'Service Bluetooth (bthserv)' $svcTxt 'FAIL'
+    Write-Sub 'Redémarre le PC. Si la ligne revient : menu Démarrer, tape « services », ouvre'
+    Write-Sub '« Service de prise en charge Bluetooth » > Type de démarrage : Manuel > Démarrer.'
+}
 elseif ($svc -and $bt.State -eq 'NONE') { Write-Status 'Service Bluetooth (bthserv)' ($svcTxt + ' (normal sans Bluetooth)') 'INFO' }
 elseif ($svc) { Write-Status 'Service Bluetooth (bthserv)' $svcTxt 'INFO' }
 else { Write-Status 'Service Bluetooth (bthserv)' 'introuvable' 'INFO' }
@@ -7098,7 +7438,11 @@ if ($bt.State -eq 'UNKNOWN') {
     Write-Status 'Adaptateur' 'lecture impossible' 'INFO'
 } elseif ($radio) {
     if ($radio.Status -eq 'OK') { Write-Status 'Adaptateur' $radio.FriendlyName 'OK' }
-    else { Write-Status 'Adaptateur' ("{0} : {1}" -f $radio.FriendlyName, $radio.Status) 'FAIL' }
+    else {
+        Write-Status 'Adaptateur' ("{0} : {1}" -f $radio.FriendlyName, $radio.Status) 'FAIL'
+        Write-Sub 'Redémarre le PC. Si la ligne revient : clic droit sur Démarrer > Gestionnaire de périphériques >'
+        Write-Sub 'Bluetooth > clic droit sur l''adaptateur > Activer le périphérique (ou Mettre à jour le pilote).'
+    }
 
     $pm = Get-CimInstance -Namespace root\wmi -ClassName MSPower_DeviceEnable |
           Where-Object { $_.InstanceName -like ($radio.InstanceId + '*') } | Select-Object -First 1
@@ -7129,16 +7473,30 @@ Write-Section '06' 'Sécurité'
 
 # Antivirus déclarés au Centre de sécurité Windows (Defender ou tiers)
 $avOther = @()
-$avs = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct)
-foreach ($av in $avs) {
-    if ($av.displayName -match 'Defender') { continue }
-    $st  = Get-AvState $av.productState
-    $on  = $st.On
-    $upd = $st.UpToDate
-    if ($on) { $avOther += $av.displayName }
-    if (-not $on) { Write-Status ('Antivirus ' + $av.displayName) 'installé mais inactif' 'WARN' }
-    elseif ($upd) { Write-Status ('Antivirus ' + $av.displayName) 'actif, à jour' 'OK' }
-    else { Write-Status ('Antivirus ' + $av.displayName) 'actif, signatures obsolètes' 'FAIL' }
+$avDef = $null      # état de Defender d'après le Centre de sécurité (repli si Get-MpComputerStatus ne répond pas)
+$avs = $null        # $null = Centre de sécurité illisible (différent de « aucun antivirus »)
+try { $avs = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop) } catch { $avs = $null }
+$secWhere = 'Sécurité Windows > Protection contre les virus et menaces > Gérer les paramètres'
+$sigWhere = @('Sécurité Windows > Protection contre les virus et menaces > Mises à jour de la protection',
+              '> Rechercher des mises à jour.')
+if ($null -ne $avs) {
+    foreach ($av in $avs) {
+        $st = Get-AvState $av.productState
+        if ($av.displayName -match 'Defender') { $avDef = $st; continue }
+        if ($null -eq $st) { Write-Status ('Antivirus ' + $av.displayName) 'état illisible' 'INFO'; continue }
+        if ($st.On) { $avOther += $av.displayName }
+        if (-not $st.On) {
+            Write-Status ('Antivirus ' + $av.displayName) 'installé mais inactif' 'WARN'
+            Write-Sub 'Ouvre ce logiciel et réactive sa protection. Si tu ne t''en sers plus, désinstalle-le'
+            Write-Sub '(Paramètres > Applications) : Microsoft Defender, gratuit, reprendra le relais.'
+        }
+        elseif ($st.UpToDate) { Write-Status ('Antivirus ' + $av.displayName) 'actif, à jour' 'OK' }
+        else {
+            Write-Status ('Antivirus ' + $av.displayName) 'actif, signatures obsolètes' 'FAIL'
+            Write-Sub 'Ouvre ce logiciel et lance sa mise à jour. Abonnement terminé ? Désinstalle-le'
+            Write-Sub '(Paramètres > Applications) : Microsoft Defender, gratuit, reprendra le relais.'
+        }
+    }
 }
 
 $mp = Get-MpComputerStatus
@@ -7146,23 +7504,29 @@ if ($mp -and -not $mp.RealTimeProtectionEnabled -and $avOther.Count -gt 0) {
     Write-Status 'Microsoft Defender' ('en retrait, remplacé par ' + ($avOther -join ', ')) 'INFO'
 } elseif ($mp) {
     if ($mp.RealTimeProtectionEnabled) { Write-Status 'Defender temps réel' 'actif' 'OK' }
-    else { Write-Status 'Defender temps réel' 'inactif' 'FAIL' }
+    else {
+        Write-Status 'Defender temps réel' 'inactif' 'FAIL'
+        Write-Sub $secWhere
+        Write-Sub '> Protection en temps réel : Activé. S''il se recoupe seul ou reste grisé, demande de l''aide.'
+    }
     $sig = $null
     if ($null -ne $mp.AntivirusSignatureAge -and [double]$mp.AntivirusSignatureAge -lt 4294967295) { $sig = [int]$mp.AntivirusSignatureAge }
     if ($null -eq $sig) {
         Write-Status 'Signatures antivirus' 'âge illisible' 'INFO'
     } else {
         $sigTxt = "v{0}  (âge {1} j)" -f $mp.AntivirusSignatureVersion, $sig
-        if ($sig -gt 7) { Write-Status 'Signatures antivirus' $sigTxt 'FAIL' }
-        elseif ($sig -gt 1) { Write-Status 'Signatures antivirus' $sigTxt 'WARN' }
+        if ($sig -gt 7) { Write-Status 'Signatures antivirus' $sigTxt 'FAIL'; foreach ($l in $sigWhere) { Write-Sub $l } }
+        elseif ($sig -gt 1) { Write-Status 'Signatures antivirus' $sigTxt 'WARN'; foreach ($l in $sigWhere) { Write-Sub $l } }
         else { Write-Status 'Signatures antivirus' $sigTxt 'OK' }
     }
     if ($null -ne $mp.QuickScanAge -and $mp.QuickScanAge -lt 4294967295) {
         $qs = [int]$mp.QuickScanAge
-        if ($qs -gt 14) { Write-Status 'Dernière analyse rapide' "il y a $qs j" 'WARN' }
+        if ($qs -gt 14) {
+            Write-Status 'Dernière analyse rapide' "il y a $qs j" 'WARN'
+            if ($mp.AntivirusEnabled) { Write-Sub 'J.A.R.V.I.S. te propose une analyse rapide à la fin du scan.' }
+        }
         else { Write-Status 'Dernière analyse rapide' "il y a $qs j" 'OK' }
     }
-    $secWhere = 'Sécurité Windows > Protection contre les virus et menaces > Gérer les paramètres'
     $tp = Get-OnOffVerdict $mp.IsTamperProtected
     if ($tp -eq 'ON') { Write-Status 'Protection anti-falsification' 'active' 'OK' }
     elseif ($tp -eq 'OFF') {
@@ -7195,24 +7559,48 @@ if ($mp -and -not $mp.RealTimeProtectionEnabled -and $avOther.Count -gt 0) {
             if ($car.Count -eq 0) { Write-Status 'Accès contrôlé : exceptions' 'aucune application ajoutée' 'OK' }
             else { Write-Status 'Accès contrôlé : exceptions' ('{0} application(s) ajoutée(s), aucune à risque' -f $car.Count) 'OK' }
         } else {
-            Write-Status 'Accès contrôlé : exceptions' 'liste lisible seulement en administrateur' 'INFO'
+            Write-Status 'Accès contrôlé : exceptions' 'non lues (liste visible seulement en administrateur)' 'INFO'
         }
     }
     # L'analyse rapide n'est proposée en fin de scan que si Defender est bien l'antivirus en service
     $script:DefenderScan = [bool]$mp.AntivirusEnabled
-} else {
-    if ($avOther.Count -eq 0 -and $avs.Count -eq 0) {
-        Write-Status 'Antivirus' 'aucun antivirus détecté' 'FAIL'
+} elseif ($avOther.Count -gt 0) {
+    # Defender ne répond pas, mais un autre antivirus est actif : Defender est en retrait, c'est normal
+    Write-Status 'Microsoft Defender' ('en retrait, remplacé par ' + ($avOther -join ', ')) 'INFO'
+} elseif ($null -ne $avDef) {
+    # v3.23 (audit, constat V3) : Get-MpComputerStatus muet, le Centre de sécurité de Windows fait foi pour Defender.
+    # Avant, ce cas donnait « statut indisponible » en INFO, même pour un Defender arrêté.
+    if ($avDef.On -and $avDef.UpToDate) {
+        Write-Status 'Microsoft Defender' 'actif d''après Sécurité Windows (détails illisibles)' 'OK'
+    } elseif ($avDef.On) {
+        Write-Status 'Microsoft Defender' 'actif, signatures obsolètes d''après Sécurité Windows' 'FAIL'
+        foreach ($l in $sigWhere) { Write-Sub $l }
     } else {
-        Write-Status 'Microsoft Defender' 'statut indisponible' 'INFO'
+        Write-Status 'Microsoft Defender' 'inactif d''après Sécurité Windows' 'FAIL'
+        Write-Sub $secWhere
+        Write-Sub '> Protection en temps réel : Activé. S''il se recoupe seul ou reste grisé, demande de l''aide.'
     }
+} elseif ($null -eq $avs) {
+    Write-Status 'Antivirus' 'lecture impossible' 'INFO'
+} elseif ($avs.Count -eq 0) {
+    Write-Status 'Antivirus' 'aucun antivirus détecté' 'FAIL'
+    Write-Sub 'Ouvre Sécurité Windows > Protection contre les virus et menaces et active Microsoft Defender.'
+    Write-Sub 'Si rien ne s''active, demande de l''aide : le PC n''est pas protégé.'
+} else {
+    Write-Status 'Microsoft Defender' 'statut indisponible' 'INFO'
 }
 
 $fw = @(Get-NetFirewallProfile)
 if ($fw.Count -gt 0) {
-    $off = @($fw | Where-Object { -not $_.Enabled } | ForEach-Object { $_.Name })
+    $off = @($fw | Where-Object { -not $_.Enabled } | ForEach-Object {
+        switch ([string]$_.Name) { 'Domain' { 'domaine' } 'Private' { 'privé' } 'Public' { 'public' } default { [string]$_.Name } }
+    })
     if ($off.Count -eq 0) { Write-Status 'Pare-feu' 'actif sur tous les profils' 'OK' }
-    else { Write-Status 'Pare-feu' ('désactivé : ' + ($off -join ', ')) 'FAIL' }
+    else {
+        Write-Status 'Pare-feu' ('désactivé : réseau ' + ($off -join ', ')) 'FAIL'
+        Write-Sub 'Sécurité Windows > Pare-feu et protection du réseau > chaque réseau désactivé > Activé.'
+        Write-Sub 'Si un autre logiciel de sécurité gère ton pare-feu, vérifie plutôt qu''il est actif.'
+    }
 } else {
     Write-Status 'Pare-feu' 'lecture impossible' 'INFO'
 }
@@ -7220,25 +7608,40 @@ if ($fw.Count -gt 0) {
 if ($isAdmin) {
     try {
         $sb = Confirm-SecureBootUEFI -ErrorAction Stop
-        if ($sb) { Write-Status 'Secure Boot' 'actif' 'OK' }
+        if ($sb) { Write-Status 'Démarrage sécurisé (Secure Boot)' 'actif' 'OK' }
         else {
-            Write-Status 'Secure Boot' 'désactivé' 'WARN'
+            Write-Status 'Démarrage sécurisé (Secure Boot)' 'désactivé' 'WARN'
             Write-Sub 'Protège le démarrage de Windows ; il s''active dans le BIOS (menu Boot ou Security)'
             Write-Sub 'Pas urgent. Jamais allé dans le BIOS ? Fais-toi aider : un mauvais réglage peut empêcher Windows de démarrer'
         }
-    } catch { Write-Status 'Secure Boot' 'non vérifiable (BIOS legacy ?)' 'INFO' }
+    } catch { Write-Status 'Démarrage sécurisé (Secure Boot)' 'non vérifiable (BIOS ancien ?)' 'INFO' }
 
     $tpm = Get-Tpm
     if ($tpm) {
-        if ($tpm.TpmPresent -and $tpm.TpmReady) { Write-Status 'TPM' 'présent et prêt' 'OK' }
-        elseif ($tpm.TpmPresent) { Write-Status 'TPM' 'présent mais non prêt' 'WARN' }
-        else { Write-Status 'TPM' 'absent ou désactivé dans le BIOS' 'WARN' }
+        if ($tpm.TpmPresent -and $tpm.TpmReady) { Write-Status 'Puce de sécurité (TPM)' 'présente et prête' 'OK' }
+        elseif ($tpm.TpmPresent) {
+            Write-Status 'Puce de sécurité (TPM)' 'présente mais pas prête' 'WARN'
+            Write-Sub 'Sert au chiffrement et à Windows Hello. Windows la prépare en général seul : redémarre le PC.'
+            Write-Sub 'Si la ligne revient : Sécurité Windows > Sécurité de l''appareil > Processeur de sécurité.'
+        }
+        else {
+            Write-Status 'Puce de sécurité (TPM)' 'absente ou désactivée dans le BIOS' 'WARN'
+            Write-Sub 'Sert au chiffrement, exigée par Windows 11. Sur un PC récent, elle s''active dans le BIOS'
+            Write-Sub '(option TPM, PTT chez Intel, fTPM chez AMD). Pas urgent. Jamais allé dans le BIOS ? Fais-toi aider.'
+        }
     } else {
-        Write-Status 'TPM' 'lecture impossible' 'INFO'
+        Write-Status 'Puce de sécurité (TPM)' 'lecture impossible' 'INFO'
     }
 
-    $rp = Get-ComputerRestorePoint | Sort-Object SequenceNumber -Descending | Select-Object -First 1
-    if ($rp) {
+    # v3.23 (audit, constat V9) : aucun point de restauration = avertissement (rien pour revenir en arrière), un point
+    # ancien = information (il reste utilisable). C'était l'inverse.
+    $rpOk = $true
+    $rp = $null
+    try { $rp = Get-ComputerRestorePoint -ErrorAction Stop | Sort-Object SequenceNumber -Descending | Select-Object -First 1 } catch { $rpOk = $false }
+    $rpHow = 'menu Démarrer, tape « point de restauration » > Créer un point de restauration'
+    if (-not $rpOk) {
+        Write-Status 'Point de restauration' 'lecture impossible' 'INFO'
+    } elseif ($rp) {
         $rpDate = $null
         try { $rpDate = [Management.ManagementDateTimeConverter]::ToDateTime($rp.CreationTime) } catch {}
         if (-not $rpDate) {
@@ -7246,12 +7649,18 @@ if ($isAdmin) {
         } else {
             $rpAge = ((Get-Date) - $rpDate).Days
             $rpTxt = "{0} (il y a {1} j)" -f (Format-Date $rpDate), $rpAge
-            if ($rpAge -gt 30) { Write-Status 'Dernier point de restauration' $rpTxt 'WARN' }
+            if ($rpAge -gt 30) {
+                Write-Status 'Dernier point de restauration' $rpTxt 'INFO'
+                Write-Sub 'Toujours utilisable. Avant une grosse modification (pilote, logiciel inconnu), crées-en un :'
+                Write-Sub ($rpHow + ' > Créer.')
+            }
             else { Write-Status 'Dernier point de restauration' $rpTxt 'OK' }
         }
     } else {
-        Write-Status 'Point de restauration' 'aucun' 'INFO'
-        Write-Sub 'Protection système désactivée ou jamais utilisée (sysdm.cpl > Protection du système)'
+        Write-Status 'Point de restauration' 'aucun' 'WARN'
+        Write-Sub 'Rien pour annuler un pilote ou une mise à jour qui pose problème. Pour en avoir :'
+        Write-Sub ($rpHow + ' > disque C: > Configurer >')
+        Write-Sub '« Activer la protection du système » > OK, puis Créer.'
     }
 } else {
     Write-Status 'Secure Boot / TPM / restauration' 'nécessite les droits admin' 'INFO'
@@ -7402,8 +7811,15 @@ foreach ($v in $vols) {
     $pct = [math]::Round(($v.SizeRemaining / $v.Size) * 100, 0)
     $txt = "{0}  {1,3}% libre  ({2:N0} / {3:N0} Go)" -f (Get-MiniBar (100 - $pct)), $pct, ($v.SizeRemaining / 1GB), ($v.Size / 1GB)
     $label = "Volume {0}: {1}" -f $v.DriveLetter, $v.FileSystemLabel
-    if ($pct -lt 10) { Write-Status $label $txt 'FAIL' }
-    elseif ($pct -lt 20) { Write-Status $label $txt 'WARN' }
+    if ($pct -lt 20) {
+        if ($pct -lt 10) { Write-Status $label $txt 'FAIL' } else { Write-Status $label $txt 'WARN' }
+        if (('{0}:' -f $v.DriveLetter) -eq $env:SystemDrive) {
+            Write-Sub 'Windows a besoin de place pour ses mises à jour. Paramètres > Système > Stockage montre ce qui'
+            Write-Sub 'la prend ; Paramètres > Applications : désinstalle les jeux et logiciels dont tu ne te sers plus.'
+        } else {
+            Write-Sub 'Déplace ou supprime des fichiers volumineux (vidéos, jeux installés) de ce disque.'
+        }
+    }
     else { Write-Status $label $txt 'OK' }
 }
 
@@ -7412,40 +7828,36 @@ if ($vols.Count -eq 0) { Write-Status 'Volumes' 'lecture impossible' 'INFO' }
 $disks = @(Get-PhysicalDisk)
 if ($disks.Count -eq 0) { Write-Status 'Disques' 'lecture impossible' 'INFO' }
 foreach ($d in $disks) {
-    $txt = "{0}  {1:N0} Go  santé : {2}" -f $d.MediaType, ($d.Size / 1GB), $d.HealthStatus
-    $state = 'FAIL'
-    if ($d.HealthStatus -eq 'Healthy') { $state = 'OK' }
-    elseif ($d.HealthStatus -eq 'Warning') { $state = 'WARN' }
-
+    # v3.23 (audit, constat V6) : verdict par Get-DiskHealthVerdict (T1), santé et type en français, conseil sous la ligne
+    $media = switch ([string]$d.MediaType) { 'HDD' { 'Disque dur' } 'SSD' { 'SSD' } 'SCM' { 'SCM' } default { 'Disque' } }
     $rc = $null
     if ($isAdmin) { $rc = $d | Get-StorageReliabilityCounter }
     $extra = @()
+    $rcTemp = $null; $rcWear = $null; $rcErr = $null
     if ($rc) {
-        if ($rc.Temperature -gt 0) {
-            $extra += ('{0} °C' -f $rc.Temperature)
-            if ($rc.Temperature -ge 65 -and $state -eq 'OK') { $state = 'WARN' }
-        }
-        if ($null -ne $rc.Wear) {
-            $extra += ('usure {0}%' -f $rc.Wear)
-            if ($rc.Wear -ge 80 -and $state -eq 'OK') { $state = 'WARN' }
-        }
+        if ($rc.Temperature -gt 0) { $rcTemp = $rc.Temperature; $extra += ('{0} °C' -f $rc.Temperature) }
+        if ($null -ne $rc.Wear) { $rcWear = $rc.Wear; $extra += ('usure {0}%' -f $rc.Wear) }
         if ($rc.PowerOnHours -gt 0) { $extra += ('{0:N0} h allumé' -f $rc.PowerOnHours) }
-        if ($rc.ReadErrorsUncorrected -gt 0) {
-            $extra += ('{0} erreurs de lecture' -f $rc.ReadErrorsUncorrected)
-            $state = 'FAIL'
-        }
+        if ($rc.ReadErrorsUncorrected -gt 0) { $rcErr = $rc.ReadErrorsUncorrected; $extra += ('{0} erreurs de lecture' -f $rc.ReadErrorsUncorrected) }
     }
-    Write-Status (Cut $d.FriendlyName 32) $txt $state
+    $dv = Get-DiskHealthVerdict ([string]$d.HealthStatus) $rcTemp $rcWear $rcErr
+    Write-Status (Cut $d.FriendlyName 32) ("{0}  {1:N0} Go  {2}" -f $media, ($d.Size / 1GB), $dv.Text) $dv.State
     if ($extra.Count -gt 0) { Write-Sub ($extra -join '  //  ') }
+    foreach ($l in (Get-DiskAdvice $dv.Why)) { Write-Sub $l }
 }
 
 if ($isAdmin -and (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue)) {
     $bl = Get-BitLockerVolume -MountPoint $env:SystemDrive
     if ($bl) {
-        $blTxt = 'non chiffré'
-        if ([string]$bl.ProtectionStatus -eq 'On') { $blTxt = 'chiffré et protégé' }
-        elseif ([string]$bl.VolumeStatus -ne 'FullyDecrypted') { $blTxt = ('chiffré, protection suspendue ({0})' -f $bl.VolumeStatus) }
-        Write-Status ('BitLocker ' + $env:SystemDrive) $blTxt 'INFO'
+        # v3.23 (audit, constat V9) : « protection suspendue » devient un avertissement, avec quoi faire
+        $blv = Get-BitLockerVerdict ([string]$bl.ProtectionStatus) ([string]$bl.VolumeStatus)
+        Write-Status ('Chiffrement ' + $env:SystemDrive + ' (BitLocker)') $blv.Text $blv.State
+        if ($blv.State -eq 'WARN') {
+            Write-Sub 'Tes fichiers sont chiffrés mais la clé reste lisible : le chiffrement ne protège plus.'
+            Write-Sub 'Il reprend en général seul au redémarrage (après une mise à jour du BIOS ou de Windows).'
+            Write-Sub 'Si la ligne revient : menu Démarrer, tape « BitLocker » > Reprendre la protection,'
+            Write-Sub 'ou Paramètres > Confidentialité et sécurité > Chiffrement de l''appareil.'
+        }
     }
 }
 
@@ -7459,11 +7871,15 @@ if ($cpus.Count -gt 0) {
     Write-Status 'Processeur' (Cut ($cpus[0].Name.Trim()) 45) 'INFO'
     $avgLoad = ($cpus | Measure-Object -Property LoadPercentage -Average).Average
     if ($null -eq $avgLoad) {
-        Write-Status 'Charge CPU' 'lecture impossible' 'INFO'
+        Write-Status 'Charge du processeur' 'lecture impossible' 'INFO'
     } else {
         $load = [math]::Round($avgLoad)
         $txt = "{0}  {1}%" -f (Get-MiniBar $load), $load
-        if ($load -gt 85) { Write-Status 'Charge CPU' $txt 'WARN' } else { Write-Status 'Charge CPU' $txt 'OK' }
+        if ($load -gt 85) {
+            Write-Status 'Charge du processeur' $txt 'WARN'
+            Write-Sub 'Mesure prise pendant le scan, qui fait lui-même travailler le PC. Si le PC est lent au quotidien :'
+            Write-Sub 'Ctrl + Maj + Échap (Gestionnaire des tâches) > Processus, et ferme ce qui consomme sans raison.'
+        } else { Write-Status 'Charge du processeur' $txt 'OK' }
     }
 }
 
@@ -7473,7 +7889,11 @@ if ($os -and $os.TotalVisibleMemorySize -gt 0 -and $null -ne $os.FreePhysicalMem
     $freeGB = $os.FreePhysicalMemory / 1MB
     $usedPct = [math]::Round((1 - ($freeGB / $totGB)) * 100)
     $txt = "{0}  {1}%  ({2:N1} / {3:N1} Go)" -f (Get-MiniBar $usedPct), $usedPct, ($totGB - $freeGB), $totGB
-    if ($usedPct -gt 90) { Write-Status 'Mémoire vive' $txt 'WARN' } else { Write-Status 'Mémoire vive' $txt 'OK' }
+    if ($usedPct -gt 90) {
+        Write-Status 'Mémoire vive' $txt 'WARN'
+        Write-Sub 'Ferme les programmes et onglets inutiles (les plus gourmands sont listés ci-dessous).'
+        Write-Sub 'Si ça revient souvent, la mémoire est juste pour ton usage.'
+    } else { Write-Status 'Mémoire vive' $txt 'OK' }
 } else {
     Write-Status 'Mémoire vive' 'lecture impossible' 'INFO'
 }
@@ -7497,8 +7917,15 @@ if ($isLaptop) {
         $health = [math]::Round(($full / $design) * 100)
         if ($health -gt 100) { $health = 100 }
         $txt = '{0}  {1}% de la capacité d''origine' -f (Get-MiniBar $health), $health
-        if ($health -lt 60) { Write-Status 'Santé batterie' $txt 'FAIL' }
-        elseif ($health -lt 80) { Write-Status 'Santé batterie' $txt 'WARN' }
+        if ($health -lt 60) {
+            Write-Status 'Santé batterie' $txt 'FAIL'
+            Write-Sub 'Batterie très usée : autonomie réduite, le PC peut s''éteindre d''un coup.'
+            Write-Sub 'Son remplacement est conseillé (fabricant du PC ou réparateur).'
+        }
+        elseif ($health -lt 80) {
+            Write-Status 'Santé batterie' $txt 'WARN'
+            Write-Sub 'Usure normale avec l''âge : l''autonomie baisse. Rien d''urgent.'
+        }
         else { Write-Status 'Santé batterie' $txt 'OK' }
         Write-Sub ('{0:N0} mWh / {1:N0} mWh d''origine' -f $full, $design)
     } elseif (-not $isAdmin) {
@@ -7509,7 +7936,11 @@ if ($isLaptop) {
 $startup = $null
 try { $startup = @(Get-CimInstance Win32_StartupCommand -ErrorAction Stop) } catch { $startup = $null }
 if ($null -eq $startup) { Write-Status 'Programmes au démarrage' 'lecture impossible' 'INFO' }
-elseif ($startup.Count -gt 15) { Write-Status 'Programmes au démarrage' ("{0} (beaucoup)" -f $startup.Count) 'WARN' }
+elseif ($startup.Count -gt 15) {
+    Write-Status 'Programmes au démarrage' ("{0} (beaucoup)" -f $startup.Count) 'WARN'
+    Write-Sub 'Ils ralentissent l''allumage. Ctrl + Maj + Échap > Applications de démarrage (ou Démarrage) :'
+    Write-Sub 'clic droit > Désactiver sur ce dont tu n''as pas besoin dès l''allumage.'
+}
 else { Write-Status 'Programmes au démarrage' ([string]$startup.Count) 'OK' }
 
 # ==================================================================
@@ -7520,23 +7951,23 @@ Write-Section '09' 'Réseau'
 $ups = @(Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and -not $_.Virtual })
 foreach ($n in $ups) { Write-Status (Cut $n.Name 32) ("{0}  //  {1}" -f $n.LinkSpeed, (Cut $n.InterfaceDescription 34)) 'INFO' }
 
-$gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1).NextHop
-if ($gw) {
-    if (Test-Connection -ComputerName $gw -Count 2 -Quiet) { Write-Status 'Passerelle' "$gw joignable" 'OK' }
-    else { Write-Status 'Passerelle' "$gw injoignable" 'FAIL' }
-}
+$gw = [string](Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1).NextHop
+$gwReply = $false
+if ($gw) { $gwReply = [bool](Test-Connection -ComputerName $gw -Count 2 -Quiet) }
 
 $ping = @(Test-Connection -ComputerName 1.1.1.1 -Count 4)
+$pingAvg = $null
 if ($ping.Count -gt 0) {
     $prop = 'ResponseTime'
     if (-not $ping[0].PSObject.Properties['ResponseTime']) { $prop = 'Latency' }
-    $avg = [math]::Round(($ping | Measure-Object -Property $prop -Average).Average)
-    $loss = 100 - [math]::Round(($ping.Count / 4) * 100)
-    $txt = "{0} ms en moyenne  //  perte {1}%" -f $avg, $loss
-    if ($avg -gt 80 -or $loss -gt 0) { Write-Status 'Latence Internet (1.1.1.1)' $txt 'WARN' }
-    else { Write-Status 'Latence Internet (1.1.1.1)' $txt 'OK' }
-} else {
-    Write-Status 'Accès Internet (1.1.1.1)' 'aucune réponse' 'FAIL'
+    $pingAvg = ($ping | Measure-Object -Property $prop -Average).Average
+}
+# v3.23 (audit, constat V8) : sans réponse au ping, une connexion TCP (port 443) dit si Internet fonctionne quand même
+# (box ou réseau qui bloquent le ping) ; par nom ensuite, si l'adresse 1.1.1.1 elle-même est bloquée
+$tcpOk = $null
+if ($ping.Count -eq 0) {
+    $tcpOk = Test-TcpReach '1.1.1.1' 443 3000
+    if (-not $tcpOk) { $tcpOk = Test-TcpReach 'www.microsoft.com' 443 3000 }
 }
 
 # Premier appel à vide : il charge la commande (module DnsClient), soit 400 à 600 ms comptés à tort
@@ -7545,8 +7976,12 @@ $null = Resolve-DnsName 'localhost' -DnsOnly -QuickTimeout -ErrorAction Silently
 $dnsSw = [Diagnostics.Stopwatch]::StartNew()
 $dnsOk = [bool](Resolve-DnsName 'www.microsoft.com' -DnsOnly -QuickTimeout)
 $dnsMs = $dnsSw.Elapsed.TotalMilliseconds
-if ($dnsOk) { Write-Status 'Résolution DNS' ("{0:N0} ms" -f $dnsMs) 'OK' }
-else { Write-Status 'Résolution DNS' 'échec' 'FAIL' }
+
+$netV = Get-NetworkVerdict $gw $gwReply 4 $ping.Count $pingAvg $tcpOk $dnsOk $dnsMs
+foreach ($r in $netV.Rows) {
+    Write-Status $r.Label $r.Text $r.State
+    foreach ($l in @($r.Advice)) { Write-Sub $l }
+}
 
 # ==================================================================
 # [10] JOURNAUX D'ÉVÉNEMENTS (7 jours)
@@ -7558,14 +7993,33 @@ $since = (Get-Date).AddDays(-7)
 $sysRead = Get-EventsSafe @{ LogName = 'System'; Level = 1, 2; StartTime = $since }
 $sysErr = @($sysRead.Events)
 
+# v3.23 (audit, constats V5 et V13) : libellés sans jargon (le nom technique est dans le conseil), conseil sous chaque
+# compteur qui n'est pas à 0
 $kp = @($sysErr | Where-Object { $_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' -and $_.Id -eq 41 }).Count
-Write-EventCount 'Arrêts brutaux (Kernel-Power 41)' $sysRead.Ok $kp 'WARN'
+Write-EventCount 'Arrêts brutaux' $sysRead.Ok $kp 'WARN' @(
+    'Le PC s''est éteint sans passer par « Arrêter » (coupure de courant, bouton maintenu, plantage ;',
+    'événement Kernel-Power 41). Rien à faire si c''était toi ; s''il s''éteint seul, fais vérifier',
+    'l''alimentation et la chauffe (aérations, poussière).')
 
 $bsodRead = Get-EventsSafe @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WER-SystemErrorReporting'; Id = 1001; StartTime = $since }
-Write-EventCount 'Écrans bleus (BugCheck)' $bsodRead.Ok (@($bsodRead.Events).Count) 'FAIL'
+Write-EventCount 'Écrans bleus (plantages)' $bsodRead.Ok (@($bsodRead.Events).Count) 'FAIL' @(
+    'Windows a planté (BugCheck). Installe les mises à jour de Windows et des pilotes (carte graphique',
+    'en premier) et débranche le matériel ajouté récemment. Si ça revient, fais vérifier mémoire et disque.')
 
+# Erreurs matérielles : seules les erreurs non corrigées (niveaux critique et erreur) sont un avertissement. Les
+# erreurs corrigées par le matériel lui-même (niveau avertissement, fréquentes sur certaines cartes mères) passent en
+# information (v3.23, constat V12 de l'audit : elles donnaient un avertissement sans conseil).
 $wheaRead = Get-EventsSafe @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WHEA-Logger'; StartTime = $since }
-Write-EventCount 'Erreurs matérielles (WHEA)' $wheaRead.Ok (@($wheaRead.Events).Count) 'WARN'
+$wheaAll = @($wheaRead.Events)
+$wheaBad = @($wheaAll | Where-Object { $null -ne $_.Level -and [int]$_.Level -ge 1 -and [int]$_.Level -le 2 }).Count
+$wheaFixed = @($wheaAll | Where-Object { $null -ne $_.Level -and [int]$_.Level -eq 3 }).Count
+Write-EventCount 'Erreurs matérielles' $wheaRead.Ok $wheaBad 'WARN' @(
+    'Le processeur, la mémoire ou la carte mère ont signalé une erreur (WHEA). Si le PC plante ou',
+    'redémarre seul, fais-le vérifier ; sinon, surveille cette ligne aux prochains scans.')
+if ($wheaRead.Ok -and $wheaFixed -gt 0) {
+    Write-Status 'Erreurs matérielles corrigées' ([string]$wheaFixed) 'INFO'
+    Write-Sub 'Corrigées par le matériel lui-même : rien à faire tant que le PC est stable.'
+}
 
 $diskEv = @($sysErr | Where-Object { $_.ProviderName -in 'disk', 'Ntfs', 'stornvme', 'storahci', 'Microsoft-Windows-Ntfs' })
 # v3.22 : une erreur d'un appareil amovible débranché depuis (clé USB du 21/11/2026 sur le PC de Thomas) n'est plus
@@ -7590,6 +8044,11 @@ if ($null -ne $diskV) { $diskAlert = $diskV.Alert }
 Write-EventCount 'Erreurs disque / NTFS' $sysRead.Ok $diskAlert 'WARN'
 if ($null -ne $diskV) {
     foreach ($dkD in @($diskV.Devices | Where-Object { $_.Kind -eq 'FIXED' })) { Write-Sub ("sur {0} : {1}" -f (Cut $dkD.Name 50), $dkD.Events) 'Yellow' }
+    if (@($diskV.Devices | Where-Object { $_.Kind -eq 'FIXED' -or $_.Kind -eq 'UNKNOWN' }).Count -gt 0) {
+        Write-Sub 'Par précaution, copie tes fichiers importants ailleurs (disque externe ou cloud).'
+        if ($script:DeepMode) { Write-Sub 'La section 13 vérifie ensuite le disque (CHKDSK).' }
+        else { Write-Sub 'Puis lance le scan complet (menu [2]) : il vérifie le disque (CHKDSK).' }
+    }
     foreach ($dkD in @($diskV.Devices | Where-Object { $_.Kind -eq 'REMOVABLE' })) {
         Write-Sub ("sur {0} ({1}, branché) : {2}" -f (Cut $dkD.Name 40), $dkD.What, $dkD.Events) 'Yellow'
         Write-Sub '  si elles reviennent, copie son contenu ailleurs : il peut être en fin de vie'
@@ -7604,7 +8063,10 @@ if ($null -ne $diskV) {
     }
 }
 
-if ($sysRead.Ok) { Write-Status 'Erreurs système (total)' ([string]$sysErr.Count) 'INFO' }
+if ($sysRead.Ok) {
+    Write-Status 'Erreurs système (total)' ([string]$sysErr.Count) 'INFO'
+    if ($sysErr.Count -gt 0) { Write-Sub 'Toujours quelques-unes, même sur un PC sain : seules les lignes ci-dessus comptent.' }
+}
 $topErr = $sysErr | Group-Object ProviderName | Sort-Object Count -Descending | Select-Object -First 3
 foreach ($t in $topErr) { Write-Sub ("{0,-40} {1,4}" -f (Cut $t.Name 40), $t.Count) }
 
@@ -7632,6 +8094,7 @@ if (Test-SafeTempPath $env:TEMP) {
 } else {
     Write-Status 'Variable %TEMP% anormale' (Cut $env:TEMP 40) 'WARN'
     Write-Sub 'Nettoyage désactivé pour ce dossier par sécurité'
+    Write-Sub 'Un programme a changé l''emplacement des fichiers temporaires : demande de l''aide si ce n''est pas toi.'
 }
 $tmpWin = Measure-AgedFiles (Join-Path $env:windir 'Temp') 24
 $twTxt = Format-AgedText $tmpWin 'de plus de 24 h'
@@ -7722,7 +8185,7 @@ if ($script:DeepMode) {
 if ($script:DeepMode -and ($ctv -eq 'OK' -or $ctv -eq 'RUNNING')) {
     $every = ''
     if ($null -ne $ctask.Period -and $ctask.Period.TotalDays -ge 1) { $every = ' tous les {0:N0} jours' -f $ctask.Period.TotalDays }
-    Write-Status 'Composants Windows (WinSxS)' ('nettoyés par Windows' + $every) 'OK'
+    Write-Status 'Anciens composants de Windows' ('nettoyés par Windows' + $every) 'OK'
     if ($ctv -eq 'RUNNING') { Write-Sub 'Nettoyage de Windows en cours en ce moment, rien à faire de ton côté' }
     else { Write-Sub ('Dernier passage : ' + (Format-Date $ctask.LastRun) + ', rien à faire de ton côté') }
 } elseif ($script:DeepMode) {
@@ -7736,17 +8199,17 @@ if ($script:DeepMode -and ($ctv -eq 'OK' -or $ctv -eq 'RUNNING')) {
     $script:ComponentInfo = Invoke-ComponentAnalysis
     $ci = $script:ComponentInfo
     if ($null -eq $ci) {
-        Write-Status 'Composants Windows (WinSxS)' 'analyse impossible' 'INFO'
+        Write-Status 'Anciens composants de Windows' 'analyse impossible' 'INFO'
     } elseif ($ci.Code -ne 0 -and (Get-ComponentCleanupVerdict '' $ci.Code) -eq 'PENDING') {
-        Write-Status 'Composants Windows (WinSxS)' 'analyse impossible : mises à jour en attente' 'INFO'
+        Write-Status 'Anciens composants de Windows' 'analyse impossible : mises à jour en attente' 'INFO'
         Write-Sub 'Redémarre le PC puis relance un scan complet.'
     } elseif ($ci.Code -ne 0) {
-        Write-Status 'Composants Windows (WinSxS)' ('analyse impossible (code 0x{0:X8})' -f [int]$ci.Code) 'INFO'
+        Write-Status 'Anciens composants de Windows' ('analyse impossible (code 0x{0:X8})' -f [int]$ci.Code) 'INFO'
         Write-Sub 'Détails : C:\Windows\Logs\DISM\dism.log'
     } elseif ($ci.Recommended -eq 'YES') {
         $ciTxt = 'nettoyage conseillé par Windows'
         if ($null -ne $ci.Reclaimable) { $ciTxt += (' ({0} paquet(s) remplacé(s))' -f $ci.Reclaimable) }
-        Write-Status 'Composants Windows (WinSxS)' $ciTxt 'INFO'
+        Write-Status 'Anciens composants de Windows' $ciTxt 'INFO'
         # Sauvegardes de composants remplacés : le nettoyage ne peut pas libérer plus. Trop peu : pas de question.
         if ($null -ne $ci.BackupBytes -and $ci.BackupBytes -lt $CleanMinBytes) {
             Write-Sub ('Gain trop faible pour être proposé : ' + (Format-Bytes $ci.BackupBytes) + ' au plus')
@@ -7755,9 +8218,9 @@ if ($script:DeepMode -and ($ctv -eq 'OK' -or $ctv -eq 'RUNNING')) {
             if ($svcWhy) { Write-Sub ('Pas de nettoyage maintenant : ' + $svcWhy) }
         }
     } elseif ($ci.Recommended -eq 'NO') {
-        Write-Status 'Composants Windows (WinSxS)' 'aucun nettoyage nécessaire' 'OK'
+        Write-Status 'Anciens composants de Windows' 'aucun nettoyage nécessaire' 'OK'
     } else {
-        Write-Status 'Composants Windows (WinSxS)' 'résultat non reconnu' 'INFO'
+        Write-Status 'Anciens composants de Windows' 'résultat non reconnu' 'INFO'
         Write-Sub 'Détails : C:\Windows\Logs\DISM\dism.log'
     }
     if ($null -ne $ci -and $null -ne $ci.ActualBytes) { Write-Sub ('Taille réelle : ' + (Format-Bytes $ci.ActualBytes)) }
@@ -7790,7 +8253,10 @@ $cleanProp = Get-CleanProposal $script:CleanTargets $CleanMinBytes $isAdmin
 $allTxt = Format-Bytes $cleanProp.Bytes
 if (@($cleanProp.Items | Where-Object { $_.Key -eq 'Components' }).Count -gt 0) { $allTxt += ' + composants Windows' }
 $unread = @($script:CleanTargets | Where-Object { -not $_.Ok }).Count
-if ($cleanProp.Bytes -gt 5GB) { Write-Status 'Espace récupérable' $allTxt 'WARN' }
+if ($cleanProp.Bytes -gt 5GB) {
+    Write-Status 'Espace récupérable' $allTxt 'WARN'
+    Write-Sub 'J.A.R.V.I.S. te propose le nettoyage à la fin du scan, élément par élément.'
+}
 elseif (-not $isAdmin) { Write-Status 'Espace récupérable' ($allTxt + '  (sans droits admin)') 'INFO' }
 elseif ($unread -gt 0) { Write-Status 'Espace récupérable' ($allTxt + '  (certaines mesures impossibles)') 'INFO' }
 else { Write-Status 'Espace récupérable' $allTxt 'OK' }
@@ -7852,17 +8318,29 @@ if ($script:DeepMode) {
             -FilePath (Get-SystemToolPath 'dism.exe') `
             -Arguments '/Online /Cleanup-Image /ScanHealth' -TimeoutSec 2400 -Encoding 'Auto'
 
+    # v3.23 (audit, constats V5 et V13) : libellés « Image de Windows (DISM) », « Fichiers système (SFC) »,
+    # « Disque X: (CHKDSK) », et un geste sous chaque avertissement ou alerte
+    $later = 'Relance le scan complet plus tard, PC branché sur secteur et sans autre travail en cours.'
+    $repairLater = 'J.A.R.V.I.S. te propose la réparation à la fin du scan (connexion Internet nécessaire).'
     $dv = $null
     if ($dism) { $dv = Get-DismVerdict $dism.Text $dism.Code }
     if ($null -eq $dism) {
-        Write-Status 'DISM ScanHealth' 'délai dépassé (40 min)' 'WARN'
+        Write-Status 'Image de Windows (DISM)' 'délai dépassé (40 min)' 'WARN'
+        Write-Sub $later
     } elseif ($dv -eq 'CLEAN') {
-        Write-Status 'DISM ScanHealth' 'magasin de composants sain' 'OK'
+        Write-Status 'Image de Windows (DISM)' 'magasin de composants sain' 'OK'
     } elseif ($dv -eq 'UNREPAIRABLE') {
-        Write-Status 'DISM ScanHealth' 'corruption NON réparable' 'FAIL'
-        Write-Sub 'Réparation de Windows conseillée (réinstallation sur place)'
+        Write-Status 'Image de Windows (DISM)' 'corruption NON réparable' 'FAIL'
+        $b13 = $null
+        if ($cv) { $b13 = ConvertTo-IntOrNull $cv.CurrentBuild }
+        if ($null -ne $b13 -and $b13 -ge 26100) {
+            Write-Sub 'Paramètres > Système > Récupération > « Résoudre les problèmes à l''aide de Windows Update » :'
+            Write-Sub 'réinstalle Windows en gardant tes fichiers et applications (environ 1 h).'
+        } else {
+            Write-Sub 'Fais-toi aider : une réinstallation de Windows « sur place » garde fichiers et applications.'
+        }
     } elseif ($dv -eq 'REPAIRABLE') {
-        Write-Status 'DISM ScanHealth' 'corruption réparable détectée' 'WARN'
+        Write-Status 'Image de Windows (DISM)' 'corruption réparable détectée' 'WARN'
         $script:NeedRestore = $true
         # Nombre de défauts lu dans CBS.log (v3.21), comparé ensuite à ce qui restait après la dernière réparation
         $scanSum = Get-CbsSummary (Read-CbsLogText $scanStart) $scanStart 'DETECT'
@@ -7870,12 +8348,13 @@ if ($script:DeepMode) {
             $script:ScanDetected = $scanSum.Detected
             Write-Sub ('{0:N0} défaut(s) dans le magasin de composants (copies de Windows)' -f $scanSum.Detected)
         }
+        Write-Sub $repairLater
     } elseif ($dv -eq 'ERROR') {
-        Write-Status 'DISM ScanHealth' ("code de sortie {0}" -f $dism.Code) 'WARN'
-        Write-Sub 'Détails : C:\Windows\Logs\DISM\dism.log'
+        Write-Status 'Image de Windows (DISM)' ("code de sortie {0}" -f $dism.Code) 'WARN'
+        Write-Sub 'Redémarre le PC puis relance le scan complet. Détails : C:\Windows\Logs\DISM\dism.log'
     } else {
         # Message ni français ni anglais reconnu : pas de « sain » sans preuve
-        Write-Status 'DISM ScanHealth' 'résultat non reconnu' 'INFO'
+        Write-Status 'Image de Windows (DISM)' 'résultat non reconnu' 'INFO'
         Write-Sub 'Détails : C:\Windows\Logs\DISM\dism.log'
     }
 
@@ -7886,33 +8365,36 @@ if ($script:DeepMode) {
            -Arguments '/scannow' -TimeoutSec 3600 -Encoding 'Auto' -AskOnTimeout
 
     if ($null -eq $sfc) {
-        if ($script:ProcState -eq 'STOPPED') { Write-Status 'SFC /scannow' 'arrêté à ta demande avant la fin' 'WARN' }
-        else { Write-Status 'SFC /scannow' 'lancement impossible' 'WARN' }
+        if ($script:ProcState -eq 'STOPPED') { Write-Status 'Fichiers système (SFC)' 'arrêté à ta demande avant la fin' 'WARN' }
+        else { Write-Status 'Fichiers système (SFC)' 'lancement impossible' 'WARN' }
+        Write-Sub $later
     } else {
         $sv = Get-SfcVerdict $sfc.Text
         if ($sv -eq 'STOREDAMAGED') {
-            Write-Status 'SFC /scannow' 'intégrité non garantie : magasin de composants endommagé' 'WARN'
+            Write-Status 'Fichiers système (SFC)' 'intégrité non garantie : magasin de composants endommagé' 'WARN'
             $script:NeedRestore = $true
+            Write-Sub $repairLater
         } elseif ($sv -eq 'CLEAN') {
-            Write-Status 'SFC /scannow' 'aucune violation d''intégrité' 'OK'
+            Write-Status 'Fichiers système (SFC)' 'aucune violation d''intégrité' 'OK'
         } elseif ($sv -eq 'NORUN') {
-            Write-Status 'SFC /scannow' 'n''a pas pu s''exécuter' 'WARN'
-            Write-Sub 'Relancer après redémarrage, ou en mode sans échec'
+            Write-Status 'Fichiers système (SFC)' 'n''a pas pu s''exécuter' 'WARN'
+            Write-Sub 'Redémarre le PC puis relance le scan complet.'
         } elseif ($sv -eq 'UNFIXED') {
-            Write-Status 'SFC /scannow' 'fichiers corrompus NON réparés' 'FAIL'
+            Write-Status 'Fichiers système (SFC)' 'fichiers corrompus NON réparés' 'FAIL'
             $script:NeedRestore = $true
+            Write-Sub $repairLater
         } elseif ($sv -eq 'REPAIRED') {
             $rep = Get-SfcRepairSummary (Read-CbsLogText $sfcStart) $sfcStart
             if ($rep.OnlyOneDrive) {
-                Write-Status 'SFC /scannow' 'seul le raccourci OneDrive des nouveaux comptes a été remis' 'INFO'
+                Write-Status 'Fichiers système (SFC)' 'seul le raccourci OneDrive des nouveaux comptes a été remis' 'INFO'
                 Write-Sub 'OneDrive remplace ce raccourci quand il se met à jour, SFC remet celui de Windows : rien à faire'
             } else {
-                Write-Status 'SFC /scannow' 'fichiers corrompus trouvés et réparés' 'WARN'
+                Write-Status 'Fichiers système (SFC)' 'fichiers corrompus trouvés et réparés' 'WARN'
                 Write-SfcRepairedFiles $rep
-                Write-Sub 'Redémarrage conseillé'
+                Write-Sub 'Redémarre le PC pour terminer la réparation.'
             }
         } else {
-            Write-Status 'SFC /scannow' 'résultat non reconnu' 'INFO'
+            Write-Status 'Fichiers système (SFC)' 'résultat non reconnu' 'INFO'
             Write-Sub 'Détails : C:\Windows\Logs\CBS\CBS.log'
         }
     }
@@ -7927,14 +8409,21 @@ if ($script:DeepMode) {
         $code = $null
         if ($ck) { $code = $ck.Code }
 
-        $lbl = "CHKDSK {0}:" -f $L
-        if ($null -eq $code) { Write-Status $lbl 'délai dépassé' 'WARN' }
+        $lbl = "Disque {0}: (CHKDSK)" -f $L
+        if ($null -eq $code) { Write-Status $lbl 'délai dépassé' 'WARN'; Write-Sub $later }
         elseif ((Get-ChkdskVerdict $code) -eq 'CLEAN') { Write-Status $lbl 'aucune erreur' 'OK' }
-        elseif ((Get-ChkdskVerdict $code) -eq 'FIXED') { Write-Status $lbl 'erreurs trouvées et corrigées' 'WARN' }
+        elseif ((Get-ChkdskVerdict $code) -eq 'FIXED') {
+            Write-Status $lbl 'erreurs trouvées et corrigées' 'WARN'
+            Write-Sub 'Rien d''autre à faire. Si elles reviennent au prochain scan complet, sauvegarde tes fichiers.'
+        }
         elseif ((Get-ChkdskVerdict $code) -eq 'MINOR') { Write-Status $lbl 'nettoyage mineur nécessaire' 'INFO' }
         else {
             Write-Status $lbl 'erreurs détectées, correction nécessaire' 'FAIL'
             $script:ChkdskFix.Add($L)
+            # v3.23 : la commande de correction est aussi dans le rapport (avant, seulement à l'écran en fin de scan)
+            Write-Sub 'Sauvegarde d''abord tes fichiers importants. Puis clic droit sur Démarrer > Terminal (admin)'
+            Write-Sub ('ou Windows PowerShell (admin), tape  chkdsk {0}: /spotfix  et Entrée.' -f $L)
+            if (('{0}:' -f $L) -eq $env:SystemDrive) { Write-Sub 'Pour ce disque, réponds O : la correction se fait au prochain redémarrage.' }
         }
     }
 }
@@ -7942,12 +8431,9 @@ if ($script:DeepMode) {
 # ==================================================================
 # SYNTHÈSE
 # ==================================================================
-$total = $script:Ok + $script:Warnings.Count + $script:Alerts.Count
-$score = 0
-if ($total -gt 0) { $score = [math]::Round(($script:Ok / $total) * 100) }
-$scoreColor = 'Green'
-if ($script:Alerts.Count -gt 0) { $scoreColor = 'Red' }
-elseif ($score -lt 80) { $scoreColor = 'Yellow' }
+# v3.23 (audit, constats V2 et V4) : le pourcentage est remplacé par un état général à trois niveaux
+# (Get-ScanVerdict, T1) ; les contrôles non vérifiés sont listés à part au lieu de disparaître.
+$verdict = Get-ScanVerdict $script:Warnings.Count $script:Alerts.Count $script:NotChecked.Count
 
 Write-Host ''
 Write-Host ('  ╔' + ('═' * 64) + '╗') -ForegroundColor Cyan
@@ -7956,16 +8442,15 @@ Write-Host ('  SYNTHÈSE DU DIAGNOSTIC'.PadRight(64)) -NoNewline -ForegroundColo
 Write-Host '║' -ForegroundColor Cyan
 Write-Host ('  ╚' + ('═' * 64) + '╝') -ForegroundColor Cyan
 
-Write-Host '   Intégrité système  [' -NoNewline -ForegroundColor Gray
-$filled = [math]::Round($score / 2.5)
-Write-Host ('█' * $filled) -NoNewline -ForegroundColor $scoreColor
-Write-Host ('░' * (40 - $filled)) -NoNewline -ForegroundColor DarkGray
-Write-Host ("] {0}%" -f $score) -ForegroundColor $scoreColor
-Write-Host ("   Contrôles OK : {0}   //   Avertissements : {1}   //   Alertes : {2}" -f $script:Ok, $script:Warnings.Count, $script:Alerts.Count) -ForegroundColor Gray
+Write-Host '   État général  ' -NoNewline -ForegroundColor Gray
+Write-Host ('██ ' + $verdict.Title + ' ██') -ForegroundColor $verdict.Color
+Write-Host ('   ' + $verdict.Line) -ForegroundColor $verdict.Color
+Write-Host ("   Contrôles OK : {0}   //   Avertissements : {1}   //   Alertes : {2}   //   Non vérifiés : {3}" -f $script:Ok, $script:Warnings.Count, $script:Alerts.Count, $script:NotChecked.Count) -ForegroundColor Gray
 
 $script:Report.Add('')
 $script:Report.Add('== SYNTHÈSE ==')
-$script:Report.Add(("Score {0}% - OK {1} / WARN {2} / FAIL {3}" -f $score, $script:Ok, $script:Warnings.Count, $script:Alerts.Count))
+$script:Report.Add(('État général : {0} - {1}' -f $verdict.Title, $verdict.Line))
+$script:Report.Add(("OK {0} / WARN {1} / FAIL {2} / non vérifiés {3}" -f $script:Ok, $script:Warnings.Count, $script:Alerts.Count, $script:NotChecked.Count))
 
 if ($script:Alerts.Count -gt 0) {
     Write-Host ''
@@ -7977,9 +8462,25 @@ if ($script:Warnings.Count -gt 0) {
     Write-Host '   POINTS D''ATTENTION' -ForegroundColor Yellow
     foreach ($x in $script:Warnings) { Write-Host ('   - ' + $x) -ForegroundColor Yellow; $script:Report.Add('- ' + $x) }
 }
+if ($script:NotChecked.Count -gt 0) {
+    Write-Host ''
+    Write-Host '   NON VÉRIFIÉ' -ForegroundColor Cyan
+    $script:Report.Add('Non vérifié :')
+    foreach ($x in $script:NotChecked) { Write-Host ('   ? ' + $x) -ForegroundColor Cyan; $script:Report.Add('? ' + $x) }
+    if (-not $isAdmin) {
+        Write-Host '   Relance J.A.R.V.I.S. en administrateur pour en vérifier davantage.' -ForegroundColor DarkGray
+        $script:Report.Add('Relance J.A.R.V.I.S. en administrateur pour en vérifier davantage.')
+    }
+}
+if ($script:Alerts.Count -gt 0 -or $script:Warnings.Count -gt 0) {
+    Write-Host ''
+    Write-Host '   Quoi faire : écrit sous chaque ligne, dans la section indiquée entre crochets.' -ForegroundColor DarkGray
+}
 
 Write-Host ''
-if ($script:Alerts.Count -eq 0 -and $script:Warnings.Count -eq 0) {
+if ($script:Alerts.Count -eq 0 -and $script:Warnings.Count -eq 0 -and $script:NotChecked.Count -gt 0) {
+    Type-Line "   >> Rien d'anormal dans ce que j'ai pu lire, $Name. Certains points restent à vérifier." 'Green'
+} elseif ($script:Alerts.Count -eq 0 -and $script:Warnings.Count -eq 0) {
     Type-Line "   >> Tous les systèmes sont nominaux, $Name." 'Green'
 } elseif ($script:Alerts.Count -eq 0) {
     Type-Line "   >> Systèmes opérationnels. Quelques points méritent ton attention, $Name." 'Yellow'

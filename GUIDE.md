@@ -32,12 +32,13 @@ C'est fait. La prochaine fois, ouvre JARVIS depuis le **menu Démarrer** (tape �
 1. Au menu, appuie sur **1** puis **Entrée** : c'est le **scan rapide** (2 à 5 minutes, il ne modifie rien).
 2. La première fois, JARVIS affiche « Identité détectée » avec ton prénom : appuie sur **Entrée** s'il est juste, sinon tape ton prénom puis **Entrée**.
 3. Laisse-le travailler. Ne tape rien pendant le scan.
-4. À la fin, JARVIS te pose des questions, une par une (lancer une analyse antivirus, installer les mises à jour, faire le ménage…). Lis la question, puis :
+4. La **synthèse** donne l'état général de ton PC : **en bon état** (vert), **à surveiller** (jaune, rien d'urgent) ou **à traiter** (rouge). Sous chaque ligne jaune ou rouge du scan, JARVIS écrit quoi faire ; le numéro entre crochets dans la synthèse dit dans quelle section la retrouver.
+5. À la fin, JARVIS te pose des questions, une par une (lancer une analyse antivirus, installer les mises à jour, faire le ménage…). Lis la question, puis :
    - tape **o** puis **Entrée** pour accepter ;
    - appuie sur **Échap** pour refuser (Échap veut toujours dire « non ») ;
    - si tu tapes autre chose, JARVIS ne devine pas : il repose la question.
-5. Le ménage supprime pour de bon : une corbeille vidée ne se récupère pas. Si tu n'es pas sûr de ce qu'elle contient, refuse cette question-là.
-6. En cas de doute, refuse : rien n'est grave si tu ne fais rien.
+6. Le ménage supprime pour de bon : une corbeille vidée ne se récupère pas. Si tu n'es pas sûr de ce qu'elle contient, refuse cette question-là.
+7. En cas de doute, refuse : rien n'est grave si tu ne fais rien.
 
 Le **scan complet** (touche **2**) dure 20 à 60 minutes : lance-le quand tu n'as pas besoin du PC, avec le chargeur branché si c'est un portable.
 
