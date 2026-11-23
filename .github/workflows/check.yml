@@ -4,10 +4,13 @@
 # - scan : le JARVIS.cmd du dépôt fait un vrai scan rapide, sans clavier, sans aucune action (tools/scan-essai.ps1,
 #   v3.25, constat T1 de l'audit : le programme principal n'était exécuté par aucun test).
 # tools/publier.py exige ces deux contrôles réussis sur le commit avant de publier une version.
+# Branches seulement : l'étiquette créée par une publication porte sur un commit déjà contrôlé, et un second
+# passage en cours faisait échouer « publier.py --verifier » juste après la publication (v3.25, 23/11/2026).
 name: Controle
 
 on:
   push:
+    branches: ['**']
   pull_request:
 
 permissions:

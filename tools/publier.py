@@ -24,9 +24,12 @@ except Exception:
     pass
 
 
+MODE = 'PUBLICATION REFUSÉE.'   # devient « VÉRIFICATION ÉCHOUÉE. » avec --verifier
+
+
 def stop(message):
     print('[FAIL] ' + message)
-    sys.exit('PUBLICATION REFUSÉE.')
+    sys.exit(MODE)
 
 
 def stop_published(tag, message):
@@ -107,6 +110,10 @@ def check_runs(sha, required):
     missing = [n for n in required if n not in last]
     if missing:
         return 'ABSENT:contrôle(s) GitHub absent(s) sur %s : %s' % (sha[:10], ', '.join(missing))
+    running = [n for n in required if last[n].get('status') != 'completed']
+    if running:
+        return ('contrôle(s) GitHub encore en cours sur %s : %s. Attendre leur fin (2 à 3 minutes) et relancer'
+                % (sha[:10], ', '.join(running)))
     bad = ['%s (%s/%s)' % (n, last[n].get('status'), last[n].get('conclusion')) for n in required
            if last[n].get('status') != 'completed' or last[n].get('conclusion') != 'success']
     if bad:
@@ -121,7 +128,8 @@ def vkey(v):
 def verify_release(tag):
     """Fichier publié de la version tag = JARVIS.cmd du commit de son étiquette, contrôlé par GitHub."""
     git('fetch', '--quiet', '--tags', 'origin')
-    sha = git('rev-parse', tag + '^{commit}')
+    # refs/tags/ : chaque version a aussi une branche du même nom (v3.25), l'étiquette seule fait foi
+    sha = git('rev-parse', 'refs/tags/%s^{commit}' % tag)
     blob = git('cat-file', 'blob', sha + ':JARVIS.cmd', binary=True)
     tmp = tempfile.mkdtemp(prefix='jarvis-verif-')
     gh('release', 'download', tag, '-R', REPO, '-p', 'JARVIS.cmd', '-D', tmp)
@@ -236,6 +244,7 @@ a.add_argument('--publier', action='store_true', help='publier pour de bon (sino
 a.add_argument('--verifier', metavar='TAG', help='vérifier une version déjà publiée')
 o = a.parse_args()
 if o.verifier:
+    MODE = 'VÉRIFICATION ÉCHOUÉE.'
     verify_release(o.verifier)
 elif o.tag:
     publish(o.tag, o.notes, o.publier)
