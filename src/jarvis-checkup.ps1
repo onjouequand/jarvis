@@ -682,7 +682,12 @@ function Read-Answer([string]$Prompt) {
         if ($null -eq $a) { Write-Host ($Prompt + ' : [annulé, fin de l''entrée]') -ForegroundColor DarkGray }
         return $a
     }
-    $null = Request-Attention
+    if ((Request-Attention) -eq 'FRONT') {
+        # Relecture v3.26 : une frappe destinée à une autre fenêtre, partie au moment où JARVIS passe devant,
+        # ne doit pas répondre (Entrée = réponse par défaut)
+        Start-Sleep -Milliseconds 500
+        Clear-KeyBuffer
+    }
     Write-Host ($Prompt + ' : ') -NoNewline
     $sb = New-Object System.Text.StringBuilder
     while ($true) {
@@ -1657,8 +1662,14 @@ function Request-Attention {
     # défaut) ; sinon le bouton de JARVIS clignote dans la barre des tâches jusqu'à ce qu'on y revienne. Voulu :
     # prendre le clavier pendant qu'on écrit ailleurs enverrait la frappe à JARVIS (réponse non voulue). Aucun
     # contournement (touche Alt simulée, AttachThreadInput). Rend NONE, FRONT ou FLASH.
+    # Limite : dans Windows Terminal, un onglet caché d'une fenêtre déjà au premier plan ne reçoit aucun signal.
+    if ($script:AttentionOff) { return 'NONE' }
     try {
-        if (-not (Initialize-NativeWin) -or -not (Initialize-NativeFocus)) { return 'NONE' }
+        if (-not (Initialize-NativeWin) -or -not (Initialize-NativeFocus)) {
+            # Chargement refusé (antivirus qui bloque la compilation...) : pas de nouvel essai à chaque question
+            $script:AttentionOff = $true
+            return 'NONE'
+        }
         $con = [JarvisNative.Win]::GetConsoleWindow()
         if ($con -eq [IntPtr]::Zero) { return 'NONE' }
         # Windows Terminal : la fenêtre affichée est le propriétaire de la fenêtre de console (règle 26)
@@ -2843,6 +2854,11 @@ function Get-ClockSample {
         if (-not $t.Wait(5000)) { return $s }
         $s.After = [DateTime]::UtcNow
         $resp = $t.Result
+        # Relecture v3.26 : seule la vraie réponse compte. Portail d'hôtel, proxy en erreur, redirection : leur
+        # horloge peut être fausse (faux « en avance de 9 000 jours »), la mesure reste « non vérifiable »
+        $body = ''
+        if ([int]$resp.StatusCode -eq 200) { $body = [string]$resp.Content.ReadAsStringAsync().Result }
+        if ($body.Trim() -ne 'Microsoft Connect Test') { $resp.Dispose(); return $s }
         if ($null -ne $resp.Headers.Date) { $s.Server = $resp.Headers.Date.UtcDateTime }
         if ($null -ne $resp.Headers.Age) { $s.Age = $resp.Headers.Age.TotalSeconds }
         $resp.Dispose()
@@ -4793,6 +4809,22 @@ function Get-TimeSyncMode($Value) {
     return 'UNKNOWN'
 }
 
+function Test-ClockManualFix($Offset, $MaxPos, $MaxNeg) {
+    # Relecture v3.26 : le service Heure Windows refuse de corriger seul un écart plus grand que MaxPosPhaseCorrection
+    # (PC en retard, $Offset positif) ou MaxNegPhaseCorrection (PC en avance), 54 000 s (15 h) relevés sur le PC de
+    # Thomas le 24/11/2026 (W32Time\Config) ; « Synchroniser maintenant » ne suffit alors pas (pile du BIOS usée,
+    # date fausse de plusieurs années). Valeur absente ou illisible : 54 000 ; 0xFFFFFFFF (-1 lu en entier) : aucune
+    # limite. $true = l'heure est à remettre à la main. Fonction pure, testée en T1.
+    if ($null -eq $Offset) { return $false }
+    $lim = $MaxPos
+    if ([double]$Offset -lt 0) { $lim = $MaxNeg }
+    $n = $null
+    if ($null -ne $lim) { try { $n = [int64]$lim } catch { $n = $null } }
+    if ($null -eq $n) { $n = 54000 }
+    if ($n -eq -1 -or $n -eq 4294967295) { return $false }
+    return ([math]::Abs([double]$Offset) -gt $n)
+}
+
 function Get-ClockCheck($ServerUtc, $AgeSec, $Before, $After) {
     # v3.26 (demande de Thomas, 24/11/2026 : PC-LV, rallumé après une longue pause, avait plusieurs minutes
     # d'écart et une mise à jour y avait échoué). Écart entre l'heure du PC et celle d'un serveur : $ServerUtc =
@@ -5071,7 +5103,12 @@ function Invoke-WindowsRepair {
         'REPAIRED' {
             Write-Status 'DISM RestoreHealth' 'image Windows réparée' 'OK'
             if ($sum -and $sum.FilesRepaired -gt 0) { Write-Sub ('{0:N0} défaut(s) réparé(s) dans le magasin de composants' -f $sum.FilesRepaired) }
-            if ($sum -and $sum.Flags -gt 0) { Write-Sub ('plus {0:N0} marque(s) interne(s) de Windows remise(s) en ordre, sans gravité' -f $sum.Flags) }
+            if ($sum -and $sum.Flags -gt 0) {
+                # Relecture v3.26 : « plus » seulement après une ligne de défauts réparés
+                $flTxt = '{0:N0} marque(s) interne(s) de Windows remise(s) en ordre, sans gravité' -f $sum.Flags
+                if ($sum.FilesRepaired -gt 0) { $flTxt = 'plus ' + $flTxt }
+                Write-Sub $flTxt
+            }
             $memo = 'REPAIRED|0'
         }
         'NOSOURCE' {
@@ -5421,7 +5458,10 @@ function Invoke-SelfTestAnalyzers {
             @(-259200, 'WARN', 'en avance de 3 jours'),
             @(58, 'OK', 'à l''heure (écart de 58 s)'),
             @(61, 'WARN', 'en retard de 1 min 1 s'),
-            @(0, 'OK', 'à l''heure')
+            @(0, 'OK', 'à l''heure'),
+            @(59.6, 'WARN', 'en retard de 1 min'),
+            @(3600, 'WARN', 'en retard de 1 h'),
+            @(172800, 'WARN', 'en retard de 2 jours')
         )
         foreach ($c in $cases) {
             # Serveur décalé de $c[0] s par rapport au milieu de la mesure (moins la demi-seconde de l'en-tête Date)
@@ -5439,7 +5479,16 @@ function Invoke-SelfTestAnalyzers {
         foreach ($p in @(@('NTP', 'AUTO'), @('nt5ds', 'AUTO'), @('AllSync', 'AUTO'), @('NoSync', 'OFF'), @($null, 'UNKNOWN'), @('', 'UNKNOWN'), @('Autre', 'UNKNOWN'))) {
             Assert-True ((Get-TimeSyncMode $p[0]) -eq $p[1]) ('réglage « {0} » mal lu' -f $p[0])
         }
-        '20/20 cas'
+        # Écart trop grand pour le service Heure Windows (limites relevées sur le PC de Thomas : 54 000 s)
+        $mf = @(
+            @(372, 54000, 54000, $false), @(54001, 54000, 54000, $true), @(-54001, 54000, 54000, $true),
+            @(-60000, 54000, 172800, $false), @(60000, $null, $null, $true), @(9999999, -1, -1, $false),
+            @($null, 54000, 54000, $false)
+        )
+        foreach ($m in $mf) {
+            Assert-True ((Test-ClockManualFix $m[0] $m[1] $m[2]) -eq $m[3]) ('écart {0} s, limites {1}/{2} : mal jugé' -f $m[0], $m[1], $m[2])
+        }
+        '30/30 cas'
     }
     Test-Case 'Premier plan : structure FLASHWINFO (32 et 64 bits)' {
         Assert-True (Initialize-NativeFocus) 'fonctions de Windows non chargées'
@@ -7759,9 +7808,17 @@ $clk = Get-ClockSample
 $clkV = Get-ClockCheck $clk.Server $clk.Age $clk.Before $clk.After
 $clkSync = Get-TimeSyncMode (Get-RegValueSafe 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Parameters' 'Type').Value
 $clkWhere = 'Paramètres > Heure et langue > Date et heure'
+$clkCfg = 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Config'
+$clkManual = Test-ClockManualFix $clkV.Offset (Get-RegValueSafe $clkCfg 'MaxPosPhaseCorrection').Value (Get-RegValueSafe $clkCfg 'MaxNegPhaseCorrection').Value
 if ($clkV.Status -eq 'WARN') {
     Write-Status 'Heure du PC' $clkV.Text 'WARN'
-    if ($clkSync -eq 'OFF') {
+    if ($clkManual) {
+        Write-Sub ('Écart trop grand pour que Windows le corrige seul. Dans ' + $clkWhere + ' :')
+        Write-Sub 'coupe « Régler l''heure automatiquement », clique sur « Modifier » et règle la date et l''heure,'
+        Write-Sub 'puis réactive « Régler l''heure automatiquement ».'
+        Write-Sub 'Si l''heure se dérègle à chaque allumage, la pile de la carte mère est sans doute usée.'
+    }
+    elseif ($clkSync -eq 'OFF') {
         Write-Sub ($clkWhere + ' : active « Régler l''heure automatiquement »,')
         Write-Sub 'puis clique sur « Synchroniser maintenant ».'
     }
@@ -7773,6 +7830,9 @@ elseif ($clkV.Status -eq 'OK') {
     if ($clkSync -eq 'OFF') { Write-Sub ('Mise à l''heure automatique coupée : ' + $clkWhere + ' pour la réactiver') }
 }
 else { Write-Status 'Heure du PC' $clkV.Text 'INFO' }
+# Relecture v3.26 : la mesure se fait en heure universelle ; un mauvais fuseau horaire affiche une heure fausse sur
+# un PC pourtant « à l'heure ». Son nom suffit à le repérer (même écran de Paramètres pour le changer).
+try { Write-Sub ('Fuseau horaire : ' + [TimeZoneInfo]::Local.DisplayName) } catch { Write-Sub 'Fuseau horaire : illisible' }
 
 # ==================================================================
 # [02] WINDOWS UPDATE
