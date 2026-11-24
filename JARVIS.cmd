@@ -1,6 +1,6 @@
 <# : JARVIS.cmd. Ne pas modifier ce texte
 @echo off
-rem JARVIS-SHA256=19bb420a58cccf66660280a23ec1985fa6f433517d42ba37704bdea1c7ef8afc
+rem JARVIS-SHA256=0000fc4e6f184b33a2f73ee3f118bdec198fa125127d070df9fa0599e236d992
 setlocal
 "%SystemRoot%\System32\chcp.com" 65001 >nul
 set "JARVIS_SELF=%~f0"
@@ -695,6 +695,7 @@ function Read-Answer([string]$Prompt) {
         if ($null -eq $a) { Write-Host ($Prompt + ' : [annulé, fin de l''entrée]') -ForegroundColor DarkGray }
         return $a
     }
+    $null = Request-Attention
     Write-Host ($Prompt + ' : ') -NoNewline
     $sb = New-Object System.Text.StringBuilder
     while ($true) {
@@ -1644,6 +1645,51 @@ function Get-JarvisWindow {
     if (-not [JarvisNative.Win]::IsWindowVisible($win)) { return [IntPtr]::Zero }
     if ([JarvisNative.Win]::IsZoomed($win) -or [JarvisNative.Win]::IsIconic($win)) { return [IntPtr]::Zero }
     return $win
+}
+
+function Initialize-NativeFocus {
+    # Fonctions de Windows pour remettre la fenêtre au premier plan (chargées une seule fois). FLASHWINFO :
+    # 32 octets en 64 bits, 20 en 32 bits (règle 28, contrôlé en T1) ; cbSize est pris par Marshal.SizeOf.
+    if ('JarvisNative.Focus' -as [type]) { return $true }
+    try {
+        Add-Type -Namespace JarvisNative -Name Focus -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential)] public struct FLASHWINFO { public uint cbSize; public IntPtr hwnd; public uint dwFlags; public uint uCount; public uint dwTimeout; }
+[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int cmd);
+[DllImport("user32.dll")] public static extern bool FlashWindowEx(ref FLASHWINFO fi);
+'@
+        return $true
+    } catch { return $false }
+}
+
+function Request-Attention {
+    # v3.26 (demande de Thomas, 24/11/2026 : une question attendait parfois longtemps derrière d'autres fenêtres).
+    # Avant chaque question : si la fenêtre de JARVIS n'est pas au premier plan, elle y est remise. Windows ne le
+    # permet que si personne ne se sert d'une autre fenêtre depuis un moment (ForegroundLockTimeout, 200 s par
+    # défaut) ; sinon le bouton de JARVIS clignote dans la barre des tâches jusqu'à ce qu'on y revienne. Voulu :
+    # prendre le clavier pendant qu'on écrit ailleurs enverrait la frappe à JARVIS (réponse non voulue). Aucun
+    # contournement (touche Alt simulée, AttachThreadInput). Rend NONE, FRONT ou FLASH.
+    try {
+        if (-not (Initialize-NativeWin) -or -not (Initialize-NativeFocus)) { return 'NONE' }
+        $con = [JarvisNative.Win]::GetConsoleWindow()
+        if ($con -eq [IntPtr]::Zero) { return 'NONE' }
+        # Windows Terminal : la fenêtre affichée est le propriétaire de la fenêtre de console (règle 26)
+        $win = [JarvisNative.Win]::GetAncestor($con, 3)
+        if ($win -eq [IntPtr]::Zero) { $win = $con }
+        if (-not [JarvisNative.Win]::IsWindowVisible($win)) { return 'NONE' }
+        if ([JarvisNative.Focus]::GetForegroundWindow() -eq $win) { return 'NONE' }
+        if ([JarvisNative.Focus]::SetForegroundWindow($win) -and [JarvisNative.Focus]::GetForegroundWindow() -eq $win) {
+            if ([JarvisNative.Win]::IsIconic($win)) { $null = [JarvisNative.Focus]::ShowWindow($win, 9) }   # SW_RESTORE
+            return 'FRONT'
+        }
+        $fi = New-Object JarvisNative.Focus+FLASHWINFO
+        $fi.cbSize = [uint32][Runtime.InteropServices.Marshal]::SizeOf($fi)
+        $fi.hwnd = $win
+        $fi.dwFlags = [uint32]15   # FLASHW_ALL (3) + FLASHW_TIMERNOFG (12) : jusqu'au retour au premier plan
+        $null = [JarvisNative.Focus]::FlashWindowEx([ref]$fi)
+        return 'FLASH'
+    } catch { return 'NONE' }
 }
 
 function Get-WinRectArg {
@@ -2794,6 +2840,27 @@ function Get-JarvisHttpClient {
     $c.DefaultRequestHeaders.UserAgent.ParseAdd('JARVIS-checkup/' + $JarvisVersion)
     $script:JarvisHttp = $c
     return $c
+}
+
+function Get-ClockSample {
+    # Heure d'Internet pour Get-ClockCheck : en-tête Date d'une réponse de www.msftconnecttest.com (adresse que
+    # Windows interroge lui-même pour savoir s'il a Internet). En HTTP simple : la lecture marche même quand l'heure
+    # du PC est assez fausse pour faire échouer une connexion chiffrée. Relevé du 24/11/2026 sur le PC de Thomas :
+    # cette adresse et www.microsoft.com à moins d'une seconde de time.windows.com (w32tm /stripchart), github.com
+    # 6 s en retard (page gardée en cache). Server = $null sans réponse dans les 5 s.
+    $s = [pscustomobject]@{ Server = $null; Age = $null; Before = $null; After = $null }
+    try {
+        $c = Get-JarvisHttpClient
+        $s.Before = [DateTime]::UtcNow
+        $t = $c.GetAsync('http://www.msftconnecttest.com/connecttest.txt')
+        if (-not $t.Wait(5000)) { return $s }
+        $s.After = [DateTime]::UtcNow
+        $resp = $t.Result
+        if ($null -ne $resp.Headers.Date) { $s.Server = $resp.Headers.Date.UtcDateTime }
+        if ($null -ne $resp.Headers.Age) { $s.Age = $resp.Headers.Age.TotalSeconds }
+        $resp.Dispose()
+    } catch { $s.Server = $null }
+    return $s
 }
 
 function Start-JarvisUpdateCheck {
@@ -4729,6 +4796,54 @@ function Get-RegValueSafe([string]$Path, [string]$Name) {
     return $r
 }
 
+function Get-TimeSyncMode($Value) {
+    # « Régler l'heure automatiquement » (Paramètres > Heure et langue) : valeur Type de W32Time\Parameters.
+    # AUTO : NTP (PC seul), NT5DS (domaine), AllSync. OFF : NoSync (réglage coupé). Fonction pure, testée en T1.
+    if ($null -eq $Value) { return 'UNKNOWN' }
+    $t = ([string]$Value).Trim()
+    if ($t -match '^(NTP|NT5DS|AllSync)$') { return 'AUTO' }
+    if ($t -match '^NoSync$') { return 'OFF' }
+    return 'UNKNOWN'
+}
+
+function Get-ClockCheck($ServerUtc, $AgeSec, $Before, $After) {
+    # v3.26 (demande de Thomas, 24/11/2026 : PC-LV, rallumé après une longue pause, avait plusieurs minutes
+    # d'écart et une mise à jour y avait échoué). Écart entre l'heure du PC et celle d'un serveur : $ServerUtc =
+    # en-tête Date (à la seconde près), $AgeSec = en-tête Age (réponse gardée en cache), $Before et $After = heure
+    # UTC du PC avant et après la requête. Positif : le PC retarde. Status OK (moins d'une minute : Windows
+    # garde son heure à la seconde près quand sa mise à l'heure fonctionne), WARN, ou UNKNOWN (pas de réponse,
+    # réponse trop lente pour une mesure fiable). Fonction pure, testée en T1.
+    $r = [pscustomobject]@{ Status = 'UNKNOWN'; Offset = $null; Text = 'non vérifiable (pas de réponse d''Internet)' }
+    if ($null -eq $ServerUtc -or $null -eq $Before -or $null -eq $After) { return $r }
+    $rtt = ([datetime]$After - [datetime]$Before).TotalSeconds
+    if ($rtt -lt 0 -or $rtt -gt 10) { $r.Text = 'non vérifiable (réponse d''Internet trop lente)'; return $r }
+    $age = 0.0
+    if ($null -ne $AgeSec) { $age = [double]$AgeSec }
+    if ($age -lt 0 -or $age -gt 86400) { $r.Text = 'non vérifiable (réponse non reconnue)'; return $r }
+    $mid = ([datetime]$Before).AddSeconds($rtt / 2)
+    $off = (([datetime]$ServerUtc).AddSeconds($age + 0.5) - $mid).TotalSeconds
+    $r.Offset = $off
+    $g = [math]::Round([math]::Abs($off))
+    if ($g -lt 60) {
+        $r.Status = 'OK'
+        if ($g -le 1) { $r.Text = 'à l''heure' } else { $r.Text = 'à l''heure (écart de {0} s)' -f $g }
+        return $r
+    }
+    if ($g -lt 3600) {
+        $gt = '{0} min' -f [math]::Floor($g / 60)
+        if ($g % 60) { $gt += (' {0} s' -f ($g % 60)) }
+    } elseif ($g -lt 172800) {
+        $gt = '{0} h' -f [math]::Floor($g / 3600)
+        $m = [math]::Floor(($g % 3600) / 60)
+        if ($m) { $gt += (' {0} min' -f $m) }
+    } else {
+        $gt = '{0} jours' -f [math]::Floor($g / 86400)
+    }
+    $r.Status = 'WARN'
+    if ($off -gt 0) { $r.Text = 'en retard de ' + $gt } else { $r.Text = 'en avance de ' + $gt }
+    return $r
+}
+
 function Get-UacState {
     $k = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
     $lua = Get-RegValueSafe $k 'EnableLUA'
@@ -5305,6 +5420,47 @@ function Invoke-SelfTestAnalyzers {
         $f = Get-CbsSummary ((& $mk 1154 1000) + "`r`n") $t0 'REPAIR'
         Assert-True ($null -ne $f -and $f.Flags -eq 0 -and $f.FilesDetected -eq 1187 -and $f.FilesRepaired -eq 1033 -and $f.Remaining -eq 154) 'marques en partie réparées mises à part'
         '9/9 cas'
+    }
+    Test-Case 'Heure du PC : écart avec Internet et réglage automatique' {
+        # Mesure réelle du 24/11/2026 sur le PC de Thomas (www.msftconnecttest.com, 72 ms, PC en retard de 1,8 s)
+        $b = [datetime]'2026-11-24 17:06:46.149'
+        $a = $b.AddMilliseconds(72)
+        $s0 = [datetime]'2026-11-24 17:06:48'
+        $v = Get-ClockCheck $s0 $null $b $a
+        Assert-True ($v.Status -eq 'OK' -and $v.Text -eq 'à l''heure (écart de 2 s)' -and $v.Offset -gt 2 -and $v.Offset -lt 3) ('mesure réelle : ' + $v.Text)
+        $cases = @(
+            @(372, 'WARN', 'en retard de 6 min 12 s'),
+            @(-11100, 'WARN', 'en avance de 3 h 5 min'),
+            @(-259200, 'WARN', 'en avance de 3 jours'),
+            @(58, 'OK', 'à l''heure (écart de 58 s)'),
+            @(61, 'WARN', 'en retard de 1 min 1 s'),
+            @(0, 'OK', 'à l''heure')
+        )
+        foreach ($c in $cases) {
+            # Serveur décalé de $c[0] s par rapport au milieu de la mesure (moins la demi-seconde de l'en-tête Date)
+            $v = Get-ClockCheck ($b.AddMilliseconds(36 - 500).AddSeconds($c[0])) $null $b $a
+            Assert-True ($v.Status -eq $c[1] -and $v.Text -eq $c[2]) ('écart {0} s : {1} {2}' -f $c[0], $v.Status, $v.Text)
+        }
+        $v = Get-ClockCheck ($s0.AddSeconds(-30)) 30 $b $a
+        Assert-True ($v.Status -eq 'OK') 'réponse en cache (en-tête Age) mal comptée'
+        Assert-True ((Get-ClockCheck $null $null $b $a).Status -eq 'UNKNOWN') 'sans réponse : pas UNKNOWN'
+        $v = Get-ClockCheck $s0 $null $b $b.AddSeconds(12)
+        Assert-True ($v.Status -eq 'UNKNOWN' -and (Test-UnreadValue $v.Text)) 'réponse lente acceptée, ou absente de « Non vérifié »'
+        Assert-True ((Get-ClockCheck $s0 $null $a $b).Status -eq 'UNKNOWN') 'heure du PC revenue en arrière acceptée'
+        Assert-True ((Get-ClockCheck $s0 (-5) $b $a).Status -eq 'UNKNOWN') 'en-tête Age négatif accepté'
+        Assert-True (Test-UnreadValue (Get-ClockCheck $null $null $b $a).Text) 'absence de réponse hors de « Non vérifié »'
+        foreach ($p in @(@('NTP', 'AUTO'), @('nt5ds', 'AUTO'), @('AllSync', 'AUTO'), @('NoSync', 'OFF'), @($null, 'UNKNOWN'), @('', 'UNKNOWN'), @('Autre', 'UNKNOWN'))) {
+            Assert-True ((Get-TimeSyncMode $p[0]) -eq $p[1]) ('réglage « {0} » mal lu' -f $p[0])
+        }
+        '20/20 cas'
+    }
+    Test-Case 'Premier plan : structure FLASHWINFO (32 et 64 bits)' {
+        Assert-True (Initialize-NativeFocus) 'fonctions de Windows non chargées'
+        $size = [Runtime.InteropServices.Marshal]::SizeOf([type]'JarvisNative.Focus+FLASHWINFO')
+        $want = 20
+        if ([IntPtr]::Size -eq 8) { $want = 32 }
+        Assert-True ($size -eq $want) ('taille {0} au lieu de {1}' -f $size, $want)
+        '{0} octets ({1} bits)' -f $size, ([IntPtr]::Size * 8)
     }
     Test-Case 'SFC : fichiers remis lus dans CBS.log' {
         # Lignes réelles de PC-LV le 21/11/2026 (SFC lancé vers 17 h 02), espaces d'origine
@@ -7609,6 +7765,27 @@ if ($pending.Count -gt 0) {
     Write-Sub '(un simple « Redémarrer » peut laisser les mises à jour en attente)'
 }
 else { Write-Status 'Redémarrage en attente' 'aucun' 'OK' }
+
+# v3.26 : heure du PC comparée à celle d'Internet (Get-ClockSample, Get-ClockCheck), avec l'état du réglage
+# « Régler l'heure automatiquement » (Get-TimeSyncMode) pour donner le bon geste
+$clk = Get-ClockSample
+$clkV = Get-ClockCheck $clk.Server $clk.Age $clk.Before $clk.After
+$clkSync = Get-TimeSyncMode (Get-RegValueSafe 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Parameters' 'Type').Value
+$clkWhere = 'Paramètres > Heure et langue > Date et heure'
+if ($clkV.Status -eq 'WARN') {
+    Write-Status 'Heure du PC' $clkV.Text 'WARN'
+    if ($clkSync -eq 'OFF') {
+        Write-Sub ($clkWhere + ' : active « Régler l''heure automatiquement »,')
+        Write-Sub 'puis clique sur « Synchroniser maintenant ».'
+    }
+    else { Write-Sub ($clkWhere + ' > « Synchroniser maintenant ».') }
+    Write-Sub 'Une heure fausse peut faire échouer des mises à jour et des connexions sécurisées.'
+}
+elseif ($clkV.Status -eq 'OK') {
+    Write-Status 'Heure du PC' $clkV.Text 'OK'
+    if ($clkSync -eq 'OFF') { Write-Sub ('Mise à l''heure automatique coupée : ' + $clkWhere + ' pour la réactiver') }
+}
+else { Write-Status 'Heure du PC' $clkV.Text 'INFO' }
 
 # ==================================================================
 # [02] WINDOWS UPDATE

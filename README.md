@@ -16,7 +16,7 @@ Lien permanent, il donne toujours la dernière version publiée. Toutes les vers
 
 | N° | Section | Ce qui est vérifié |
 |---|---|---|
-| 01 | Système | version de Windows, fin de support de Windows 10, durée depuis le dernier démarrage, redémarrage en attente |
+| 01 | Système | version de Windows, fin de support de Windows 10, durée depuis le dernier démarrage, redémarrage en attente, heure du PC comparée à celle d'Internet |
 | 02 | Windows Update | mises à jour importantes, à faire à l'écran, facultatives ; échecs d'installation des 30 derniers jours |
 | 03 | Applications | mises à jour disponibles via winget et le Microsoft Store |
 | 04 | Pilotes | Wi-Fi, Ethernet, Bluetooth, carte graphique, périphériques en erreur |
@@ -48,7 +48,7 @@ Windows 10 ou 11, PC fixe ou portable, Windows PowerShell 5.1 (déjà présent d
 
 ## Sécurité et confidentialité
 
-- **Aucune donnée personnelle n'est envoyée.** Les seules connexions sont celles des outils de Windows (Windows Update, winget, Microsoft Store), un test de latence vers `1.1.1.1`, une résolution DNS de `www.microsoft.com`, et la question à GitHub sur la dernière version publiée (GitHub voit alors l'adresse IP, comme pour toute visite).
+- **Aucune donnée personnelle n'est envoyée.** Les seules connexions sont celles des outils de Windows (Windows Update, winget, Microsoft Store), un test de latence vers `1.1.1.1`, une résolution DNS de `www.microsoft.com`, une lecture de l'heure sur `www.msftconnecttest.com` (adresse que Windows interroge lui-même pour tester la connexion), et la question à GitHub sur la dernière version publiée (GitHub voit alors l'adresse IP, comme pour toute visite).
 - **Fichier abîmé ou incomplet détecté** : `JARVIS.cmd` contient l'empreinte SHA-256 de son propre code. S'il a été abîmé ou tronqué (téléchargement interrompu, par exemple), il refuse de démarrer. Ce contrôle détecte un accident, il ne protège pas contre une modification volontaire du fichier.
 - **Installation réservée aux administrateurs** : JARVIS refuse de s'installer dans un dossier que n'importe quel programme peut modifier. Le dossier proposé, `C:\Program Files\JARVIS`, convient toujours.
 - **Mises à jour contrôlées** : un fichier téléchargé n'est installé que si sa taille, l'empreinte publiée par GitHub, son empreinte interne et son numéro de version sont tous conformes. Si l'installation échoue en cours de route, l'ancienne version est remise en place.
