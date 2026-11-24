@@ -2951,6 +2951,10 @@ function Get-CbsSummary([string]$Text, $Since, [string]$Kind) {
     # « Operation: Detect and Repair »). Rend Time, Detected, Repaired, Remaining, ou $null sans bilan complet.
     # Relevé sur l'autre PC le 20/11/2026 : DISM rendait 0x800F0915 (« échec ») alors que 1 929 défauts sur
     # 1 973 avaient été réparés. Fonction pure, testée en T1 (fins de ligne CRLF).
+    # v3.26 : FilesDetected, FilesRepaired, Flags. Relevé sur le PC de Thomas le 24/11/2026 : /ScanHealth trouvait
+    # 33 défauts (fichiers), /RestoreHealth en annonçait 1 187 réparés, dont 1 154 « CSI FileFlags » (marques
+    # internes des fichiers en attente, vues seulement pendant la réparation). Ces marques sont mises à part
+    # seulement si toutes ont été réparées : FilesDetected - FilesRepaired reste alors égal à Remaining.
     if ([string]::IsNullOrEmpty($Text)) { return $null }
     $found = $null
     $cur = $null
@@ -2960,7 +2964,7 @@ function Get-CbsSummary([string]$Text, $Since, [string]$Kind) {
         $body = $m.Groups[2].Value.Trim()
         if ($body -eq 'Summary:') {
             $t = [datetime]::ParseExact($m.Groups[1].Value, 'yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
-            $cur = @{ Time = $t; Kind = ''; Detected = $null; Repaired = $null }
+            $cur = @{ Time = $t; Kind = ''; Detected = $null; Repaired = $null; FlagsDet = $null; FlagsRep = $null }
             continue
         }
         if ($null -eq $cur) { continue }
@@ -2968,12 +2972,18 @@ function Get-CbsSummary([string]$Text, $Since, [string]$Kind) {
         elseif ($body -match '^Operation:\s*Detect only') { $cur.Kind = 'DETECT' }
         elseif ($body -match '^Total Detected Corruption:\s*(\d+)') { $cur.Detected = [int]$Matches[1] }
         elseif ($body -match '^Total Repaired Corruption:\s*(\d+)') { $cur.Repaired = [int]$Matches[1] }
+        elseif ($body -match '^CSI FileFlags Corrupt:\s*(\d+)') { $cur.FlagsDet = [int]$Matches[1] }
+        elseif ($body -match '^CSI FileFlags Repaired:\s*(\d+)') { $cur.FlagsRep = [int]$Matches[1] }
         elseif ($body -match '^Total Operation Time:') {
             if ($cur.Kind -eq $Kind -and $null -ne $cur.Detected -and $null -ne $cur.Repaired -and
                 ($null -eq $Since -or $cur.Time -ge $Since)) {
+                $fl = 0
+                if ($null -ne $cur.FlagsDet -and $null -ne $cur.FlagsRep -and $cur.FlagsDet -eq $cur.FlagsRep -and
+                    $cur.FlagsRep -le $cur.Repaired -and $cur.FlagsDet -le $cur.Detected) { $fl = $cur.FlagsRep }
                 $found = [pscustomobject]@{
                     Time = $cur.Time; Detected = $cur.Detected; Repaired = $cur.Repaired
                     Remaining = [math]::Max(0, $cur.Detected - $cur.Repaired)
+                    FilesDetected = $cur.Detected - $fl; FilesRepaired = $cur.Repaired - $fl; Flags = $fl
                 }
             }
             $cur = $null
@@ -4945,13 +4955,14 @@ function Invoke-WindowsRepair {
     switch (Get-DismRepairVerdict $dism.Text $dism.Code) {
         'REPAIRED' {
             Write-Status 'DISM RestoreHealth' 'image Windows réparée' 'OK'
-            if ($sum -and $sum.Detected -gt 0) { Write-Sub ('{0:N0} défaut(s) réparé(s) dans le magasin de composants' -f $sum.Repaired) }
+            if ($sum -and $sum.FilesRepaired -gt 0) { Write-Sub ('{0:N0} défaut(s) réparé(s) dans le magasin de composants' -f $sum.FilesRepaired) }
+            if ($sum -and $sum.Flags -gt 0) { Write-Sub ('plus {0:N0} marque(s) interne(s) de Windows remise(s) en ordre, sans gravité' -f $sum.Flags) }
             $memo = 'REPAIRED|0'
         }
         'NOSOURCE' {
             $incomplete = $true
-            if ($sum -and $sum.Repaired -gt 0 -and $sum.Remaining -gt 0) {
-                Write-Status 'DISM RestoreHealth' ('réparation partielle : {0:N0} défauts réparés sur {1:N0}' -f $sum.Repaired, $sum.Detected) 'WARN'
+            if ($sum -and $sum.FilesRepaired -gt 0 -and $sum.Remaining -gt 0) {
+                Write-Status 'DISM RestoreHealth' ('réparation partielle : {0:N0} défauts réparés sur {1:N0}' -f $sum.FilesRepaired, $sum.FilesDetected) 'WARN'
                 Write-Sub ('{0:N0} restent : Windows Update ne fournit plus les fichiers qui les remplaceraient' -f $sum.Remaining)
                 $memo = 'PARTIAL|{0}' -f $sum.Remaining
             } else {
@@ -5264,7 +5275,23 @@ function Invoke-SelfTestAnalyzers {
         $cut = ($rows[9..13] -join "`r`n") + "`r`n"
         Assert-True ($null -eq (Get-CbsSummary $cut $t0 'REPAIR')) 'bilan incomplet accepté'
         Assert-True ($null -eq (Get-CbsSummary '' $t0 'REPAIR')) 'texte vide accepté'
-        '6/6 cas'
+        Assert-True ($r.FilesRepaired -eq 1929 -and $r.FilesDetected -eq 1973 -and $r.Flags -eq 0) 'bilan sans marques de fichiers modifié'
+        # Bilan réel du PC de Thomas le 24/11/2026 (/RestoreHealth) : 33 fichiers et 1 154 marques internes
+        $mk = { param($fd, $fr) @(
+                (& $L '2026-11-24 15:44:30' 'Summary:'),
+                (& $L '2026-11-24 15:44:30' 'Operation: Detect and Repair '),
+                (& $L '2026-11-24 15:44:30' "Total Detected Corruption:`t1187"),
+                (& $L '2026-11-24 15:44:30' "`tCSI Payload Corruption:`t33"),
+                (& $L '2026-11-24 15:44:30' ("`tCSI FileFlags Corrupt:`t{0}" -f $fd)),
+                (& $L '2026-11-24 15:44:30' ("Total Repaired Corruption:`t{0}" -f (33 + $fr))),
+                (& $L '2026-11-24 15:44:30' "`tCSI Payload Repaired:`t33"),
+                (& $L '2026-11-24 15:44:30' ("`tCSI FileFlags Repaired:`t{0}" -f $fr)),
+                (& $L '2026-11-24 15:44:30' 'Total Operation Time: 678 seconds.')) -join "`r`n" }
+        $f = Get-CbsSummary ((& $mk 1154 1154) + "`r`n") $t0 'REPAIR'
+        Assert-True ($null -ne $f -and $f.FilesDetected -eq 33 -and $f.FilesRepaired -eq 33 -and $f.Flags -eq 1154 -and $f.Remaining -eq 0) 'marques de fichiers non mises à part'
+        $f = Get-CbsSummary ((& $mk 1154 1000) + "`r`n") $t0 'REPAIR'
+        Assert-True ($null -ne $f -and $f.Flags -eq 0 -and $f.FilesDetected -eq 1187 -and $f.FilesRepaired -eq 1033 -and $f.Remaining -eq 154) 'marques en partie réparées mises à part'
+        '9/9 cas'
     }
     Test-Case 'SFC : fichiers remis lus dans CBS.log' {
         # Lignes réelles de PC-LV le 21/11/2026 (SFC lancé vers 17 h 02), espaces d'origine
