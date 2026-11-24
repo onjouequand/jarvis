@@ -682,12 +682,7 @@ function Read-Answer([string]$Prompt) {
         if ($null -eq $a) { Write-Host ($Prompt + ' : [annulé, fin de l''entrée]') -ForegroundColor DarkGray }
         return $a
     }
-    if ((Request-Attention) -eq 'FRONT') {
-        # Relecture v3.26 : une frappe destinée à une autre fenêtre, partie au moment où JARVIS passe devant,
-        # ne doit pas répondre (Entrée = réponse par défaut)
-        Start-Sleep -Milliseconds 500
-        Clear-KeyBuffer
-    }
+    $null = Request-Attention   # fenêtre remise devant sans prendre le clavier (v3.26)
     Write-Host ($Prompt + ' : ') -NoNewline
     $sb = New-Object System.Text.StringBuilder
     while ($true) {
@@ -1640,15 +1635,13 @@ function Get-JarvisWindow {
 }
 
 function Initialize-NativeFocus {
-    # Fonctions de Windows pour remettre la fenêtre au premier plan (chargées une seule fois). FLASHWINFO :
-    # 32 octets en 64 bits, 20 en 32 bits (règle 28, contrôlé en T1) ; cbSize est pris par Marshal.SizeOf.
+    # Fonctions de Windows pour signaler une question (chargées une seule fois). FLASHWINFO : 32 octets en 64 bits,
+    # 20 en 32 bits (règle 28, contrôlé en T1) ; cbSize est pris par Marshal.SizeOf.
     if ('JarvisNative.Focus' -as [type]) { return $true }
     try {
         Add-Type -Namespace JarvisNative -Name Focus -MemberDefinition @'
 [StructLayout(LayoutKind.Sequential)] public struct FLASHWINFO { public uint cbSize; public IntPtr hwnd; public uint dwFlags; public uint uCount; public uint dwTimeout; }
 [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
-[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int cmd);
 [DllImport("user32.dll")] public static extern bool FlashWindowEx(ref FLASHWINFO fi);
 '@
         return $true
@@ -1657,12 +1650,20 @@ function Initialize-NativeFocus {
 
 function Request-Attention {
     # v3.26 (demande de Thomas, 24/11/2026 : une question attendait parfois longtemps derrière d'autres fenêtres).
-    # Avant chaque question : si la fenêtre de JARVIS n'est pas au premier plan, elle y est remise. Windows ne le
-    # permet que si personne ne se sert d'une autre fenêtre depuis un moment (ForegroundLockTimeout, 200 s par
-    # défaut) ; sinon le bouton de JARVIS clignote dans la barre des tâches jusqu'à ce qu'on y revienne. Voulu :
-    # prendre le clavier pendant qu'on écrit ailleurs enverrait la frappe à JARVIS (réponse non voulue). Aucun
-    # contournement (touche Alt simulée, AttachThreadInput). Rend NONE, FRONT ou FLASH.
-    # Limite : dans Windows Terminal, un onglet caché d'une fenêtre déjà au premier plan ne reçoit aucun signal.
+    # Avant chaque question, si la fenêtre de JARVIS n'est pas au premier plan : elle repasse devant les autres
+    # fenêtres SANS prendre le clavier (passage « toujours visible » puis retour, SWP_NOACTIVATE), et son bouton
+    # clignote dans la barre des tâches jusqu'à ce qu'on y revienne. On clique dessus pour répondre.
+    # Relevés du 24/11/2026 sur le PC de Thomas :
+    # - SetForegroundWindow est refusé à un programme qui n'a pas reçu la dernière action au clavier ou à la souris,
+    #   quel que soit le temps d'inactivité (scan complet de 4 min sans toucher au PC : JARVIS restait derrière) ;
+    #   appelé quand même avant la remise devant, Windows donnait ensuite le clavier à JARVIS : jamais appelé ici ;
+    # - remise devant sans activation : fenêtre visible devant, clavier resté dans l'autre fenêtre, dans l'ancienne
+    #   console comme dans Windows Terminal ;
+    # - fenêtre réduite : la restaurer (même SW_SHOWNOACTIVATE) lui donnait le clavier : elle reste réduite, seul
+    #   son bouton clignote.
+    # Aucun contournement du verrou de Windows (Alt simulé, AttachThreadInput) : la frappe destinée à une autre
+    # fenêtre répondrait à JARVIS. Limite : dans Windows Terminal, un onglet caché d'une fenêtre déjà au premier plan
+    # ne reçoit aucun signal. Rend NONE, SHOWN (remise devant et clignotement) ou FLASH (clignotement seul).
     if ($script:AttentionOff) { return 'NONE' }
     try {
         if (-not (Initialize-NativeWin) -or -not (Initialize-NativeFocus)) {
@@ -1677,16 +1678,20 @@ function Request-Attention {
         if ($win -eq [IntPtr]::Zero) { $win = $con }
         if (-not [JarvisNative.Win]::IsWindowVisible($win)) { return 'NONE' }
         if ([JarvisNative.Focus]::GetForegroundWindow() -eq $win) { return 'NONE' }
-        if ([JarvisNative.Focus]::SetForegroundWindow($win) -and [JarvisNative.Focus]::GetForegroundWindow() -eq $win) {
-            if ([JarvisNative.Win]::IsIconic($win)) { $null = [JarvisNative.Focus]::ShowWindow($win, 9) }   # SW_RESTORE
-            return 'FRONT'
+        $res = 'FLASH'
+        if (-not [JarvisNative.Win]::IsIconic($win)) {
+            # SWP_NOSIZE (1) + SWP_NOMOVE (2) + SWP_NOACTIVATE (0x10) ; HWND_TOPMOST (-1) puis HWND_NOTOPMOST (-2) :
+            # la fenêtre reste au-dessus des fenêtres ordinaires sans rester « toujours visible »
+            $null = [JarvisNative.Win]::SetWindowPos($win, [IntPtr](-1), 0, 0, 0, 0, [uint32]0x13)
+            $null = [JarvisNative.Win]::SetWindowPos($win, [IntPtr](-2), 0, 0, 0, 0, [uint32]0x13)
+            $res = 'SHOWN'
         }
         $fi = New-Object JarvisNative.Focus+FLASHWINFO
         $fi.cbSize = [uint32][Runtime.InteropServices.Marshal]::SizeOf($fi)
         $fi.hwnd = $win
         $fi.dwFlags = [uint32]15   # FLASHW_ALL (3) + FLASHW_TIMERNOFG (12) : jusqu'au retour au premier plan
         $null = [JarvisNative.Focus]::FlashWindowEx([ref]$fi)
-        return 'FLASH'
+        return $res
     } catch { return 'NONE' }
 }
 
