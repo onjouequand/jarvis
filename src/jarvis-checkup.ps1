@@ -1,5 +1,5 @@
 ﻿<#
-    J.A.R.V.I.S. // Check-up système v3.26
+    J.A.R.V.I.S. // Check-up système v3.27
     -----------------------------------------------------------------
     Modules :
       [01] Système        : version Windows, uptime, redémarrage en attente
@@ -210,7 +210,7 @@ if (-not $PSCommandPath -and $env:JARVIS_SELF -and $env:JARVIS_ARGS) {
 # ------------------------------------------------------------------
 # Identité du programme et emplacement
 # ------------------------------------------------------------------
-$JarvisVersion = '3.26'
+$JarvisVersion = '3.27'
 $JarvisSelf = $env:JARVIS_SELF                     # défini par JARVIS.cmd
 if (-not $JarvisSelf) { $JarvisSelf = $PSCommandPath }  # lancement direct du .ps1
 $JarvisHome = $null
@@ -360,7 +360,7 @@ function Show-Banner {
         foreach ($l in $plain) { Write-Host $l -ForegroundColor Cyan; Pause-Ms 70 }
         Write-Host ''
         Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-        Write-Host '      module check-up v3.26' -ForegroundColor DarkGray
+        Write-Host '      module check-up v3.27' -ForegroundColor DarkGray
         Write-Host ''
         return
     }
@@ -380,7 +380,7 @@ function Show-Banner {
     }
     Write-Host ''
     Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-    Write-Host '      module check-up v3.26' -ForegroundColor DarkGray
+    Write-Host '      module check-up v3.27' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -3769,8 +3769,21 @@ function Get-WingetErrorHint([string]$Code) {
         # « ShellExecute installer failed » : le programme d'installation de l'éditeur a échoué (Java : code 1618)
         '^0x8A150006$' { return 'son programme d''installation a échoué, souvent parce qu''une autre installation tournait : redémarre le PC, puis relance J.A.R.V.I.S.' }
         '^0x80070002$' { return 'un fichier manquait pendant l''installation : relance un scan pour réessayer' }
+        # 0x8019xxxx = réponse HTTP d'erreur au téléchargement (0x80190193 = 403, « Interdit » selon « winget error ») :
+        # le site de l'éditeur a refusé le fichier (Intel Extreme Tuning Utility sur MAJÉRION, 25/11/2026)
+        '^0x80190(1[9A-F][0-9A-F]|2[0-5][0-9A-F])$' { return 'le site de l''éditeur a refusé le téléchargement : réessaie dans quelques jours, ou prends la nouvelle version sur le site de l''éditeur' }
     }
     return $null
+}
+
+function Test-WingetNotApplicable($ExitCode) {
+    # Code de « winget upgrade » qui veut dire « pas de version adaptée à cette installation » : ce n'est pas une
+    # panne, l'application doit se mettre à jour par elle-même. 0x8A15002B « aucune mise à niveau applicable » ;
+    # 0x8A15008E « la mise à niveau utilise une technologie d'installation différente » (Epic Online Services sur
+    # MAJÉRION, 25/11/2026, sens lu par « winget error »). Fonction pure, testée en T1.
+    if ($null -eq $ExitCode) { return $false }
+    try { $h = '{0:X8}' -f $ExitCode } catch { return $false }
+    return ($h -eq '8A15002B' -or $h -eq '8A15008E')
 }
 
 function Get-WingetPresence($ExitCode) {
@@ -6368,6 +6381,15 @@ function Invoke-SelfTestAnalyzers {
         Assert-True ((Get-WingetErrorHint '0x8A150011') -match 'sécurité') 'empreinte différente (0x8A150011) sans explication'
         Assert-True ((Get-WingetErrorHint '0x8A150006') -match 'autre installation') 'installateur en échec (0x8A150006) sans explication'
         Assert-True ($null -eq (Get-WingetErrorHint '0x8A15FFFF')) 'code inconnu expliqué'
+        # MAJÉRION le 25/11/2026 : Intel XTU 0x80190193 (HTTP 403), Epic Online Services 0x8A15008E
+        Assert-True ((Get-WingetErrorHint '0x80190193') -match 'refusé le téléchargement') 'téléchargement refusé (403) sans explication'
+        Assert-True ((Get-WingetErrorHint '0x80190194') -match 'refusé le téléchargement') 'fichier introuvable (404) sans explication'
+        Assert-True ($null -eq (Get-WingetErrorHint '0x8019012C')) 'code HTTP hors erreur expliqué'
+        Assert-True (Test-WingetNotApplicable ([int]0x8A15002B)) 'aucune mise à niveau applicable non reconnue'
+        Assert-True (Test-WingetNotApplicable ([int]0x8A15008E)) 'technologie d''installation différente non reconnue'
+        Assert-True (-not (Test-WingetNotApplicable ([int]0x8A150011))) 'empreinte différente prise pour « pas adaptée »'
+        Assert-True (-not (Test-WingetNotApplicable 0)) 'succès pris pour « pas adaptée »'
+        Assert-True (-not (Test-WingetNotApplicable $null)) 'code absent pris pour « pas adaptée »'
         Assert-True ((Get-WingetPresence 0) -eq 'PRESENT') 'application présente mal lue'
         Assert-True ((Get-WingetPresence (-1978335212)) -eq 'ABSENT') 'application absente (0x8A150014) mal lue'
         Assert-True ((Get-WingetPresence (-1978335231)) -eq 'UNKNOWN') 'autre erreur de winget prise pour une réponse'
@@ -7761,7 +7783,7 @@ $adminTxt = 'non'
 if ($isAdmin) { $adminTxt = 'oui' }
 Type-Line ("   >> Hôte : {0}  //  Session : {1}  //  Admin : {2}  //  Protocole : {3}" -f $env:COMPUTERNAME, $env:USERNAME, $adminTxt, $modeTxt) 'DarkCyan' 2
 
-$script:Report.Add('J.A.R.V.I.S. // Rapport de check-up')
+$script:Report.Add(('J.A.R.V.I.S. v{0} // Rapport de check-up' -f $JarvisVersion))
 $script:Report.Add(('Date : {0}   Hôte : {1}   Admin : {2}   Protocole : {3}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm'), $env:COMPUTERNAME, $adminTxt, $modeTxt))
 
 # ==================================================================
@@ -8155,7 +8177,7 @@ if ($NoWinget) {
             # winget ne connaît pas leur version installée : il refuse de les mettre à jour, inutile de les proposer
             $names = ''
             if (@($wg.UnknownNames).Count -gt 0) { $names = ' : ' + (Cut (@($wg.UnknownNames) -join ', ') 60) }
-            Write-Status 'Version non détectable par winget' ([string]$wg.Unknown + $names) 'INFO'
+            Write-Status 'Version inconnue de winget' ([string]$wg.Unknown + $names) 'INFO'
             Write-Sub 'winget ne peut pas les mettre à jour : passe par l''application elle-même ou le site de l''éditeur si besoin'
         }
         $script:WGSkipIds = @(@($wg.NotApplicable) | ForEach-Object { $_.Ids } | Where-Object { $_ })
@@ -9513,9 +9535,9 @@ if ($script:WGCount -gt 0 -and $script:WingetExe) {
                     $okItems += $it
                     $spans[$it.Id] = @($itStart, (Get-Date))
                 }
-                elseif (('{0:X8}' -f $rc) -eq '8A15002B') {
-                    # « Aucune mise à niveau applicable » : la nouvelle version ne convient pas à cette installation.
-                    # Ce n'est pas une panne : l'application doit se mettre à jour par elle-même.
+                elseif (Test-WingetNotApplicable $rc) {
+                    # La nouvelle version ne convient pas à cette installation (aucune mise à niveau applicable, ou
+                    # autre technologie d'installation). Ce n'est pas une panne : l'application se met à jour seule.
                     $naList += $it.Name
                     $skip += $it.Id
                 } else {
@@ -9605,7 +9627,11 @@ if ($script:WGCount -gt 0 -and $script:WingetExe) {
                 }
             }
             Write-Action 'FAIL' ('{0} : code {1}' -f $it.Name, $k.Code)
-            if ($hint) { Write-Sub $hint }
+            if ($hint) {
+                Write-Sub $hint
+                # Cause déjà dite : pas de « l'application tournait encore » pour elle dans la liste des retards
+                $explained += $it.Id
+            }
         }
         foreach ($n in $selfList) {
             Write-Action 'INFO' ($n + ' : contient winget, qui ne peut pas se remplacer pendant qu''il tourne ; le Microsoft Store le met à jour')
