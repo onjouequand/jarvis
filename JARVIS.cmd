@@ -1,6 +1,6 @@
 <# : JARVIS.cmd. Ne pas modifier ce texte
 @echo off
-rem JARVIS-SHA256=5267b96af63b0f3ca7532d122208210fb7f9cd98b93084e7ecc18a3423bc3cfe
+rem JARVIS-SHA256=7ec05c1c355d6eec8e674e180c18241cc3243ee4990d2cecba348e0d2b0dbbfe
 setlocal
 "%SystemRoot%\System32\chcp.com" 65001 >nul
 set "JARVIS_SELF=%~f0"
@@ -3584,6 +3584,16 @@ function Get-WingetUnknownCount {
     return 0
 }
 
+function Get-WingetUnknownNames {
+    # Noms des applications de version inconnue, lus dans la liste de « winget upgrade --include-unknown » déjà
+    # analysée par ConvertFrom-WingetText (v3.27, MAJÉRION le 25/11/2026 : sans le module winget, le rapport
+    # disait « 1 » sans dire laquelle). winget écrit « Unknown » sans le traduire (relevé le 25/11/2026, version
+    # française). Autonome (param dans le corps) : passée telle quelle au job. Fonction pure, testée en T1.
+    param([object[]]$Items)
+    return @(@($Items) | Where-Object { $null -ne $_ -and ([string]$_.Installed).Trim() -eq 'Unknown' -and $_.Name } |
+             ForEach-Object { [string]$_.Name })
+}
+
 function Test-WingetNoUpgrade([string]$Raw) {
     # Message explicite de winget : aucune mise à jour (français ou anglais), ou seulement des
     # applications de version inconnue (winget n'affiche alors ni tableau ni « aucune mise à niveau »)
@@ -5389,7 +5399,16 @@ function Invoke-SelfTestAnalyzers {
         Assert-True ((Get-WingetUnknownCount $en) -eq 2) 'message EN mal lu'
         Assert-True ((Get-WingetUnknownCount $fr) -eq 1) 'message FR mal lu'
         Assert-True ((Get-WingetUnknownCount 'Aucune mise à niveau disponible.') -eq 0) 'faux positif'
-        '3/3 cas'
+        # v3.27 : noms lus dans la sortie réelle de « winget upgrade --include-unknown » (25/11/2026, CRLF)
+        $fmt = '{0,-16}{1,-22}{2,-19}{3,-19}{4}'
+        $raw = "   - `r   \ `r`r`n" + ($fmt -f 'Nom', 'ID', 'Version', 'Disponible', 'Source') + "`r`n" + ('-' * 82) + "`r`n" +
+               ($fmt -f 'Docker Desktop', 'Docker.DockerDesktop', '4.99.0', '4.100.1', 'winget') + "`r`n" +
+               ($fmt -f 'Epson Scan 2', 'EPSON.EpsonScan2', 'Unknown', '6.7.89.1', 'winget') + "`r`n" +
+               "2 mises à niveau disponibles.`r`n"
+        $n = @(Get-WingetUnknownNames @(ConvertFrom-WingetText $raw))
+        Assert-True ($n.Count -eq 1 -and $n[0] -eq 'Epson Scan 2') ('noms inconnus lus : ' + ($n -join ', '))
+        Assert-True (@(Get-WingetUnknownNames @()).Count -eq 0) 'liste vide : nom inventé'
+        '5/5 cas'
     }
     Test-Case 'winget : aucune mise à jour' {
         $n = @(ConvertFrom-WingetText "Aucune mise à niveau disponible.`n").Count
@@ -8053,9 +8072,10 @@ if ($NoWinget) {
     $wgParser = ${function:ConvertFrom-WingetText}.ToString()
     $wgUnknown = ${function:Get-WingetUnknownCount}.ToString()
     $wgSplit = ${function:Split-NativeOutput}.ToString()
+    $wgUnkNames = ${function:Get-WingetUnknownNames}.ToString()
     $wgExe = [string](Get-WingetPath)
     $wg = Invoke-Spinner 'Analyse des paquets installés' {
-        param($ParserText, $UnknownText, $SplitText, $WgExe)
+        param($ParserText, $UnknownText, $SplitText, $WgExe, $UnkNamesText)
         # Liste de départ : « winget upgrade ». Le module (s'il est là) complète noms, identifiants et
         # versions tronqués, et écarte ce que winget refusera d'installer (IsUpdateAvailable faux).
         # Constaté le 19/11/2026 : Epson Scan 2 (version « Unknown ») et Hytale Launcher (installé pour
@@ -8080,6 +8100,16 @@ if ($NoWinget) {
         $out.Items = @(& ([scriptblock]::Create($ParserText)) $raw)
         $out.Parsed = @($out.Items).Count
         $out.Unknown = [int](& ([scriptblock]::Create($UnknownText)) $raw)
+        if ($out.Unknown -gt 0) {
+            # v3.27 : leurs noms, que « winget upgrade » ne donne pas (second appel d'environ 1 s, source déjà lue).
+            # En cas d'échec, le nombre reste affiché seul, comme avant.
+            try {
+                $uLines = @(& $WgExe upgrade --include-unknown --accept-source-agreements --disable-interactivity 2>&1)
+                $uSp = & ([scriptblock]::Create($SplitText)) -Lines $uLines
+                $uItems = @(& ([scriptblock]::Create($ParserText)) ([string]$uSp.Out))
+                $out.UnknownNames = @(& ([scriptblock]::Create($UnkNamesText)) -Items $uItems)
+            } catch { $out.UnknownNames = @() }
+        }
         # v3.26 (audit, constat T9) : le résultat du module n'est pris qu'une fois le filtrage fini. Avant, le mode
         # « avec module » était écrit d'abord : une erreur en cours de route laissait une liste non filtrée annoncée
         # filtrée. Chaque ligne est complétée sur une copie, la liste de winget reste intacte si le module échoue.
@@ -8118,12 +8148,12 @@ if ($NoWinget) {
                          ForEach-Object { [string]$_.Name })
                 $out.Items = $keep
                 $out.NotApplicable = $na
-                $out.UnknownNames = $unk
+                if ($unk.Count -gt 0) { $out.UnknownNames = $unk }   # sinon, les noms lus par winget restent
                 $out.Mode = 'text+module'
             }
         } catch { $out.ModuleErr = [string]$_.Exception.Message }
         return $out
-    } 300 -ArgumentList $wgParser, $wgUnknown, $wgSplit, $wgExe
+    } 300 -ArgumentList $wgParser, $wgUnknown, $wgSplit, $wgExe, $wgUnkNames
 
     $wgRetry = 'Vérifie la connexion Internet puis relance le scan ; si ça revient, mets à jour'
     $wgRetry2 = '« Programme d''installation d''application » dans le Microsoft Store (Bibliothèque).'
