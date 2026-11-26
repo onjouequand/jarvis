@@ -1,6 +1,6 @@
 <# : JARVIS.cmd. Ne pas modifier ce texte
 @echo off
-rem JARVIS-SHA256=28d01f5fdfd87f059cf9f089862ac415295b9f52b07920c769a3d233e06765f6
+rem JARVIS-SHA256=aeb13aa4af81d212897ef38a8dc84868d466374b288e216227a5ef330f5cee10
 setlocal
 "%SystemRoot%\System32\chcp.com" 65001 >nul
 set "JARVIS_SELF=%~f0"
@@ -325,6 +325,7 @@ $script:Report      = New-Object System.Collections.Generic.List[string]
 $script:WUCount     = 0
 $script:ScanDetected = $null    # défauts du magasin de composants vus par DISM /ScanHealth (CBS.log), v3.21
 $script:WUManual    = 0
+$script:WUDrivers   = @()     # pilotes proposés par Windows Update (HardwareId, Title, Kind), v3.27
 $script:WGItems     = @()
 $script:WGCount     = 0
 $script:WingetExe   = $null    # winget.exe par son chemin complet (Get-WingetPath), v3.24
@@ -2158,6 +2159,26 @@ function Test-SkipWuUpdate {
     if ([string]$Update.Title -match 'Feature update|Mise à jour de fonctionnalit') { return 'mise à niveau de version de Windows' }
     if ($Update.BrowseOnly) { return 'facultative' }
     if ($Update.InstallationBehavior.CanRequestUserInput) { return 'demande une intervention à l''écran' }
+    return $null
+}
+
+function Get-DriverOffer {
+    # Pilote proposé par Windows Update pour un appareil de la section 04 (v3.27, demande de Thomas : sur MAJÉRION
+    # le 25/11/2026, Bluetooth Intel 24.70.0.4 en section 04 et « Intel Corporation Bluetooth Driver Update
+    # (24.80.0.2) » en section 02, sans lien entre les deux). Rapprochement par l'identifiant matériel que vise la
+    # mise à jour (DriverHardwareID) : égal à un des identifiants de l'appareil, ou début de son identifiant
+    # d'instance. Rend la première offre qui correspond, sinon $null. Fonction pure, testée en T1.
+    param([string]$InstanceId, [string[]]$HardwareIds, [object[]]$Offers)
+    $ids = @(@($HardwareIds) + @($InstanceId) | Where-Object { $_ } | ForEach-Object { ([string]$_).Trim().ToUpperInvariant() })
+    if ($ids.Count -eq 0) { return $null }
+    $inst = ([string]$InstanceId).Trim().ToUpperInvariant()
+    foreach ($o in @($Offers)) {
+        if ($null -eq $o -or -not $o.PSObject.Properties['HardwareId']) { continue }
+        $h = ([string]$o.HardwareId).Trim().ToUpperInvariant()
+        if (-not $h) { continue }
+        if ($ids -contains $h) { return $o }
+        if ($inst -and ($inst.StartsWith($h + '\') -or $inst.StartsWith($h + '&'))) { return $o }
+    }
     return $null
 }
 
@@ -6720,6 +6741,22 @@ function Invoke-SelfTestAnalyzers {
         Assert-True ($null -eq (Compare-JarvisVersion '3.3' '')) 'version absente traitée comme « égale »'
         '6/6 cas'
     }
+    Test-Case 'Windows Update : pilote proposé rattaché à l''appareil' {
+        # v3.27 : identifiants de la forme relevée sur les PC (USB pour le Bluetooth Intel, PCI pour la carte graphique)
+        $bt = [pscustomobject]@{ HardwareId = 'USB\VID_8087&PID_0033'; Title = 'Intel Corporation Bluetooth Driver Update (24.80.0.2)' }
+        $gpu = [pscustomobject]@{ HardwareId = 'pci\ven_10de&dev_2786&subsys_51111458'; Title = 'NVIDIA - Display - 32.0.15.9999' }
+        $offers = @($bt, $gpu)
+        $r = Get-DriverOffer 'USB\VID_8087&PID_0033\5&2A6B8C1&0&10' @('USB\VID_8087&PID_0033&REV_0000', 'USB\VID_8087&PID_0033') $offers
+        Assert-True ($null -ne $r -and $r.Title -match 'Bluetooth') 'Bluetooth non rattaché par son identifiant'
+        $r = Get-DriverOffer 'PCI\VEN_10DE&DEV_2786&SUBSYS_51111458&REV_A1\4&1D2E3F&0&0008' @() $offers
+        Assert-True ($null -ne $r -and $r.Title -match 'NVIDIA') 'carte graphique non rattachée par le début de son identifiant (casse différente)'
+        $r = Get-DriverOffer 'PCI\VEN_10DE&DEV_27860&SUBSYS_1\0' @() @([pscustomobject]@{ HardwareId = 'PCI\VEN_10DE&DEV_2786'; Title = 'x' })
+        Assert-True ($null -eq $r) 'identifiant voisin (DEV_27860) pris pour DEV_2786'
+        Assert-True ($null -eq (Get-DriverOffer 'PCI\VEN_8086&DEV_7AF0\3&0' @('PCI\VEN_8086&DEV_7AF0') $offers)) 'appareil sans offre rattaché'
+        Assert-True ($null -eq (Get-DriverOffer '' @() $offers)) 'appareil sans identifiant rattaché'
+        Assert-True ($null -eq (Get-DriverOffer 'USB\VID_8087&PID_0033\5' @() @([pscustomobject]@{ HardwareId = ''; Title = 'vide' }))) 'offre sans identifiant rattachée'
+        '6/6 cas'
+    }
     Test-Case 'Windows Update : mises à jour exclues' {
         # Une mise à niveau de Windows ne s'installe jamais sans surveillance. Objets construits comme ceux de Windows
         # Update (BrowseOnly toujours présent : le mode strict de T1 refuse une propriété absente)
@@ -7958,6 +7995,7 @@ $wu = Invoke-Spinner 'Interrogation des serveurs Microsoft' {
                 Driver = ($u.Type -eq 2)
                 Optional = [bool]$u.BrowseOnly
                 Interactive = [bool]$u.InstallationBehavior.CanRequestUserInput
+                DriverHwId = $(if ($u.Type -eq 2) { try { [string]$u.DriverHardwareID } catch { '' } } else { '' })
                 Categories = @(foreach ($c in $u.Categories) { [pscustomobject]@{ CategoryID = [string]$c.CategoryID } })
                 KBs = @(foreach ($k in $u.KBArticleIDs) { [string]$k })
             }
@@ -7986,6 +8024,13 @@ if ($null -eq $wu) {
     $optional  = @($all | Where-Object { $_.Optional })
     $script:WUCount = $important.Count
     $script:WUManual = $manual.Count
+    # Pilotes proposés, pour les rattacher aux appareils de la section 04 (v3.27)
+    $script:WUDrivers = @(foreach ($u in @($important + $manual + $optional)) {
+        if (-not $u.Driver -or -not $u.DriverHwId) { continue }
+        $k = 'AUTO'
+        if ($u.Optional) { $k = 'OPTIONAL' } elseif ($u.Interactive) { $k = 'MANUAL' }
+        [pscustomobject]@{ HardwareId = [string]$u.DriverHwId; Title = [string]$u.Title; Kind = $k }
+    })
     if ($important.Count -eq 0) {
         Write-Status 'Mises à jour importantes' 'aucune, Windows est à jour' 'OK'
     } else {
@@ -8317,6 +8362,39 @@ Write-Section '04' 'Pilotes'
 $drv = @(Get-CimInstance Win32_PnPSignedDriver | Where-Object { $_.DeviceName })
 if ($drv.Count -eq 0) { Write-Status 'Liste des pilotes' 'lecture impossible' 'INFO' }
 
+# Appareils lus une seule fois : identifiants matériels (pilotes proposés, v3.27) et appareils en erreur (plus bas)
+$pnpRead = $true
+$pnpAll = @()
+try { $pnpAll = @(Get-CimInstance Win32_PnPEntity -ErrorAction Stop) } catch { $pnpRead = $false }
+$pnpHw = @{}
+foreach ($pe in $pnpAll) {
+    # Identifiants matériels et compatibles : DriverHardwareID peut viser l'un ou l'autre (documentation de
+    # IWindowsDriverUpdate ; pas encore vu en réel, aucun pilote en attente sur le PC de Thomas le 26/11/2026)
+    if ($pe.DeviceID -and -not $pnpHw.ContainsKey([string]$pe.DeviceID)) {
+        $pnpHw[[string]$pe.DeviceID] = @(@($pe.HardwareID) + @($pe.CompatibleID) | Where-Object { $_ })
+    }
+}
+
+function Write-DriverOffer($Dev) {
+    # Pilote proposé par Windows Update pour cet appareil (section 02), écrit sous sa ligne avec le geste (v3.27)
+    if ($null -eq $Dev -or @($script:WUDrivers).Count -eq 0) { return }
+    $id = [string]$Dev.DeviceID
+    $hw = @()
+    if ($id -and $pnpHw.ContainsKey($id)) { $hw = @($pnpHw[$id]) }
+    if ($Dev.HardWareID) { $hw += [string]$Dev.HardWareID }
+    $o = Get-DriverOffer $id $hw @($script:WUDrivers)
+    if ($null -eq $o) { return }
+    Write-Sub ('Windows Update propose : ' + (Cut $o.Title 70))
+    if ($o.Kind -eq 'AUTO') {
+        if ($isAdmin) { Write-Sub 'J.A.R.V.I.S. te propose de l''installer à la fin du scan, avec les mises à jour Windows.' }
+        else { Write-Sub 'Relance J.A.R.V.I.S. en administrateur pour l''installer, ou Paramètres > Windows Update.' }
+    } elseif ($o.Kind -eq 'MANUAL') {
+        Write-Sub 'Elle demande une action à l''écran : J.A.R.V.I.S. te propose d''ouvrir Windows Update à la fin du scan.'
+    } else {
+        Write-Sub 'Facultative, utile si l''appareil fonctionne mal : Windows Update > Options avancées > Mises à jour facultatives.'
+    }
+}
+
 # Wi-Fi
 $phys = @(Get-NetAdapter -Physical)
 $wifiNa = $phys | Where-Object { $_.PhysicalMediaType -match '802\.11' } | Select-Object -First 1
@@ -8332,6 +8410,7 @@ if ($wifi) {
     if ($wifiModel -and $Ref.ContainsKey($wifiModel)) {
         Write-Sub ("Référence Intel {0} : paquet Wi-Fi {1}" -f $wifiModel, $Ref[$wifiModel].WiFiPkg)
     }
+    Write-DriverOffer $wifi
 }
 
 # Bluetooth
@@ -8354,13 +8433,17 @@ if ($bt) {
     } else {
         Write-Status (Cut $bt.DeviceName 32) $btVal 'INFO'
     }
+    Write-DriverOffer $bt
 }
 
 # Ethernet
 $ethNa = @($phys | Where-Object { $_.PhysicalMediaType -match '802\.3' })
 foreach ($e in $ethNa) {
     $ed = $drv | Where-Object { $_.DeviceName -eq $e.InterfaceDescription } | Select-Object -First 1
-    if ($ed) { Write-Status (Cut $ed.DeviceName 32) ("v{0}  ({1})" -f $ed.DriverVersion, (Format-Date $ed.DriverDate)) 'INFO' }
+    if ($ed) {
+        Write-Status (Cut $ed.DeviceName 32) ("v{0}  ({1})" -f $ed.DriverVersion, (Format-Date $ed.DriverDate)) 'INFO'
+        Write-DriverOffer $ed
+    }
     else { Write-Status (Cut $e.InterfaceDescription 32) ("v{0}" -f $e.DriverVersion) 'INFO' }
 }
 
@@ -8376,6 +8459,7 @@ foreach ($g in $gpus) {
         Write-Status (Cut $g.DeviceName 32) 'pilote générique Microsoft, pilote constructeur absent' 'FAIL'
         Write-Sub 'Affichage et jeux limités : Windows Update > Options avancées > Mises à jour facultatives,'
         Write-Sub 'sinon le site du fabricant du PC ou de la carte graphique (NVIDIA, AMD, Intel).'
+        Write-DriverOffer $g
         continue
     }
     if ($g.Manufacturer -match 'AMD|Advanced Micro') { $v += '  (version Adrenalin : logiciel AMD)' }
@@ -8393,14 +8477,11 @@ foreach ($g in $gpus) {
         Write-Sub ('Utile surtout pour les jeux ou un souci d''affichage : ' + $gTool + '.')
     }
     else { Write-Status (Cut $g.DeviceName 32) $v 'OK' }
+    Write-DriverOffer $g
 }
 
 # Périphériques en erreur
-$pnpRead = $true
-$bad = @()
-try {
-    $bad = @(Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object { $null -ne $_.ConfigManagerErrorCode -and $_.ConfigManagerErrorCode -ne 0 })
-} catch { $pnpRead = $false }
+$bad = @($pnpAll | Where-Object { $null -ne $_.ConfigManagerErrorCode -and $_.ConfigManagerErrorCode -ne 0 })
 $realBad = 0
 foreach ($d in $bad) {
     $n = $d.DeviceID
