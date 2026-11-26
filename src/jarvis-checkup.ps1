@@ -1829,15 +1829,21 @@ function Set-ConsoleTall {
 
 function Get-NoQuickEditMode([uint32]$Mode) {
     # Mode de la console sans sélection à la souris : ENABLE_QUICK_EDIT_MODE (0x40) retiré et
-    # ENABLE_EXTENDED_FLAGS (0x80) ajouté, sans quoi Windows ignore le changement. Fonction pure, testée en T1.
-    return [uint32](([int64]$Mode -band 0xFFFFFFBFL) -bor 0x80)
+    # ENABLE_EXTENDED_FLAGS (0x80) ajouté, sans quoi Windows ignore le changement. v3.27 : ENABLE_MOUSE_INPUT (0x10)
+    # retiré aussi. Sans sélection et avec lui, la console envoie la molette au programme au lieu de défiler
+    # (essai du 26/11/2026 dans l'ancienne console : 0x1B7 ne défile pas, 0x1A7 et 0x1F7 défilent de 9 lignes).
+    # JARVIS ne lit pas la souris. Fonction pure, testée en T1.
+    return [uint32](([int64]$Mode -band 0xFFFFFFAFL) -bor 0x80)
 }
 
 function Get-QuickEditRestoreMode([uint32]$Current, [uint32]$Saved) {
     # Mode à remettre en partant : le mode actuel (Ctrl+C a pu être réglé entre-temps), avec la sélection à
-    # la souris seulement si elle était active au départ. Fonction pure, testée en T1.
-    if (([int64]$Saved -band 0x40) -eq 0) { return $Current }
-    return [uint32]([int64]$Current -bor 0xC0)
+    # la souris seulement si elle était active au départ, et la souris rendue au programme seulement si elle
+    # l'était (v3.27). Fonction pure, testée en T1.
+    $r = [int64]$Current
+    if (([int64]$Saved -band 0x40) -ne 0) { $r = $r -bor 0xC0 }
+    if (([int64]$Saved -band 0x10) -ne 0) { $r = $r -bor 0x10 }
+    return [uint32]$r
 }
 
 function Set-QuickEdit([bool]$Off) {
@@ -1905,18 +1911,21 @@ function Test-JarvisIntegrity {
 }
 
 function Confirm-DeepScan {
-    # Conditions sûres pour SFC / DISM / CHKDSK
+    # Conditions sûres pour SFC / DISM / CHKDSK. Rend GO (lancer), QUICK (scan rapide demandé par la touche R) ou
+    # MENU (non ou annulation : retour au menu). v3.27 : avant, un « non » lançait le scan rapide sans le demander
+    # (retour d'un utilisateur, 25/11/2026).
     $st = Get-PowerSource
     while ($st -eq 'BATTERY') {
         Write-Host '   [!] PC sur batterie : une coupure pendant SFC ou DISM peut interrompre une réparation de Windows.' -ForegroundColor Yellow
-        $a = Read-Answer '   >> Branche le chargeur puis appuie sur Entrée, ou tape R pour un scan rapide'
-        if ($null -eq $a -or $a -match '^[rR]') { return $false }
+        $a = Read-Answer '   >> Branche le chargeur puis appuie sur Entrée, ou tape R pour un scan rapide (Échap = retour au menu)'
+        if ($null -eq $a) { return 'MENU' }
+        if ($a -match '^[rR]') { return 'QUICK' }
         $st = Get-PowerSource
     }
     if ($st -eq 'UNKNOWN') {
         Write-Host '   [!] Impossible de savoir si le PC est sur secteur : une coupure pendant SFC ou DISM peut interrompre une réparation.' -ForegroundColor Yellow
         Write-Host '       Sur un PC portable, branche le chargeur avant de continuer.' -ForegroundColor Yellow
-        if (-not (Read-YesNo '   >> Continuer le scan complet (chargeur branché, ou PC fixe) ?')) { return $false }
+        if (-not (Read-YesNo '   >> Continuer le scan complet (chargeur branché, ou PC fixe) ?')) { return 'MENU' }
     }
     $reasons = @()
     $rebootPending = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
@@ -1932,7 +1941,7 @@ function Confirm-DeepScan {
             Write-Host '       Choisis Démarrer > Marche/Arrêt > « Mettre à jour et redémarrer » si ce choix est affiché :' -ForegroundColor Yellow
             Write-Host '       un simple « Redémarrer » peut laisser les mises à jour en attente.' -ForegroundColor Yellow
         }
-        if (-not (Read-YesNo '   >> Continuer quand même le scan complet ?')) { return $false }
+        if (-not (Read-YesNo '   >> Continuer quand même le scan complet ?')) { return 'MENU' }
     }
     Write-Host ''
     Write-Host ('  ╔' + ('═' * 64) + '╗') -ForegroundColor Yellow
@@ -1944,7 +1953,8 @@ function Confirm-DeepScan {
         Write-Host '║' -ForegroundColor Yellow
     }
     Write-Host ('  ╚' + ('═' * 64) + '╝') -ForegroundColor Yellow
-    return (Read-YesNo '   >> Lancer le scan complet ?' -DefaultYes)
+    if (Read-YesNo '   >> Lancer le scan complet ?' -DefaultYes) { return 'GO' }
+    return 'MENU'
 }
 
 # ------------------------------------------------------------------
@@ -6444,11 +6454,14 @@ function Invoke-SelfTestAnalyzers {
     }
     Test-Case 'Console : sélection à la souris coupée puis remise' {
         # Mode réel de l'ancienne console de Windows : 0x1F7 (sélection à la souris active)
-        Assert-True ((Get-NoQuickEditMode 0x1F7) -eq 0x1B7) ('mode sans sélection mal calculé : 0x{0:X}' -f (Get-NoQuickEditMode 0x1F7))
-        Assert-True ((Get-NoQuickEditMode 0x1B7) -eq 0x1B7) 'mode déjà sans sélection modifié'
+        # v3.27 : souris (0x10) retirée aussi, sinon la molette ne fait plus défiler l'ancienne console
+        Assert-True ((Get-NoQuickEditMode 0x1F7) -eq 0x1A7) ('mode sans sélection mal calculé : 0x{0:X}' -f (Get-NoQuickEditMode 0x1F7))
+        Assert-True ((Get-NoQuickEditMode 0x1B7) -eq 0x1A7) 'souris laissée au programme : molette bloquée'
+        Assert-True ((Get-NoQuickEditMode 0x1A7) -eq 0x1A7) 'mode déjà sans sélection ni souris modifié'
         Assert-True ((Get-NoQuickEditMode 0x7) -eq 0x87) 'drapeau 0x80 non ajouté'
-        Assert-True ((Get-QuickEditRestoreMode 0x1B6 0x1F7) -eq 0x1F6) 'sélection non remise, ou réglage de Ctrl+C écrasé'
-        Assert-True ((Get-QuickEditRestoreMode 0x1B7 0x1B7) -eq 0x1B7) 'sélection remise alors qu''elle était coupée au départ'
+        Assert-True ((Get-QuickEditRestoreMode 0x1A6 0x1F7) -eq 0x1F6) 'sélection ou souris non remise, ou réglage de Ctrl+C écrasé'
+        Assert-True ((Get-QuickEditRestoreMode 0x1A7 0x1B7) -eq 0x1B7) 'souris non remise, ou sélection remise alors qu''elle était coupée'
+        Assert-True ((Get-QuickEditRestoreMode 0x1A7 0x1A7) -eq 0x1A7) 'souris remise alors qu''elle était coupée au départ'
         '5/5 cas'
     }
     Test-Case 'Composants Windows : analyse DISM EN/FR' {
@@ -7656,75 +7669,96 @@ if (-not $isAdmin -and -not $NoElevate) {
 # ------------------------------------------------------------------
 
 $script:RunSelfTest = $false
+# v3.27 : un scan complet refusé (non, Échap, droits absents) ramène au menu au lieu de lancer le scan rapide
+# sans le demander (retour d'un utilisateur, 25/11/2026). Lancé par -Deep, le refus ouvre aussi le menu.
+$showMenu = $false
 if ($SelfTest) {
     $script:RunSelfTest = $true
 } elseif ($Deep) {
     $script:DeepMode = $true
 } elseif (-not $Quick) {
-    Write-Host '   SÉLECTION DU PROTOCOLE' -ForegroundColor Cyan
-    Write-Host '   [1] Scan rapide    ~2-5 min    état, mises à jour, pilotes, sécurité, journaux' -ForegroundColor Gray
-    Write-Host '   [2] Scan complet   ~20-60 min  tout le scan rapide + DISM, SFC /scannow, CHKDSK' -ForegroundColor Gray
-    Write-Host '   [3] Auto-test      ~1-5 min    vérifie que JARVIS fonctionne correctement sur ce PC' -ForegroundColor Gray
-    $upd = Get-JarvisUpdateResult $script:UpdateCheck 3000
-    $showU = ($upd.Status -eq 'NEW')
-    if ($showU) {
-        Write-Host ("   [U] Mise à jour    ~1 min      v{0} disponible : nouveautés et installation" -f $upd.Info.Version) -ForegroundColor Green
-    }
-    $showM = Test-ShowWingetOffer
-    if ($showM) { Write-Host '   [M] Module winget  ~1-3 min    facultatif : versions détaillées des mises à jour d''applications' -ForegroundColor Gray }
-    if ($JarvisInstalled) { Write-Host '   [4] Désinstaller J.A.R.V.I.S.' -ForegroundColor DarkGray }
-    Write-Host '   [R] Ouvrir le dossier des rapports' -ForegroundColor DarkGray
-    Write-Host '   [Échap] Quitter' -ForegroundColor DarkGray
-    $buildKeys = {
-        $k = @('1', '2', '3')
-        if ($showU) { $k += 'U' }
-        if ($showM) { $k += 'M' }
-        if ($JarvisInstalled) { $k += '4' }
-        $k += 'R'
-        $k
-    }
-    # Seules les touches affichées sont acceptées ; Entrée lance le scan rapide
-    $keys = @(& $buildKeys)
-    $m = Read-Choice ('   >> Protocole [' + ($keys -join '/') + '] (Entrée = 1)') $keys '1'
-    if ($null -eq $m) { exit }
-    while ($m -eq 'R' -or $m -eq 'M' -or $m -eq 'U') {
-        if ($m -eq 'R') {
-            $rd = Get-ReportDir
-            if ($rd) { Start-Process -FilePath (Join-Path $WinDir 'explorer.exe') -ArgumentList ('"{0}"' -f $rd) }
-            else { Write-Host '   [!] Aucun dossier de rapports accessible.' -ForegroundColor Yellow }
-        } elseif ($m -eq 'U') {
-            Invoke-JarvisSelfUpdate $upd.Info      # ne revient ici qu'en cas d'annulation ou d'échec
-            Write-Host ''
-        } else {
-            Invoke-WingetModuleOffer
-            $showM = Test-ShowWingetOffer
-            $keys = @(& $buildKeys)
+    $showMenu = $true
+}
+$modeOk = $false
+while (-not $modeOk) {
+    if ($showMenu) {
+        $script:DeepMode = $false
+        Write-Host '   SÉLECTION DU PROTOCOLE' -ForegroundColor Cyan
+        Write-Host '   [1] Scan rapide    ~2-5 min    état, mises à jour, pilotes, sécurité, journaux' -ForegroundColor Gray
+        Write-Host '   [2] Scan complet   ~20-60 min  tout le scan rapide + DISM, SFC /scannow, CHKDSK' -ForegroundColor Gray
+        Write-Host '   [3] Auto-test      ~1-5 min    vérifie que JARVIS fonctionne correctement sur ce PC' -ForegroundColor Gray
+        $upd = Get-JarvisUpdateResult $script:UpdateCheck 3000
+        $showU = ($upd.Status -eq 'NEW')
+        if ($showU) {
+            Write-Host ("   [U] Mise à jour    ~1 min      v{0} disponible : nouveautés et installation" -f $upd.Info.Version) -ForegroundColor Green
         }
+        $showM = Test-ShowWingetOffer
+        if ($showM) { Write-Host '   [M] Module winget  ~1-3 min    facultatif : versions détaillées des mises à jour d''applications' -ForegroundColor Gray }
+        if ($JarvisInstalled) { Write-Host '   [4] Désinstaller J.A.R.V.I.S.' -ForegroundColor DarkGray }
+        Write-Host '   [R] Ouvrir le dossier des rapports' -ForegroundColor DarkGray
+        Write-Host '   [Échap] Quitter' -ForegroundColor DarkGray
+        $buildKeys = {
+            $k = @('1', '2', '3')
+            if ($showU) { $k += 'U' }
+            if ($showM) { $k += 'M' }
+            if ($JarvisInstalled) { $k += '4' }
+            $k += 'R'
+            $k
+        }
+        # Seules les touches affichées sont acceptées ; Entrée lance le scan rapide
+        $keys = @(& $buildKeys)
         $m = Read-Choice ('   >> Protocole [' + ($keys -join '/') + '] (Entrée = 1)') $keys '1'
         if ($null -eq $m) { exit }
+        while ($m -eq 'R' -or $m -eq 'M' -or $m -eq 'U') {
+            if ($m -eq 'R') {
+                $rd = Get-ReportDir
+                if ($rd) { Start-Process -FilePath (Join-Path $WinDir 'explorer.exe') -ArgumentList ('"{0}"' -f $rd) }
+                else { Write-Host '   [!] Aucun dossier de rapports accessible.' -ForegroundColor Yellow }
+            } elseif ($m -eq 'U') {
+                Invoke-JarvisSelfUpdate $upd.Info      # ne revient ici qu'en cas d'annulation ou d'échec
+                Write-Host ''
+            } else {
+                Invoke-WingetModuleOffer
+                $showM = Test-ShowWingetOffer
+                $keys = @(& $buildKeys)
+            }
+            $m = Read-Choice ('   >> Protocole [' + ($keys -join '/') + '] (Entrée = 1)') $keys '1'
+            if ($null -eq $m) { exit }
+        }
+        if ($m -eq '2') { $script:DeepMode = $true }
+        if ($m -eq '3') { $script:RunSelfTest = $true }
+        if ($m -eq '4' -and $JarvisInstalled) {
+            Uninstall-Jarvis
+            Read-Answer '   [Entrée pour fermer]' | Out-Null
+            exit
+        }
     }
-    if ($m -eq '2') { $script:DeepMode = $true }
-    if ($m -eq '3') { $script:RunSelfTest = $true }
-    if ($m -eq '4' -and $JarvisInstalled) {
-        Uninstall-Jarvis
+    if ($script:RunSelfTest) {
+        $fails = Invoke-SelfTest | Select-Object -Last 1
+        Write-Host ''
         Read-Answer '   [Entrée pour fermer]' | Out-Null
-        exit
+        exit ([int]([int]$fails -gt 0))
     }
-}
-if ($script:RunSelfTest) {
-    $fails = Invoke-SelfTest | Select-Object -Last 1
-    Write-Host ''
-    Read-Answer '   [Entrée pour fermer]' | Out-Null
-    exit ([int]([int]$fails -gt 0))
-}
-if ($script:DeepMode -and -not $isAdmin) {
-    Write-Host '   [!] Le scan complet exige les droits administrateur. Bascule en scan rapide.' -ForegroundColor Yellow
-    $script:DeepMode = $false
-}
-if ($script:DeepMode) {
-    if (-not (Confirm-DeepScan)) {
-        Write-Host '   >> Bascule en scan rapide.' -ForegroundColor DarkGray
+    $modeOk = $true
+    if ($script:DeepMode -and -not $isAdmin) {
+        Write-Host '   [!] Le scan complet exige les droits administrateur.' -ForegroundColor Yellow
+        Write-Host '       Ferme J.A.R.V.I.S., relance-le et réponds O à « Relancer en mode administrateur ? ».' -ForegroundColor Yellow
+        Write-Host ''
         $script:DeepMode = $false
+        $showMenu = $true
+        $modeOk = $false
+    } elseif ($script:DeepMode) {
+        $dc = Confirm-DeepScan
+        if ($dc -eq 'QUICK') {
+            Write-Host '   >> Scan rapide, comme demandé.' -ForegroundColor DarkGray
+            $script:DeepMode = $false
+        } elseif ($dc -ne 'GO') {
+            Write-Host '   >> Scan complet annulé : retour au menu.' -ForegroundColor DarkGray
+            Write-Host ''
+            $script:DeepMode = $false
+            $showMenu = $true
+            $modeOk = $false
+        }
     }
 }
 
