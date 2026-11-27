@@ -1,5 +1,5 @@
 ﻿<#
-    J.A.R.V.I.S. // Check-up système v3.29
+    J.A.R.V.I.S. // Check-up système v3.30
     -----------------------------------------------------------------
     Modules :
       [01] Système        : version Windows, uptime, redémarrage en attente
@@ -210,7 +210,7 @@ if (-not $PSCommandPath -and $env:JARVIS_SELF -and $env:JARVIS_ARGS) {
 # ------------------------------------------------------------------
 # Identité du programme et emplacement
 # ------------------------------------------------------------------
-$JarvisVersion = '3.29'
+$JarvisVersion = '3.30'
 $JarvisSelf = $env:JARVIS_SELF                     # défini par JARVIS.cmd
 if (-not $JarvisSelf) { $JarvisSelf = $PSCommandPath }  # lancement direct du .ps1
 $JarvisHome = $null
@@ -366,7 +366,7 @@ function Show-Banner {
         foreach ($l in $plain) { Write-Host $l -ForegroundColor Cyan; Pause-Ms 70 }
         Write-Host ''
         Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-        Write-Host '      module check-up v3.29' -ForegroundColor DarkGray
+        Write-Host '      module check-up v3.30' -ForegroundColor DarkGray
         Write-Host ''
         return
     }
@@ -386,7 +386,7 @@ function Show-Banner {
     }
     Write-Host ''
     Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-    Write-Host '      module check-up v3.29' -ForegroundColor DarkGray
+    Write-Host '      module check-up v3.30' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -3756,6 +3756,22 @@ function Test-WingetStillListed([string]$Id, $Rows) {
     return $false
 }
 
+function Split-WingetLeftovers($Rows, [string[]]$AskedIds) {
+    # v3.30, essai réel sur DESKTOP-LV du 27/11/2026 : Discord (1.0.9269 -> 1.0.9270), absent de la liste du scan, est
+    # apparu pendant l'entretien et était écrit « toujours en retard » avec la cause « l'application tournait encore ».
+    # Sépare les lignes encore proposées par winget après les mises à jour : Asked (demandées, donc en retard) et New
+    # (absentes de la liste du scan : nouvelle mise à jour apparue depuis). Comparaison par Test-WingetStillListed
+    # (identifiant coupé par winget compris). Fonction pure, T1.
+    $asked = @(); $new = @()
+    foreach ($r in @($Rows)) {
+        if ($null -eq $r) { continue }
+        $hit = $false
+        foreach ($id in @($AskedIds)) { if ($id -and (Test-WingetStillListed $id @($r))) { $hit = $true; break } }
+        if ($hit) { $asked += $r } else { $new += $r }
+    }
+    return [pscustomobject]@{ Asked = $asked; New = $new }
+}
+
 function Get-WingetScanState([string]$Raw, [int]$Parsed) {
     # Que prouve la réponse de « winget upgrade » ? LIST : un tableau a été lu ($Parsed lignes).
     # NONE : winget dit lui-même qu'il n'y a rien à mettre à jour. UNREADABLE : ni l'un ni l'autre,
@@ -6049,6 +6065,19 @@ function Invoke-WingetUpdates {
         Write-Action 'INFO' ($n + ' : winget n''a pas de version adaptée à cette installation')
         Write-Host '          Mets-la à jour depuis l''application elle-même (souvent automatique à son ouverture).' -ForegroundColor DarkGray
     }
+    # v3.30 : une application absente de la liste du scan n'a pas été demandée ; sa mise à jour est apparue depuis
+    $split = Split-WingetLeftovers $left ([string[]]@($targets | ForEach-Object { [string]$_.Id }))
+    $left = @($split.Asked)
+    $fresh = @($split.New)
+    if ($fresh.Count -gt 0) {
+        Write-Action 'INFO' ("{0} nouvelle(s) mise(s) à jour apparue(s) pendant l'entretien, absente(s) de la liste du scan :" -f $fresh.Count)
+        foreach ($l in $fresh) {
+            Write-Host ('       - ' + (Cut $l.Name 60) + '  ' + $l.Installed + ' -> ' + $l.Available) -ForegroundColor Cyan
+            $script:Report.Add('       - ' + (Cut $l.Name 60) + '  ' + $l.Installed + ' -> ' + $l.Available)
+        }
+        if ($fresh.Count -gt 1) { Write-Host '       Rien à faire maintenant : le prochain scan les proposera.' -ForegroundColor DarkGray }
+        else { Write-Host '       Rien à faire maintenant : le prochain scan la proposera.' -ForegroundColor DarkGray }
+    }
     if ($left.Count -gt 0) {
         Write-Action 'WARN' ("{0} application(s) toujours en retard :" -f $left.Count)
         foreach ($l in $left) {
@@ -6061,6 +6090,8 @@ function Invoke-WingetUpdates {
             Write-Host '       (icône près de l''horloge, service en arrière-plan). Ferme-la complètement ou redémarre le PC,' -ForegroundColor DarkGray
             Write-Host '       puis relance JARVIS ; sinon mets-la à jour depuis l''application ou le Microsoft Store.' -ForegroundColor DarkGray
         }
+    } elseif ($fresh.Count -gt 0) {
+        Write-Action 'OK' 'Vérifié : les applications demandées sont à jour'
     } elseif ($leftAll.Count -gt 0) {
         # Seules restent des applications que winget refuse de mettre à jour (signalées ci-dessus)
         Write-Action 'OK' 'Vérifié : tout ce que winget peut mettre à jour est à jour'
@@ -7651,6 +7682,26 @@ function Invoke-SelfTestAnalyzers {
         Assert-True (-not (Test-WingetStillListed 'Discord.Discord' @())) 'liste vide mal lue'
         # Identifiant réduit aux points de suspension : il ne doit pas correspondre à tout
         Assert-True (-not (Test-WingetStillListed 'Mozilla.Firefox' @([pscustomobject]@{ Id = ('Mo' + $ell) }))) 'début trop court accepté'
+        '6/6 cas'
+    }
+    Test-Case 'winget : mise à jour apparue pendant l''entretien' {
+        # v3.30, DESKTOP-LV le 27/11/2026 : Discord absent de la liste du scan, proposé à la vérification
+        $ell = [string][char]0x2026
+        $rows = @(
+            [pscustomobject]@{ Name = 'Discord'; Id = 'Discord.Discord'; Installed = '1.0.9269'; Available = '1.0.9270' },
+            [pscustomobject]@{ Name = 'Git'; Id = 'Git.Git'; Installed = '2.56.0.4'; Available = '2.56.1' },
+            [pscustomobject]@{ Name = 'Microsoft Visual C++'; Id = ('Microsoft.VCRedist.2015+' + $ell); Installed = '14.40'; Available = '14.42' }
+        )
+        $s = Split-WingetLeftovers $rows @('Git.Git', 'Google.Chrome', 'Microsoft.VCRedist.2015+.x64')
+        Assert-True (@($s.Asked).Count -eq 2 -and @($s.New).Count -eq 1) ('séparation fausse : {0} demandées, {1} nouvelles' -f @($s.Asked).Count, @($s.New).Count)
+        Assert-True (@($s.New)[0].Id -eq 'Discord.Discord') 'Discord non reconnu comme nouveau'
+        Assert-True (@($s.Asked | Where-Object { $_.Id -eq 'Git.Git' }).Count -eq 1) 'application demandée rangée dans les nouvelles'
+        $s = Split-WingetLeftovers $rows @()
+        Assert-True (@($s.Asked).Count -eq 0 -and @($s.New).Count -eq 3) 'aucune demande : tout devait être nouveau'
+        $s = Split-WingetLeftovers @() @('Git.Git')
+        Assert-True (@($s.Asked).Count -eq 0 -and @($s.New).Count -eq 0) 'liste vide mal lue'
+        $s = Split-WingetLeftovers @($null, $rows[1]) @('git.git', '')
+        Assert-True (@($s.Asked).Count -eq 1 -and @($s.New).Count -eq 0) 'valeur nulle, casse ou identifiant vide mal traités'
         '6/6 cas'
     }
     Test-Case 'winget : codes, application retirée, version changée' {
