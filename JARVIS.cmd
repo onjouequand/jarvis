@@ -1,6 +1,6 @@
 <# : JARVIS.cmd. Ne pas modifier ce texte
 @echo off
-rem JARVIS-SHA256=ea9a3c9f36fba551070a224516d07d06f0d9b1e7771b0f063897365b210f48b0
+rem JARVIS-SHA256=fa73e4182c72d379ef3f740d0ea37273e058aa2fd2c4058f9a614cde7cf8c35d
 setlocal
 "%SystemRoot%\System32\chcp.com" 65001 >nul
 set "JARVIS_SELF=%~f0"
@@ -12,7 +12,7 @@ if "%JARVIS_RC%"=="4" pause
 exit /b %JARVIS_RC%
 #>
 <#
-    J.A.R.V.I.S. // Check-up système v3.28
+    J.A.R.V.I.S. // Check-up système v3.29
     -----------------------------------------------------------------
     Modules :
       [01] Système        : version Windows, uptime, redémarrage en attente
@@ -223,7 +223,7 @@ if (-not $PSCommandPath -and $env:JARVIS_SELF -and $env:JARVIS_ARGS) {
 # ------------------------------------------------------------------
 # Identité du programme et emplacement
 # ------------------------------------------------------------------
-$JarvisVersion = '3.28'
+$JarvisVersion = '3.29'
 $JarvisSelf = $env:JARVIS_SELF                     # défini par JARVIS.cmd
 if (-not $JarvisSelf) { $JarvisSelf = $PSCommandPath }  # lancement direct du .ps1
 $JarvisHome = $null
@@ -346,6 +346,11 @@ $script:SpinState   = ''         # fin du dernier Invoke-Spinner : DONE, TIMEOUT
 $script:ConModeSaved = $null     # mode de la console au lancement (sélection à la souris remise en partant)
 $script:ConFontSaved = $null     # police de l'ancienne console au lancement, quand JARVIS l'a agrandie
 $script:StoreItems  = @()        # applications du Microsoft Store à mettre à jour (Pfn, Name)
+# v3.29 (lot 2 du plan « entretien ») : fin de scan en deux temps, questions d'abord, travail ensuite
+$script:ActionStates = New-Object System.Collections.Generic.List[string]   # état de chaque ligne écrite (Get-ActionOutcome)
+$script:FollowUps   = New-Object System.Collections.Generic.List[string]   # pages à proposer après l'entretien : STORE, WU
+$script:RebootNeeded = $false    # redémarrage demandé par Windows Update, proposé tout à la fin
+$script:PowerConfirmed = $false  # alimentation illisible, mais « chargeur branché » déjà confirmé pendant cette session
 
 # ------------------------------------------------------------------
 # Rendu terminal
@@ -374,7 +379,7 @@ function Show-Banner {
         foreach ($l in $plain) { Write-Host $l -ForegroundColor Cyan; Pause-Ms 70 }
         Write-Host ''
         Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-        Write-Host '      module check-up v3.28' -ForegroundColor DarkGray
+        Write-Host '      module check-up v3.29' -ForegroundColor DarkGray
         Write-Host ''
         return
     }
@@ -394,7 +399,7 @@ function Show-Banner {
     }
     Write-Host ''
     Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-    Write-Host '      module check-up v3.28' -ForegroundColor DarkGray
+    Write-Host '      module check-up v3.29' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -470,6 +475,7 @@ function Write-Status {
     Write-Host (' {0,-33}' -f $lbl) -NoNewline -ForegroundColor Gray
     Write-Host $Value -ForegroundColor White
     $script:Report.Add(('{0} {1,-33} {2}' -f $tags[$State], $lbl, $Value))
+    $script:ActionStates.Add($State)
     # v3.23 : chaque point de la synthèse dit dans quelle section lire son conseil ; une lecture impossible (INFO) est
     # comptée à part, sauf au nettoyage (section 11 : des mesures de place, pas des contrôles de santé)
     $where = ''
@@ -519,13 +525,22 @@ function Write-Sub {
 }
 
 function Write-Action {
-    # Résultat d'une action lancée après le scan : affiché et ajouté au rapport
-    param([ValidateSet('OK', 'WARN', 'FAIL', 'INFO')][string]$State, [string]$Text)
+    # Résultat d'une action lancée après le scan : affiché et ajouté au rapport. -BilanState (v3.29) : état compté
+    # par le bilan de l'entretien quand il diffère de l'affichage (nettoyage mesuré dont seuls des fichiers
+    # verrouillés restent : affiché INFO, compté fait)
+    param([ValidateSet('OK', 'WARN', 'FAIL', 'INFO')][string]$State, [string]$Text,
+          [ValidateSet('', 'OK', 'WARN', 'FAIL', 'INFO')][string]$BilanState = '')
     $tags   = @{ OK = '[ OK ]'; WARN = '[WARN]'; FAIL = '[FAIL]'; INFO = '[INFO]' }
     $colors = @{ OK = 'Green';  WARN = 'Yellow'; FAIL = 'Red';    INFO = 'Cyan' }
     $Text = ConvertTo-DisplayText $Text
     Write-Host ('   ' + $tags[$State] + ' ' + $Text) -ForegroundColor $colors[$State]
     $script:Report.Add($tags[$State] + ' ' + $Text)
+    if ($BilanState) { $script:ActionStates.Add($BilanState) } else { $script:ActionStates.Add($State) }
+}
+
+function Add-FollowUp([string]$Key) {
+    # Page à proposer après l'entretien (STORE, WU), une seule fois (v3.29)
+    if (-not ($script:FollowUps -contains $Key)) { $script:FollowUps.Add($Key) }
 }
 
 function Get-MiniBar([double]$Pct, [int]$Width = 20) {
@@ -1441,6 +1456,72 @@ function Get-CleanProposal($Targets, [int64]$MinBytes, [bool]$IsAdmin) {
     return [pscustomobject]@{ Items = $keep; Bytes = $sum }
 }
 
+function Get-MaintenancePlan([bool]$Defender, [int]$WingetCount, [bool]$WingetReady, [int]$StoreCount, [int]$WuCount, [bool]$IsAdmin, $TempBytes) {
+    # v3.29 (lot 2 du plan « entretien », décision de Thomas du 26/11/2026) : l'entretien courant proposé en une
+    # seule question en fin de scan. Rend les éléments dans l'ordre où ils sont faits : Key, Label (nom court du
+    # bilan), Text (ligne de la liste), Time (durée annoncée), Bytes (fichiers temporaires seulement, sinon $null).
+    # Mises à jour Windows : seulement en administrateur (sinon la page Windows Update est proposée à part).
+    # $TempBytes : $null quand la section 11 ne propose pas les fichiers temporaires. Les suppressions définitives
+    # (corbeille, caches, vidages, composants) et la réparation de Windows restent des questions à part.
+    # Fonction pure, T1.
+    $items = @()
+    $mk = { param($k, $l, $t, $d, $b) [pscustomobject]@{ Key = $k; Label = $l; Text = $t; Time = $d; Bytes = $b } }
+    if ($Defender) {
+        $items += & $mk 'Defender' 'Analyse antivirus' 'Analyse antivirus rapide (Microsoft Defender)' 'quelques minutes' $null
+    }
+    if ($WingetCount -gt 0 -and $WingetReady) {
+        $items += & $mk 'Winget' 'Applications (winget)' ('Mise à jour de {0} application(s) avec winget' -f $WingetCount) 'environ 1 min par application' $null
+    }
+    if ($StoreCount -gt 0) {
+        $items += & $mk 'Store' 'Applications du Microsoft Store' ('Mise à jour de {0} application(s) du Microsoft Store' -f $StoreCount) 'quelques minutes' $null
+    }
+    if ($WuCount -gt 0 -and $IsAdmin) {
+        $items += & $mk 'WindowsUpdate' 'Mises à jour Windows' ('Installation de {0} mise(s) à jour Windows' -f $WuCount) '5 à 60 min' $null
+    }
+    if ($null -ne $TempBytes) {
+        # Taille du scan : la place réelle est remesurée juste avant la suppression, et le résultat l'écrit
+        $items += & $mk 'Temp' 'Fichiers temporaires' ('Suppression des fichiers temporaires de plus de 24 h ({0} au moment du scan)' -f (Format-Bytes $TempBytes)) 'environ 1 min' ([int64]$TempBytes)
+    }
+    return $items
+}
+
+function Get-ActionOutcome($States, [bool]$Threw) {
+    # v3.29 : bilan d'un élément de l'entretien, d'après l'état des lignes écrites pendant son exécution (Write-Action,
+    # Write-Status). DONE : au moins un OK, aucun WARN ni FAIL. TODO (à reprendre) : un WARN ou un FAIL, ou une panne
+    # ($Threw). UNVERIFIED : seulement des INFO, ou aucune ligne : rien ne prouve que c'est fait (règle 7).
+    # Fonction pure, T1.
+    if ($Threw) { return 'TODO' }
+    $s = @(@($States) | Where-Object { $null -ne $_ } | ForEach-Object { ([string]$_).Trim().ToUpperInvariant() })
+    if ($s -contains 'FAIL' -or $s -contains 'WARN') { return 'TODO' }
+    if ($s -contains 'OK') { return 'DONE' }
+    return 'UNVERIFIED'
+}
+
+function Get-MaintenanceSummary($Outcomes) {
+    # v3.29 : bilan de l'entretien, « 3 faits, 1 à reprendre, 1 non vérifié ». Rend Done, Todo, Unverified, State
+    # (WARN si un élément est à reprendre, INFO si un élément n'est pas vérifié, OK si tout est fait) et Text.
+    # Fonction pure, T1.
+    $d = 0; $t = 0; $u = 0
+    foreach ($o in @(@($Outcomes) | Where-Object { $null -ne $_ })) {
+        switch ([string]$o) {
+            'DONE' { $d++ }
+            'TODO' { $t++ }
+            default { $u++ }
+        }
+    }
+    $txt = '{0} fait' -f $d
+    if ($d -gt 1) { $txt += 's' }
+    if ($t -gt 0) { $txt += (', {0} à reprendre' -f $t) }
+    if ($u -gt 0) {
+        $txt += (', {0} non vérifié' -f $u)
+        if ($u -gt 1) { $txt += 's' }
+    }
+    $state = 'OK'
+    if ($t -gt 0) { $state = 'WARN' }
+    elseif ($u -gt 0 -or $d -eq 0) { $state = 'INFO' }
+    return [pscustomobject]@{ Done = $d; Todo = $t; Unverified = $u; State = $state; Text = $txt }
+}
+
 function Resolve-InstallDir([string]$Dir) {
     $r = [pscustomobject]@{ Ok = $false; Path = $null; Reason = '' }
     $d = ("$Dir").Trim().Trim('"').Trim()
@@ -2217,9 +2298,12 @@ function Wait-ACPower([string]$Reason) {
         $st = Get-PowerSource
     }
     if ($st -eq 'UNKNOWN') {
+        # v3.29 : déjà confirmé avant l'entretien, pas de nouvelle question au milieu du travail
+        if ($script:PowerConfirmed) { return $true }
         Write-Host ('   [!] Impossible de savoir si le PC est sur secteur : ' + $Reason) -ForegroundColor Yellow
         Write-Host '       Sur un PC portable, branche le chargeur avant de continuer.' -ForegroundColor Yellow
-        return (Read-YesNo '   >> Continuer (chargeur branché, ou PC fixe) ?')
+        $script:PowerConfirmed = Read-YesNo '   >> Continuer (chargeur branché, ou PC fixe) ?'
+        return $script:PowerConfirmed
     }
     return $true
 }
@@ -2227,7 +2311,9 @@ function Wait-ACPower([string]$Reason) {
 function Install-WindowsUpdates {
     $script:WuTouched = $true      # l'analyse des composants faite pendant le scan n'est plus à jour
     if (-not (Wait-ACPower 'une coupure pendant l''installation des mises à jour peut endommager Windows.')) {
-        Write-Host '   >> Installation annulée.' -ForegroundColor DarkGray
+        # v3.29 : écrit comme un résultat, pour que le bilan de l'entretien la compte « à reprendre »
+        Write-Action 'WARN' 'Mises à jour Windows : installation annulée, PC pas sur secteur'
+        Write-Sub 'Branche le chargeur, puis relance J.A.R.V.I.S. pour les installer'
         return
     }
     Write-Host ''
@@ -2274,19 +2360,29 @@ function Install-WindowsUpdates {
         Write-Sub 'Rien n''a été installé : reprends plus tard avec J.A.R.V.I.S. ou dans Windows Update'
         return
     }
-    if (-not $dl.Ok) { Write-Status 'Téléchargement' ('échec : ' + (Cut $dl.Error 60)) 'WARN'; Open-WindowsUpdateGuided; return }
+    # v3.29 : la page Windows Update n'est plus ouverte ici en cas d'échec ; elle est proposée après l'entretien
+    # (Invoke-FollowUps), pour que son mode d'emploi ne défile pas pendant les éléments suivants
+    $wuLater = 'J.A.R.V.I.S. te propose d''ouvrir Windows Update à la fin de l''entretien'
+    if (-not $dl.Ok) {
+        Write-Status 'Téléchargement' ('échec : ' + (Cut $dl.Error 60)) 'WARN'
+        Write-Sub $wuLater
+        Add-FollowUp 'WU'
+        return
+    }
     foreach ($sk in @($dl.Skipped)) { Write-Sub ('Exclue, ' + (Cut $sk 90)) 'DarkGray' }
     if ($dl.Count -eq 0) {
-        Write-Host '   >> Aucune mise à jour installable automatiquement : celles qui restent sont facultatives' -ForegroundColor Yellow
-        Write-Host '      ou demandent une action à l''écran.' -ForegroundColor Yellow
-        if (Read-YesNo '   >> Ouvrir Windows Update pour les traiter toi-même ?') { Open-WindowsUpdateGuided }
+        Write-Status 'Mises à jour Windows' 'aucune installable automatiquement' 'WARN'
+        Write-Sub 'Celles qui restent sont facultatives ou demandent une action à l''écran'
+        Write-Sub $wuLater
+        Add-FollowUp 'WU'
         return
     }
     $dlState = Get-WuDownloadState $dl.Code $dl.Count $dl.Ready
     if ($dlState -eq 'FAILED') {
         Write-Status 'Téléchargement' ("échec, aucune mise à jour téléchargée (code de résultat {0})" -f $dl.Code) 'WARN'
         Write-Sub 'Vérifie la connexion Internet, puis réessaie ou passe par Windows Update'
-        Open-WindowsUpdateGuided
+        Write-Sub $wuLater
+        Add-FollowUp 'WU'
         return
     }
     if ($dlState -eq 'PARTIAL') {
@@ -2331,7 +2427,12 @@ function Install-WindowsUpdates {
         Write-Sub 'Paramètres > Windows Update > Historique des mises à jour, et redémarre si Windows le demande'
         return
     }
-    if (-not $ins.Ok) { Write-Status 'Installation' ('échec : ' + (Cut $ins.Error 60)) 'WARN'; Open-WindowsUpdateGuided; return }
+    if (-not $ins.Ok) {
+        Write-Status 'Installation' ('échec : ' + (Cut $ins.Error 60)) 'WARN'
+        Write-Sub $wuLater
+        Add-FollowUp 'WU'
+        return
+    }
     foreach ($x in @($ins.Results)) {
         if ($x.Code -eq 2) { Write-Sub ('Installée : ' + (Cut $x.Title 80)) 'Green' }
         elseif ($x.Code -eq 3) { Write-Sub ('Installée avec avertissement : ' + (Cut $x.Title 62)) 'Yellow' }
@@ -2354,14 +2455,10 @@ function Install-WindowsUpdates {
         }
     }
     if ($ins.Reboot) {
-        Write-Host ''
-        Write-Host '   [!] Un redémarrage est nécessaire pour terminer l''installation.' -ForegroundColor Yellow
-        if (Read-YesNo '   >> Redémarrer dans 1 minute ? (enregistre ton travail)') {
-            & (Get-SystemToolPath 'shutdown.exe') /r /t 60 /c 'J.A.R.V.I.S. : redémarrage pour terminer les mises à jour Windows.'
-            Write-Host '   >> Redémarrage dans 60 s. Pour l''annuler : Windows + R, puis « shutdown /a ».' -ForegroundColor Cyan
-        } else {
-            Write-Host '   >> Pense à redémarrer aujourd''hui : les mises à jour ne sont actives qu''après.' -ForegroundColor DarkGray
-        }
+        # v3.29 : la question vient tout à la fin (Invoke-EndOfScan), après le reste de l'entretien, le nettoyage et le
+        # rapport ; avant, elle était posée ici, au milieu, et un « oui » redémarrait le PC avant la fin
+        $script:RebootNeeded = $true
+        Write-Sub 'Un redémarrage est nécessaire pour terminer : J.A.R.V.I.S. te le propose tout à la fin' 'Yellow'
     }
 }
 
@@ -3402,7 +3499,13 @@ function Write-CleanResult([string]$Label, $Res) {
     $txt = '{0} : {1} libérés' -f $Label, (Format-Bytes $Res.FreedBytes)
     if ($left -gt 0) { $txt += (', {0} conservés (fichiers verrouillés ou en cours d''utilisation)' -f (Format-Bytes $left)) }
     if ($Res.Reason) { $txt += ' ; ' + $Res.Reason }
-    if ($left -gt 0 -or $Res.Reason) { Write-Action 'INFO' $txt } else { Write-Action 'OK' $txt }
+    if ($Res.Reason) { Write-Action 'INFO' $txt }
+    elseif ($left -gt 0 -and [int64]$Res.FreedBytes -gt 0) {
+        # v3.29 : place libérée mesurée, seuls des fichiers en cours d'utilisation restent : fait, pour le bilan
+        Write-Action 'INFO' $txt -BilanState 'OK'
+    }
+    elseif ($left -gt 0) { Write-Action 'INFO' $txt }
+    else { Write-Action 'OK' $txt }
 }
 
 function Wait-ServicingIdle([int]$TimeoutSec = 300) {
@@ -3455,9 +3558,10 @@ function Test-CleanStillBlocked([string]$Label) {
     return $true
 }
 
-function Invoke-CleanTarget($Target) {
+function Invoke-CleanTarget($Target, [switch]$Approved) {
     # Une question par cible (réponse par défaut : non), posée sur un état relu juste avant (taille, empêchements),
-    # puis le résultat vérifié par une nouvelle mesure, ajouté au rapport
+    # puis le résultat vérifié par une nouvelle mesure, ajouté au rapport. -Approved (v3.29, fichiers temporaires
+    # seulement) : accord déjà donné par la question de l'entretien, aucune question
     $size = Format-Bytes $Target.Bytes
     $who = ''
     if ($script:CleanUser) { $who = ', compte ' + $script:CleanUser }
@@ -3474,10 +3578,13 @@ function Invoke-CleanTarget($Target) {
                 if ($m0.Ok) { $now += $m0.AgedBytes } else { $known = $false }
             }
             if ($known) {
-                if ($now -le 0) { return }
+                if ($now -le 0) {
+                    if ($Approved) { Write-Action 'OK' 'Fichiers temporaires : plus rien à supprimer (mesuré à l''instant)' }
+                    return
+                }
                 $size = Format-Bytes $now
             }
-            if (-not (Read-YesNo ('   >> Supprimer les fichiers temporaires de plus de 24 h ({0}{1}) ?' -f $size, $who))) { return }
+            if (-not $Approved -and -not (Read-YesNo ('   >> Supprimer les fichiers temporaires de plus de 24 h ({0}{1}) ?' -f $size, $who))) { return }
             $res = [pscustomobject]@{ Ok = $false; FreedBytes = [int64]0; LeftBytes = [int64]0; Reason = '' }
             $notes = @()
             foreach ($p in $dirs) {
@@ -4586,7 +4693,9 @@ function Update-StoreApps {
         $why = 'pas de réponse du Store'
         if ($up -and $up.Error) { $why = Cut $up.Error 60 }
         Write-Action 'WARN' ('Microsoft Store : mise à jour impossible par J.A.R.V.I.S. (' + $why + ')')
-        Open-StoreLibraryGuided
+        # v3.29 : page proposée après l'entretien (Invoke-FollowUps), plus ouverte au milieu
+        Write-Sub 'J.A.R.V.I.S. te propose d''ouvrir la page des mises à jour du Microsoft Store à la fin de l''entretien'
+        Add-FollowUp 'STORE'
         return
     }
     Write-Host '   >> Vérification auprès du Microsoft Store...' -ForegroundColor DarkCyan
@@ -4634,7 +4743,9 @@ function Update-StoreApps {
         Write-Action 'INFO' 'Nouvelle recherche dans le Store impossible : regarde dans Microsoft Store > Bibliothèque'
     }
     if ($notOk -gt 0) {
-        if (Read-YesNo '   >> Ouvrir la page des mises à jour du Microsoft Store ?') { Open-StoreLibraryGuided }
+        # v3.29 : proposée après l'entretien (Invoke-FollowUps), pour ne pas l'interrompre
+        Write-Sub 'J.A.R.V.I.S. te propose d''ouvrir la page des mises à jour du Microsoft Store à la fin de l''entretien'
+        Add-FollowUp 'STORE'
     }
 }
 
@@ -4884,7 +4995,7 @@ function Get-RegValueSafe([string]$Path, [string]$Name) {
 }
 
 # ------------------------------------------------------------------
-# Version de Windows encore maintenue ? (v3.28) Dates relues le 26/11/2026 sur les pages de Microsoft :
+# Version de Windows encore maintenue ? (v3.28) Dates relues le 26/11/2026, puis le 27/11/2026 (v3.29, inchangées) :
 # « Windows 11 release information » (révisée le 19/11/2026) et « lifecycle » de chaque produit (fin de 24H2
 # Famille/Pro : 13/10/2026). À relire à chaque montée de version (règle 13) : un an après AsOf, une version
 # encore maintenue dans la table devient « non vérifiable » plutôt qu'un OK donné de mémoire.
@@ -4964,7 +5075,7 @@ function Get-WindowsLifecycleTable {
     # révision de 6575 ou plus prouve que le PC a reçu un correctif ESU. Relevé sur PC-LV (Windows 10 Famille
     # inscrit) le 27/11/2026 : 19045.7846, cumulative de novembre 2026 (KB5131096) installée le 21/11/2026.
     return [pscustomobject]@{
-        AsOf = [datetime]::ParseExact('2026-11-19', 'yyyy-MM-dd', $inv)
+        AsOf = [datetime]::ParseExact('2026-11-27', 'yyyy-MM-dd', $inv)
         EsuEnd = [datetime]::ParseExact('2027-10-12', 'yyyy-MM-dd', $inv)
         EsuFirstUbr = 6575
         Rows = @($list)
@@ -5687,6 +5798,451 @@ function Invoke-WindowsRepair {
 # ------------------------------------------------------------------
 # Auto-test
 # ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# Fin de scan (v3.29, lot 2 du plan « entretien », décisions de Thomas du 26/11/2026) : la réparation de Windows,
+# puis l'entretien courant en une question groupée, sont demandés d'abord ; le travail se fait ensuite, à la suite,
+# et une panne n'arrête pas les éléments suivants. Viennent après : pages à ouvrir, mises à jour Windows hors
+# entretien, suppressions définitives (une question chacune), Windows.old, rapport, et en tout dernier le
+# redémarrage demandé par Windows Update. Avant la v3.29 : une question par action, chacune lancée aussitôt, et
+# « Redémarrer dans 1 minute ? » posé au milieu, avant le nettoyage.
+# ------------------------------------------------------------------
+function Read-RepairOffer {
+    # Réparation de l'image Windows (DISM /RestoreHealth puis SFC), proposée avant l'entretien et lancée en premier.
+    # $true si acceptée.
+    if (-not ($script:NeedRestore -and $isAdmin)) { return $false }
+    $online = Test-Connection -ComputerName 1.1.1.1 -Count 1 -Quiet
+    if (-not $online) { $online = [bool](Resolve-DnsName 'www.microsoft.com' -DnsOnly -QuickTimeout) }
+    if (-not $online) {
+        Write-Host '   [!] Réparation DISM impossible sans Internet : elle télécharge les fichiers sains depuis Windows Update.' -ForegroundColor Yellow
+        Write-Host '       Connecte le PC puis relance le scan complet.' -ForegroundColor Yellow
+        return $false
+    }
+    $retry = Get-RepairRetryAdvice ([string](Get-JarvisConfig)['LastRepair']) (Get-Date) $script:ScanDetected
+    if ($retry) {
+        $lastDate = ([string](Get-JarvisConfig)['LastRepair'] -split '\|')[0]
+        Write-Host ('   [i] La dernière réparation ({0}) n''a pas pu tout corriger : Windows Update ne fournissait plus certains fichiers.' -f $lastDate) -ForegroundColor Yellow
+        if ($retry -eq 'SAME') { Write-Host '       Les défauts vus aujourd''hui ne sont pas plus nombreux : une nouvelle réparation n''ira sans doute pas plus loin.' -ForegroundColor Yellow }
+        else { Write-Host '       Une nouvelle tentative a peu de chances d''aller plus loin, sauf après une nouvelle mise à jour de Windows.' -ForegroundColor Yellow }
+    }
+    return (Read-YesNo '   >> Réparer l''image Windows (DISM /RestoreHealth puis SFC, 15-45 min) ?')
+}
+
+function Read-WindowsUpdateMenu([bool]$CanInstall) {
+    # Menu des mises à jour Windows (textes d'avant la v3.29). Rend '1' (installer), '2' (page Windows Update avec le
+    # mode d'emploi), 'N' ou $null (annulation).
+    Write-Host ''
+    Write-Host ("   MISES À JOUR WINDOWS : {0} en attente" -f $script:WUCount) -ForegroundColor Cyan
+    $wkeys = @()
+    if ($CanInstall) {
+        Write-Host '   [1] Les installer maintenant avec J.A.R.V.I.S. (recommandé, tout est automatique)' -ForegroundColor Gray
+        $wkeys += '1'
+    } else {
+        Write-Host '   (Pour que J.A.R.V.I.S. les installe lui-même : relance-le en administrateur.)' -ForegroundColor DarkGray
+    }
+    Write-Host '   [2] Ouvrir Windows Update, avec le mode d''emploi' -ForegroundColor Gray
+    Write-Host '   [N] Plus tard' -ForegroundColor Gray
+    $wkeys += '2'; $wkeys += 'N'
+    return (Read-Choice ('   >> Choix [' + ($wkeys -join '/') + '] (Entrée = N)') $wkeys 'N')
+}
+
+function Get-StoreNamesText {
+    # Noms des applications du Store à mettre à jour, pour la liste et pour la question
+    return (Cut ((@($script:StoreItems) | ForEach-Object { $_.Name }) -join ', ') 80)
+}
+
+function Read-MaintenanceItem($Item) {
+    # Réponse « D » (ou un seul élément) : la question de l'élément, avec les textes d'avant la v3.29. Rend 'RUN',
+    # 'OPEN' (mises à jour Windows : page ouverte avec le mode d'emploi) ou $null (refusé ou annulé).
+    switch ($Item.Key) {
+        'Defender' {
+            if (Read-YesNo '   >> Lancer une analyse antivirus rapide (Microsoft Defender, quelques minutes) ?') { return 'RUN' }
+        }
+        'Winget' {
+            Write-Host '   [i] winget peut fermer les applications concernées (navigateur, jeux, messageries) pendant leur mise à jour.' -ForegroundColor DarkGray
+            Write-Host '       Enregistre ton travail avant de valider.' -ForegroundColor DarkGray
+            if (Read-YesNo ("   >> Mettre à jour les {0} application(s) avec winget ?" -f $script:WGCount)) { return 'RUN' }
+        }
+        'Store' {
+            Write-Host ('   [i] Applications du Microsoft Store concernées : ' + (Get-StoreNamesText)) -ForegroundColor DarkGray
+            Write-Host '       Une application ouverte ne peut pas être mise à jour : ferme-les avant de valider.' -ForegroundColor DarkGray
+            if (Read-YesNo ("   >> Mettre à jour les {0} application(s) du Microsoft Store ?" -f @($script:StoreItems).Count)) { return 'RUN' }
+        }
+        'WindowsUpdate' {
+            $a = Read-WindowsUpdateMenu $true
+            if ($a -eq '1') { return 'RUN' }
+            if ($a -eq '2') { return 'OPEN' }
+        }
+        'Temp' {
+            $who = ''
+            if ($script:CleanUser) { $who = ', compte ' + $script:CleanUser }
+            if (Read-YesNo ('   >> Supprimer les fichiers temporaires de plus de 24 h ({0}{1}) ?' -f (Format-Bytes $Item.Bytes), $who)) { return 'RUN' }
+        }
+    }
+    return $null
+}
+
+function Read-MaintenanceChoice($Plan) {
+    # Question groupée : [O] tout faire, [D] une question par élément, [N] rien (Entrée = N, règle 5) ; Échap = rien,
+    # et rien n'est écrit au rapport. Un seul élément : sa question habituelle. Rend les éléments retenus (Item, Mode).
+    $Plan = @($Plan)
+    if ($Plan.Count -eq 0) { return }
+    if ($Plan.Count -gt 1) {
+        $keys = @($Plan | ForEach-Object { $_.Key })
+        Write-Host ''
+        Write-Host '   ENTRETIEN RECOMMANDÉ' -ForegroundColor Cyan
+        for ($i = 0; $i -lt $Plan.Count; $i++) {
+            Write-Host ('   {0}. {1} : {2}' -f ($i + 1), $Plan[$i].Text, $Plan[$i].Time) -ForegroundColor Gray
+            # Consignes d'avant la v3.29, reprises sous l'élément : le Store ne ferme pas une application ouverte, il
+            # échoue (0x80073D02) ; le nettoyage peut viser le dossier temporaire d'un autre compte
+            if ($Plan[$i].Key -eq 'Store') {
+                Write-Host ('      ' + (Get-StoreNamesText)) -ForegroundColor DarkGray
+                Write-Host '      Une application ouverte ne peut pas être mise à jour : ferme-les avant de valider.' -ForegroundColor Yellow
+            }
+            if ($Plan[$i].Key -eq 'Temp' -and $script:CleanUser) { Write-Host ('      Compte ' + $script:CleanUser) -ForegroundColor DarkGray }
+        }
+        if ($keys -contains 'Winget') {
+            Write-Host '   [!] winget peut fermer les applications concernées (navigateur, jeux, messageries) : enregistre ton travail avant.' -ForegroundColor Yellow
+        }
+        if ($keys -contains 'WindowsUpdate') {
+            Write-Host '   [i] Si Windows demande un redémarrage, J.A.R.V.I.S. te le propose tout à la fin.' -ForegroundColor DarkGray
+        }
+        Write-Host '   Tout s''enchaîne à la suite : tu peux laisser le PC travailler.' -ForegroundColor DarkGray
+        Write-Host ''
+        Write-Host '   [O] Tout faire    [D] Décider élément par élément    [N] Rien pour cette fois' -ForegroundColor Gray
+        $c = Read-Choice '   >> Choix [O/D/N] (Entrée = N)' @('O', 'D', 'N') 'N'
+        if ($c -eq 'O') {
+            foreach ($it in $Plan) { [pscustomobject]@{ Item = $it; Mode = 'RUN' } }
+            return
+        }
+        if ($c -ne 'D') { return }
+    }
+    foreach ($it in $Plan) {
+        $m = Read-MaintenanceItem $it
+        if ($m) { [pscustomobject]@{ Item = $it; Mode = $m } }
+    }
+}
+
+function Invoke-WingetUpdates {
+    # Mise à jour par winget des applications annoncées par la section 03, une par une, puis vérification par une
+    # nouvelle liste (corps repris tel quel de la fin de scan d'avant la v3.29)
+    Write-Host ''
+    $okItems = @(); $koList = @(); $naList = @(); $selfList = @()
+    $spans = @{}      # début et fin de chaque mise à jour, pour relire ensuite le journal de Windows
+    $explained = @()  # applications dont le retard vient d'être expliqué (encore en service)
+    $resolved = @()   # « terminées » encore proposées, mais dont la version a changé (autre numérotation)
+    $skip = @($script:WGSkipIds)
+    # Seulement les applications annoncées, une par une : plus de repli « winget upgrade --all » (v3.24, S5)
+    $targets = @($script:WGItems | Where-Object { $_.Id })
+    if ($targets.Count -gt 0) {
+        foreach ($it in $targets) {
+            if ($it.Id -eq 'Microsoft.AppInstaller') {
+                # winget est dans ce paquet et ne peut pas se remplacer pendant qu'il tourne (PC-LV le 21/11/2026 :
+                # code 0x80070002, MSIX 80073CF1 ; le Microsoft Store l'a mis à jour peu après)
+                $selfList += $it.Name
+                $skip += $it.Id
+                continue
+            }
+            Write-Host ''
+            Write-Host ('   >> Mise à jour de ' + $it.Name) -ForegroundColor Cyan
+            $null = Wait-MsiIdle
+            $itStart = Get-Date
+            & $script:WingetExe upgrade --id $it.Id --exact --accept-source-agreements --accept-package-agreements --disable-interactivity
+            $rc = $LASTEXITCODE
+            if ($rc -eq 0) {
+                $okItems += $it
+                $spans[$it.Id] = @($itStart, (Get-Date))
+            }
+            elseif (Test-WingetNotApplicable $rc) {
+                # La nouvelle version ne convient pas à cette installation (aucune mise à niveau applicable, ou
+                # autre technologie d'installation). Ce n'est pas une panne : l'application se met à jour seule.
+                $naList += $it.Name
+                $skip += $it.Id
+            } else {
+                $koList += [pscustomobject]@{ Item = $it; Code = ('0x{0:X8}' -f $rc) }
+            }
+        }
+    }
+    Write-Host ''
+    Write-Host '   >> Vérification du résultat...' -ForegroundColor DarkCyan
+    $raw2 = (Split-NativeOutput -Lines @(& $script:WingetExe upgrade --accept-source-agreements --disable-interactivity 2>&1)).Out
+    $leftAll = @(ConvertFrom-WingetText $raw2)
+    $verif = Get-WingetScanState $raw2 $leftAll.Count
+    # Certaines applications finissent leur mise à jour en se relançant après la fin de winget (Discord, autre PC
+    # le 20/11/2026 : annoncé « toujours en retard », relancé seul quelques secondes plus tard, à jour au scan
+    # suivant). Nouvelle lecture toutes les 20 s, 3 fois au plus, tant qu'une application annoncée « terminée » est
+    # encore proposée ; une lecture illisible garde la précédente.
+    # Ligne de la nouvelle liste pour une application, $null si elle n'y est plus
+    $rowOf = {
+        param($Id, $Rows)
+        foreach ($r in @($Rows)) { if (Test-WingetStillListed $Id @($r)) { return $r } }
+        return $null
+    }
+    # Encore proposée, mais version inscrite changée : mise à jour faite, l'éditeur numérote autrement
+    $changed = {
+        param($It, $Rows)
+        $r = & $rowOf $It.Id $Rows
+        return ($null -ne $r -and (Get-WingetVersionChange $It.Installed ([string]$r.Installed)) -eq 'CHANGED')
+    }
+    for ($try = 1; $try -le 3 -and $verif -ne 'UNREADABLE'; $try++) {
+        $waiting = @($okItems | Where-Object { (Test-WingetStillListed $_.Id $leftAll) -and -not (& $changed $_ $leftAll) })
+        if ($waiting.Count -eq 0) { break }
+        if ($try -eq 1) {
+            Write-Host '   >> Certaines applications finissent leur mise à jour en se relançant toutes seules.' -ForegroundColor DarkCyan
+        }
+        Write-Host ('   >> Ancienne version encore inscrite pour {0} application(s) : nouvelle vérification dans 20 s ({1}/3)...' -f $waiting.Count, $try) -ForegroundColor DarkCyan
+        Start-Sleep -Seconds 20
+        $raw3 = (Split-NativeOutput -Lines @(& $script:WingetExe upgrade --accept-source-agreements --disable-interactivity 2>&1)).Out
+        $all3 = @(ConvertFrom-WingetText $raw3)
+        if ((Get-WingetScanState $raw3 $all3.Count) -eq 'UNREADABLE') { break }
+        $leftAll = $all3
+    }
+    foreach ($it in $okItems) {
+        # winget a répondu « terminé » : le succès n'est annoncé que si la nouvelle liste le confirme.
+        $still = Test-WingetStillListed $it.Id $leftAll
+        if ($verif -eq 'UNREADABLE') { Write-Action 'INFO' ($it.Name + ' : winget a répondu « terminé », résultat non vérifié') }
+        elseif ($still -and (& $changed $it $leftAll)) {
+            # Preuve : la version inscrite a changé (Google Play Games sur PC-LV, 21/11/2026)
+            $r = & $rowOf $it.Id $leftAll
+            Write-Action 'OK' ('{0} : mise à jour vérifiée ({1} -> {2})' -f $it.Name, $it.Installed, $r.Installed)
+            Write-Sub ('winget annonce encore une version {0}, numérotée autrement par l''éditeur : rien à faire' -f $r.Available)
+            $resolved += $it.Id
+        }
+        elseif ($still -and $spans.ContainsKey($it.Id) -and (Test-AppxInUseBetween $spans[$it.Id][0] $spans[$it.Id][1])) {
+            # Preuve lue dans le journal de Windows (erreur 0x80073D02)
+            Write-Action 'WARN' ($it.Name + ' : nouvelle version téléchargée, mais pas installée : Windows a constaté que l''application tournait encore')
+            $explained += $it.Id
+            Write-Host '          Même sans fenêtre ouverte : icône près de l''horloge ou service en arrière-plan,' -ForegroundColor DarkGray
+            Write-Host '          parfois lancé dès le démarrage de Windows. Le plus sûr : Microsoft Store >' -ForegroundColor DarkGray
+            Write-Host '          Bibliothèque > Obtenir les mises à jour, ou la mise à jour proposée par l''application.' -ForegroundColor DarkGray
+        }
+        elseif ($still) {
+            Write-Action 'WARN' ($it.Name + ' : winget a répondu « terminé », mais l''ancienne version est toujours là')
+            Write-Host '          Si l''application vient de se relancer, refais un scan dans quelques minutes pour vérifier.' -ForegroundColor DarkGray
+        }
+        else { Write-Action 'OK' ($it.Name + ' : mise à jour vérifiée') }
+    }
+    foreach ($k in $koList) {
+        $it = $k.Item
+        $hint = Get-WingetErrorHint $k.Code
+        if ($verif -ne 'UNREADABLE' -and -not (Test-WingetStillListed $it.Id $leftAll)) {
+            # Plus proposée malgré l'erreur : faite quand même, ou application retirée par son propre installateur
+            # (Java sur PC-LV le 21/11/2026 : ancienne version désinstallée, nouvelle refusée, code 1618)
+            $null = & $script:WingetExe list --id $it.Id --exact --accept-source-agreements --disable-interactivity 2>&1
+            $pres = Get-WingetPresence $LASTEXITCODE
+            if ($pres -eq 'ABSENT') {
+                Write-Action 'FAIL' ('{0} : n''est plus installée (code {1})' -f $it.Name, $k.Code)
+                Write-Sub 'Son programme d''installation a retiré l''ancienne version, puis n''a pas pu installer la nouvelle.' 'Yellow'
+                if ($hint) { Write-Sub ('Cause probable : ' + $hint) }
+                Write-Sub 'Pour la remettre : clic droit sur Démarrer > Windows PowerShell (admin) ou Terminal (admin), puis :' 'Yellow'
+                Write-Sub ('winget install --id {0} --exact' -f $it.Id) 'Yellow'
+                $resolved += $it.Id
+                continue
+            }
+            if ($pres -eq 'PRESENT') {
+                Write-Action 'INFO' ('{0} : winget a signalé une erreur (code {1}), mais elle n''est plus en retard' -f $it.Name, $k.Code)
+                continue
+            }
+        }
+        Write-Action 'FAIL' ('{0} : code {1}' -f $it.Name, $k.Code)
+        if ($hint) {
+            Write-Sub $hint
+            # Cause déjà dite : pas de « l'application tournait encore » pour elle dans la liste des retards
+            $explained += $it.Id
+        }
+    }
+    foreach ($n in $selfList) {
+        Write-Action 'INFO' ($n + ' : contient winget, qui ne peut pas se remplacer pendant qu''il tourne ; le Microsoft Store le met à jour')
+    }
+    # Toujours en retard : sans les applications que winget refuse, ni celles réglées ci-dessus
+    $left = @($leftAll | Where-Object {
+            $row = $_
+            ($skip -notcontains $row.Id) -and (@($resolved | Where-Object { Test-WingetStillListed $_ @($row) }).Count -eq 0)
+        })
+    foreach ($n in $naList) {
+        Write-Action 'INFO' ($n + ' : winget n''a pas de version adaptée à cette installation')
+        Write-Host '          Mets-la à jour depuis l''application elle-même (souvent automatique à son ouverture).' -ForegroundColor DarkGray
+    }
+    if ($left.Count -gt 0) {
+        Write-Action 'WARN' ("{0} application(s) toujours en retard :" -f $left.Count)
+        foreach ($l in $left) {
+            Write-Host ('       - ' + (Cut $l.Name 60) + '  ' + $l.Installed + ' -> ' + $l.Available) -ForegroundColor Yellow
+            $script:Report.Add('       - ' + (Cut $l.Name 60) + '  ' + $l.Installed + ' -> ' + $l.Available)
+        }
+        if (@($left | Where-Object { $explained -notcontains $_.Id }).Count -gt 0) {
+            # Au moins un retard sans explication lue dans le journal : cause la plus courante rappelée
+            Write-Host '       Cause fréquente : l''application tournait encore pendant la mise à jour, parfois sans fenêtre' -ForegroundColor DarkGray
+            Write-Host '       (icône près de l''horloge, service en arrière-plan). Ferme-la complètement ou redémarre le PC,' -ForegroundColor DarkGray
+            Write-Host '       puis relance JARVIS ; sinon mets-la à jour depuis l''application ou le Microsoft Store.' -ForegroundColor DarkGray
+        }
+    } elseif ($leftAll.Count -gt 0) {
+        # Seules restent des applications que winget refuse de mettre à jour (signalées ci-dessus)
+        Write-Action 'OK' 'Vérifié : tout ce que winget peut mettre à jour est à jour'
+    } elseif ($verif -eq 'NONE') {
+        Write-Action 'OK' 'Vérifié : toutes les applications sont à jour'
+    } else {
+        # Ni liste lisible, ni message « aucune mise à jour » : on ne conclut pas
+        Write-Action 'WARN' 'Vérification impossible : la réponse de winget n''a pas pu être lue'
+        Write-Host '          Relance un scan pour contrôler.' -ForegroundColor DarkGray
+    }
+}
+
+function Invoke-MaintenanceItem($Choice, $Outcomes) {
+    # Exécute un élément retenu (Mode RUN). Une panne inattendue est écrite et n'arrête pas les suivants. Le bilan
+    # (DONE, TODO ou UNVERIFIED, Get-ActionOutcome) est ajouté à $Outcomes, jamais rendu : la sortie de winget doit
+    # aller à l'écran, et une affectation du résultat de cette fonction la capturerait.
+    $it = $Choice.Item
+    $from = $script:ActionStates.Count
+    $threw = $false
+    try {
+        switch ($it.Key) {
+            'Repair'   { Write-Host ''; Invoke-WindowsRepair }
+            'Defender' { Invoke-DefenderQuickScan }
+            'Winget'   { Invoke-WingetUpdates }
+            'Store'    { Write-Host ''; Update-StoreApps }
+            'WindowsUpdate' { Install-WindowsUpdates }
+            'Temp' {
+                Write-Host ''
+                $t = @($script:CleanTargets | Where-Object { $_.Key -eq 'Temp' }) | Select-Object -First 1
+                Invoke-CleanTarget $t -Approved
+            }
+        }
+    } catch {
+        $threw = $true
+        Write-Action 'FAIL' ('{0} : arrêt inattendu ({1})' -f $it.Label, (Cut ([string]$_.Exception.Message) 80))
+        Write-Sub 'La suite de l''entretien continue. Relance un scan plus tard pour cet élément.'
+    }
+    $states = @()
+    for ($i = $from; $i -lt $script:ActionStates.Count; $i++) { $states += $script:ActionStates[$i] }
+    $Outcomes.Add((Get-ActionOutcome $states $threw))
+}
+
+function Invoke-FollowUps {
+    # Pages proposées après l'entretien plutôt qu'au milieu (v3.29) : avant, elles s'ouvraient seules en cas d'échec,
+    # d'où la réponse par défaut oui (ouvrir une page ne change rien au PC)
+    if ($script:FollowUps -contains 'STORE') {
+        Write-Host ''
+        if (Read-YesNo '   >> Ouvrir la page des mises à jour du Microsoft Store ?' -DefaultYes) { Open-StoreLibraryGuided }
+    }
+    if ($script:FollowUps -contains 'WU') {
+        Write-Host ''
+        if (Read-YesNo '   >> Ouvrir Windows Update pour traiter toi-même les mises à jour restantes ?' -DefaultYes) { Open-WindowsUpdateGuided }
+    }
+}
+
+function Invoke-WindowsUpdateOffer {
+    # Mises à jour Windows hors de l'entretien groupé : à valider à l'écran, ou J.A.R.V.I.S. lancé sans droits admin
+    # (seule la page Windows Update est alors proposée)
+    if ($script:WUCount -eq 0 -and $script:WUManual -gt 0) {
+        Write-Host ''
+        Write-Host ("   {0} mise(s) à jour Windows demandent une action à l'écran (souvent des pilotes de périphériques)." -f $script:WUManual) -ForegroundColor Cyan
+        if (Read-YesNo '   >> Ouvrir Windows Update avec le mode d''emploi ?') { Open-WindowsUpdateGuided }
+        return
+    }
+    if ($script:WUCount -gt 0 -and -not $isAdmin) {
+        if ((Read-WindowsUpdateMenu $false) -eq '2') { Open-WindowsUpdateGuided }
+    }
+}
+
+function Complete-ActionReport([string]$RepFile, [int]$Mark) {
+    # Le rapport a été enregistré avant les actions : il est complété avec leur résultat. Rien n'est ajouté si
+    # aucune action n'a écrit de ligne (le scan d'essai refuse le bloc des actions quand rien n'a été accepté).
+    if (-not $RepFile -or $script:Report.Count -le $Mark) { return }
+    $script:Report.Insert($Mark, '== ACTIONS LANCÉES APRÈS LE SCAN ==')
+    $script:Report.Insert($Mark, '')
+    if (Update-Report $RepFile ([string[]]$script:Report)) {
+        Write-Host '   >> Rapport complété avec le résultat des actions.' -ForegroundColor DarkGray
+    } else {
+        Write-Host '   [!] Rapport non complété : le résultat des actions n''y figure pas.' -ForegroundColor Yellow
+    }
+}
+
+function Invoke-EndOfScan([string]$RepFile) {
+    # Appelée seule sur sa ligne, sans affectation : la sortie de winget va à l'écran (voir Invoke-MaintenanceItem)
+    Write-Host ''
+    $repMark = $script:Report.Count       # tout ce qui s'ajoute au rapport après ce point vient des actions
+
+    # 1. Questions : réparation de Windows, puis entretien courant
+    $repair = Read-RepairOffer
+    foreach ($L in $script:ChkdskFix) {
+        Write-Host ("   >> Volume {0}: correction conseillée : chkdsk {0}: /spotfix" -f $L) -ForegroundColor Yellow
+        Write-Host '      (pour le disque système, la correction a lieu au prochain redémarrage)' -ForegroundColor DarkGray
+    }
+    $cleanProp = Get-CleanProposal $script:CleanTargets $CleanMinBytes $isAdmin
+    $tempBytes = $null
+    foreach ($t in @($cleanProp.Items)) { if ($t.Key -eq 'Temp') { $tempBytes = $t.Bytes } }
+    $plan = @(Get-MaintenancePlan $script:DefenderScan $script:WGCount ([bool]$script:WingetExe) @($script:StoreItems).Count $script:WUCount $isAdmin $tempBytes)
+    $chosen = @(Read-MaintenanceChoice $plan)
+    if ($repair) {
+        $rep = [pscustomobject]@{ Item = [pscustomobject]@{ Key = 'Repair'; Label = 'Réparation de Windows' }; Mode = 'RUN' }
+        $chosen = @($rep) + $chosen
+    }
+    # Page Windows Update choisie en « D » : ouverte après le travail, avec les autres pages
+    $openWu = (@($chosen | Where-Object { $_.Mode -eq 'OPEN' }).Count -gt 0)
+    $chosen = @($chosen | Where-Object { $_.Mode -eq 'RUN' })
+    # Secteur vérifié avant le travail, pour ne pas s'arrêter sur une question au milieu
+    $needAC = @($chosen | Where-Object { @('Repair', 'WindowsUpdate') -contains $_.Item.Key })
+    if ($needAC.Count -gt 0 -and -not (Wait-ACPower 'une coupure pendant la réparation ou l''installation des mises à jour peut abîmer Windows.')) {
+        Write-Host ('   >> Annulé : ' + (@($needAC | ForEach-Object { $_.Item.Label }) -join ' et ') + '. Le reste de l''entretien continue.') -ForegroundColor DarkGray
+        $chosen = @($chosen | Where-Object { @('Repair', 'WindowsUpdate') -notcontains $_.Item.Key })
+    }
+
+    # 2. Travail, à la suite
+    $outcomes = New-Object System.Collections.Generic.List[string]
+    if ($chosen.Count -gt 1) {
+        Write-Host ''
+        Write-Host ('   >> Entretien : {0} éléments à la suite. Ne ferme pas cette fenêtre.' -f $chosen.Count) -ForegroundColor Cyan
+    }
+    foreach ($c in $chosen) { Invoke-MaintenanceItem $c $outcomes }
+    if ($outcomes.Count -gt 1) {
+        $sum = Get-MaintenanceSummary $outcomes.ToArray()
+        Write-Host ''
+        Write-Action $sum.State ('Entretien terminé : ' + $sum.Text)
+        if ($sum.Todo -gt 0) { Write-Sub 'Quoi faire : écrit sous chaque ligne jaune ou rouge ci-dessus.' }
+    }
+
+    # 3. Ce qui reste à part : pages à ouvrir, suppressions définitives, Windows.old
+    if ($openWu) { Write-Host ''; Open-WindowsUpdateGuided }
+    Invoke-FollowUps
+    Invoke-WindowsUpdateOffer
+    $rest = @($cleanProp.Items | Where-Object { $_.Key -ne 'Temp' })
+    if ($rest.Count -gt 0) {
+        Write-Host ''
+        $restBytes = [int64]0
+        foreach ($t in $rest) { $restBytes += [int64]$t.Bytes }
+        $cpTxt = Format-Bytes $restBytes
+        if (@($rest | Where-Object { $_.Key -eq 'Components' }).Count -gt 0) { $cpTxt += ' + composants Windows' }
+        Write-Host ('   NETTOYAGE : ' + $cpTxt + ' récupérables') -ForegroundColor Cyan
+        Write-Host '   Suppressions définitives : une question par élément, réponse par défaut non.' -ForegroundColor DarkGray
+        foreach ($t in $rest) { Invoke-CleanTarget $t }
+    }
+    if ($script:WinOld) {
+        Write-Host ''
+        Write-Host '   [i] Windows.old : ancienne version de Windows, gardée pour pouvoir y revenir. J.A.R.V.I.S. n''y touche pas.' -ForegroundColor DarkGray
+        if (Read-YesNo '   >> Ouvrir Paramètres > Stockage pour le retirer toi-même ?') {
+            Write-Host '   Dans la fenêtre qui s''ouvre : Fichiers temporaires, coche « Installation(s) précédente(s) de Windows »,' -ForegroundColor Cyan
+            Write-Host '   puis « Supprimer les fichiers ». Après cela, revenir à la version précédente ne sera plus possible.' -ForegroundColor Cyan
+            try { Start-Process 'ms-settings:storagesense' -ErrorAction Stop }
+            catch { Write-Host '   [!] Ouverture impossible : Démarrer > Paramètres > Système > Stockage.' -ForegroundColor Yellow }
+        }
+    }
+
+    # 4. Rapport, puis le redémarrage en tout dernier
+    Complete-ActionReport $RepFile $repMark
+    if ($RepFile) {
+        if (Read-YesNo '   >> Ouvrir le rapport ?') { Start-Process -FilePath (Get-SystemToolPath 'notepad.exe') -ArgumentList ('"{0}"' -f $RepFile) }
+    }
+    if ($script:RebootNeeded) {
+        Write-Host ''
+        Write-Host '   [!] Un redémarrage est nécessaire pour terminer l''installation des mises à jour Windows.' -ForegroundColor Yellow
+        if (Read-YesNo '   >> Redémarrer dans 1 minute ? (enregistre ton travail)') {
+            & (Get-SystemToolPath 'shutdown.exe') /r /t 60 /c 'J.A.R.V.I.S. : redémarrage pour terminer les mises à jour Windows.'
+            Write-Host '   >> Redémarrage dans 60 s. Pour l''annuler : Windows + R, puis « shutdown /a ».' -ForegroundColor Cyan
+        } else {
+            Write-Host '   >> Pense à redémarrer aujourd''hui : les mises à jour ne sont actives qu''après.' -ForegroundColor DarkGray
+        }
+    }
+}
+
 function Invoke-SelfTestAnalyzers {
     # T1 : analyseurs (cas connus, aucune dépendance au PC ni à la console).
     # Appelée par Invoke-SelfTest (auto-test) et par tools/check.ps1 (contrôle avant chaque fabrication) :
@@ -6055,8 +6611,9 @@ function Invoke-SelfTestAnalyzers {
         Assert-True ($v.Kind -eq 'SOON' -and $v.Text -like '*encore 72 j*' -and -not (Test-UnreadValue $v.Text)) ('25H2 au 01/08/2027 : ' + $v.Text); $n++
         $v = Get-WindowsSupportVerdict 26200 'Core' ([datetime]'2027-07-13')
         Assert-True ($v.Kind -eq 'OK') ('25H2 à 91 jours de sa fin : ' + $v.Kind); $n++
-        # Table de plus d'un an : plus de OK donné de mémoire, mais une fin déjà passée reste une fin
-        $v = Get-WindowsSupportVerdict 26300 'Professional' ([datetime]'2027-11-20')
+        # Table de plus d'un an : plus de OK donné de mémoire, mais une fin déjà passée reste une fin. Date prise par
+        # rapport à AsOf (v3.29 : la date fixe du 20/11/2027 cessait d'être « plus d'un an après » dès qu'AsOf avançait)
+        $v = Get-WindowsSupportVerdict 26300 'Professional' ((Get-WindowsLifecycleTable).AsOf.AddDays(366))
         Assert-True ($v.Kind -eq 'UNKNOWN' -and $v.State -eq 'INFO' -and (Test-UnreadValue $v.Text)) ('table périmée : ' + $v.Text); $n++
         $v = Get-WindowsSupportVerdict 26100 'Core' ([datetime]'2028-03-01')
         Assert-True ($v.Kind -eq 'ENDED') 'table périmée : fin de 24H2 oubliée'; $n++
@@ -7440,6 +7997,89 @@ function Invoke-SelfTestAnalyzers {
         Assert-True ($null -eq (Test-SkipWuUpdate (& $mk '2026-11 Mise à jour cumulative' @('0fa1201d-4330-4fa8-8ae9-b877473b6441') $false $false))) 'mise à jour normale exclue à tort'
         Assert-True ((Test-SkipWuUpdate (& $mk 'Pilote facultatif' @() $false $true)) -eq 'facultative') 'mise à jour facultative non exclue'
         '6/6 cas'
+    }
+    Test-Case 'Entretien : contenu de la question groupée' {
+        # v3.29 : Defender, winget, Store, mises à jour Windows (administrateur seulement), fichiers temporaires, dans
+        # cet ordre. Arguments : Defender, retards winget, winget.exe trouvé, retards Store, mises à jour Windows,
+        # administrateur, fichiers temporaires proposés (octets, $null sinon), puis les éléments attendus.
+        $tmp = [int64]812MB
+        $cases = @(
+            @($false, 0, $true, 0, 0, $true, $null, ''),
+            @($true, 5, $true, 2, 3, $true, $tmp, 'Defender,Winget,Store,WindowsUpdate,Temp'),
+            @($true, 5, $true, 2, 3, $false, $tmp, 'Defender,Winget,Store,Temp'),
+            @($false, 0, $true, 0, 3, $true, $null, 'WindowsUpdate'),
+            @($false, 0, $true, 0, 3, $false, $null, ''),
+            @($false, 4, $false, 0, 0, $true, $null, ''),
+            @($true, 0, $true, 0, 0, $false, $null, 'Defender'),
+            @($false, 0, $false, 1, 0, $false, $null, 'Store'),
+            @($false, 0, $true, 0, 0, $false, $tmp, 'Temp'),
+            @($true, 0, $true, 0, 0, $true, $tmp, 'Defender,Temp'),
+            @($false, 2, $true, 0, 1, $false, $null, 'Winget'),
+            @($false, 0, $true, 2, 1, $true, $tmp, 'Store,WindowsUpdate,Temp')
+        )
+        foreach ($c in $cases) {
+            $p = @(Get-MaintenancePlan $c[0] $c[1] $c[2] $c[3] $c[4] $c[5] $c[6])
+            $got = (@($p | ForEach-Object { $_.Key }) -join ',')
+            Assert-True ($got -eq $c[7]) ('obtenu « {0} », attendu « {1} »' -f $got, $c[7])
+            foreach ($it in $p) {
+                Assert-True ([bool]$it.Label -and [bool]$it.Text -and [bool]$it.Time) ('libellé, texte ou durée vide : ' + $it.Key)
+            }
+        }
+        $p = @(Get-MaintenancePlan $true 5 $true 2 3 $true $tmp)
+        Assert-True ($p[1].Text -match '5 application\(s\) avec winget') ('nombre winget absent : ' + $p[1].Text)
+        Assert-True ($p[2].Text -match '2 application\(s\) du Microsoft Store') ('nombre Store absent : ' + $p[2].Text)
+        Assert-True ($p[3].Text -match '3 mise\(s\) à jour Windows') ('nombre Windows Update absent : ' + $p[3].Text)
+        Assert-True ($p[4].Text -match '812 Mo' -and $p[4].Bytes -eq $tmp) ('taille des fichiers temporaires perdue : ' + $p[4].Text)
+        Assert-True ($null -eq $p[0].Bytes) 'taille donnée à un élément autre que les fichiers temporaires'
+        '{0}/{0} cas, textes et taille' -f $cases.Count
+    }
+    Test-Case 'Entretien : bilan d''un élément' {
+        # v3.29 : d'après l'état des lignes écrites pendant l'élément ; aucune ligne ou seulement INFO = non vérifié
+        $cases = @(
+            @(@('OK'), $false, 'DONE'),
+            @(@('OK', 'INFO'), $false, 'DONE'),
+            @(@('OK', 'WARN'), $false, 'TODO'),
+            @(@('INFO', 'FAIL'), $false, 'TODO'),
+            @(@('INFO'), $false, 'UNVERIFIED'),
+            @(@(), $false, 'UNVERIFIED'),
+            @(@('OK'), $true, 'TODO'),
+            @(@(), $true, 'TODO')
+        )
+        foreach ($c in $cases) {
+            $got = Get-ActionOutcome $c[0] $c[1]
+            Assert-True ($got -eq $c[2]) ('« {0} », panne {1} -> {2}, attendu {3}' -f ($c[0] -join ','), $c[1], $got, $c[2])
+        }
+        Assert-True ((Get-ActionOutcome $null $false) -eq 'UNVERIFIED') 'aucune liste : pas « non vérifié »'
+        Assert-True ((Get-ActionOutcome @('OK', $null) $false) -eq 'DONE') 'valeur nulle dans la liste mal comptée'
+        '{0}/{0} cas, plus liste absente et valeur nulle' -f $cases.Count
+    }
+    Test-Case 'Entretien : bilan final' {
+        $s = Get-MaintenanceSummary @('DONE', 'DONE', 'DONE')
+        Assert-True ($s.State -eq 'OK' -and $s.Text -eq '3 faits' -and $s.Done -eq 3) ('tout fait : ' + $s.State + ' / ' + $s.Text)
+        $s = Get-MaintenanceSummary @('DONE', 'TODO', 'UNVERIFIED')
+        Assert-True ($s.State -eq 'WARN' -and $s.Text -eq '1 fait, 1 à reprendre, 1 non vérifié') ('mélange : ' + $s.State + ' / ' + $s.Text)
+        $s = Get-MaintenanceSummary @('UNVERIFIED', 'UNVERIFIED')
+        Assert-True ($s.State -eq 'INFO' -and $s.Text -eq '0 fait, 2 non vérifiés') ('rien de prouvé : ' + $s.State + ' / ' + $s.Text)
+        $s = Get-MaintenanceSummary @('TODO', 'TODO')
+        Assert-True ($s.State -eq 'WARN' -and $s.Todo -eq 2) ('tout à reprendre : ' + $s.State + ' / ' + $s.Text)
+        $s = Get-MaintenanceSummary $null
+        Assert-True ($s.State -eq 'INFO' -and $s.Done -eq 0 -and $s.Todo -eq 0 -and $s.Unverified -eq 0) 'liste absente mal comptée'
+        $s = Get-MaintenanceSummary @('DONE', $null)
+        Assert-True ($s.State -eq 'OK' -and $s.Unverified -eq 0) 'valeur nulle comptée comme non vérifiée'
+        '6/6 cas'
+    }
+    Test-Case 'Entretien : touches O, D et N' {
+        # v3.29 : Entrée = N (règle 5), Échap = annulation, aucune autre réponse acceptée
+        $keys = @('O', 'D', 'N')
+        Assert-True ((Get-MenuChoice 'o' $keys 'N') -eq 'O') 'o refusé'
+        Assert-True ((Get-MenuChoice ' D ' $keys 'N') -eq 'D') 'D avec espaces refusé'
+        Assert-True ((Get-MenuChoice "n`r`n" $keys 'N') -eq 'N') 'fin de ligne Windows non retirée'
+        Assert-True ((Get-MenuChoice '' $keys 'N') -eq 'N') 'Entrée ne vaut pas N'
+        Assert-True ($null -eq (Get-MenuChoice $null $keys 'N')) 'annulation non transmise'
+        foreach ($bad in @('oui', '1', 'tout', 'y')) {
+            Assert-True ((Get-MenuChoice $bad $keys 'N') -eq '') ('réponse non affichée acceptée : ' + $bad)
+        }
+        '9/9 cas'
     }
 }
 
@@ -10173,7 +10813,7 @@ if (@($cleanProp.Items | Where-Object { $_.Key -eq 'Components' }).Count -gt 0) 
 $unread = @($script:CleanTargets | Where-Object { -not $_.Ok }).Count
 if ($cleanProp.Bytes -gt 5GB) {
     Write-Status 'Espace récupérable' $allTxt 'WARN'
-    Write-Sub 'J.A.R.V.I.S. te propose le nettoyage à la fin du scan, élément par élément.'
+    Write-Sub 'J.A.R.V.I.S. te propose le nettoyage à la fin du scan.'
 }
 elseif (-not $isAdmin) { Write-Status 'Espace récupérable' ($allTxt + '  (sans droits admin)') 'INFO' }
 elseif ($unread -gt 0) { Write-Status 'Espace récupérable' ($allTxt + '  (certaines mesures impossibles)') 'INFO' }
@@ -10414,264 +11054,8 @@ if ($script:Alerts.Count -eq 0 -and $script:Warnings.Count -eq 0 -and $script:No
 
 $repFile = Save-Report 'checkup' ([string[]]$script:Report)
 
-# ------------------------------------------------------------------
-# Actions proposées (rien n'est lancé sans réponse "o")
-# ------------------------------------------------------------------
-Write-Host ''
-$repMark = $script:Report.Count       # tout ce qui s'ajoute au rapport après ce point vient des actions
-if ($script:NeedRestore -and $isAdmin) {
-    $online = Test-Connection -ComputerName 1.1.1.1 -Count 1 -Quiet
-    if (-not $online) { $online = [bool](Resolve-DnsName 'www.microsoft.com' -DnsOnly -QuickTimeout) }
-    if (-not $online) {
-        Write-Host '   [!] Réparation DISM impossible sans Internet : elle télécharge les fichiers sains depuis Windows Update.' -ForegroundColor Yellow
-        Write-Host '       Connecte le PC puis relance le scan complet.' -ForegroundColor Yellow
-    } else {
-        $retry = Get-RepairRetryAdvice ([string](Get-JarvisConfig)['LastRepair']) (Get-Date) $script:ScanDetected
-        if ($retry) {
-            $lastDate = ([string](Get-JarvisConfig)['LastRepair'] -split '\|')[0]
-            Write-Host ('   [i] La dernière réparation ({0}) n''a pas pu tout corriger : Windows Update ne fournissait plus certains fichiers.' -f $lastDate) -ForegroundColor Yellow
-            if ($retry -eq 'SAME') { Write-Host '       Les défauts vus aujourd''hui ne sont pas plus nombreux : une nouvelle réparation n''ira sans doute pas plus loin.' -ForegroundColor Yellow }
-            else { Write-Host '       Une nouvelle tentative a peu de chances d''aller plus loin, sauf après une nouvelle mise à jour de Windows.' -ForegroundColor Yellow }
-        }
-        if (Read-YesNo '   >> Réparer l''image Windows (DISM /RestoreHealth puis SFC, 15-45 min) ?') {
-            if (Wait-ACPower 'une coupure pendant la réparation peut abîmer Windows.') { Invoke-WindowsRepair }
-            else { Write-Host '   >> Réparation annulée.' -ForegroundColor DarkGray }
-        }
-    }
-}
-foreach ($L in $script:ChkdskFix) {
-    Write-Host ("   >> Volume {0}: correction conseillée : chkdsk {0}: /spotfix" -f $L) -ForegroundColor Yellow
-    Write-Host '      (pour le disque système, la correction a lieu au prochain redémarrage)' -ForegroundColor DarkGray
-}
-if ($script:DefenderScan) {
-    if (Read-YesNo '   >> Lancer une analyse antivirus rapide (Microsoft Defender, quelques minutes) ?') { Invoke-DefenderQuickScan }
-}
-if ($script:WGCount -gt 0 -and $script:WingetExe) {
-    Write-Host '   [i] winget peut fermer les applications concernées (navigateur, jeux, messageries) pendant leur mise à jour.' -ForegroundColor DarkGray
-    Write-Host '       Enregistre ton travail avant de valider.' -ForegroundColor DarkGray
-    if (Read-YesNo ("   >> Mettre à jour les {0} application(s) avec winget ?" -f $script:WGCount)) {
-        Write-Host ''
-        $okItems = @(); $koList = @(); $naList = @(); $selfList = @()
-        $spans = @{}      # début et fin de chaque mise à jour, pour relire ensuite le journal de Windows
-        $explained = @()  # applications dont le retard vient d'être expliqué (encore en service)
-        $resolved = @()   # « terminées » encore proposées, mais dont la version a changé (autre numérotation)
-        $skip = @($script:WGSkipIds)
-        # Seulement les applications annoncées, une par une : plus de repli « winget upgrade --all » (v3.24, S5)
-        $targets = @($script:WGItems | Where-Object { $_.Id })
-        if ($targets.Count -gt 0) {
-            foreach ($it in $targets) {
-                if ($it.Id -eq 'Microsoft.AppInstaller') {
-                    # winget est dans ce paquet et ne peut pas se remplacer pendant qu'il tourne (PC-LV le 21/11/2026 :
-                    # code 0x80070002, MSIX 80073CF1 ; le Microsoft Store l'a mis à jour peu après)
-                    $selfList += $it.Name
-                    $skip += $it.Id
-                    continue
-                }
-                Write-Host ''
-                Write-Host ('   >> Mise à jour de ' + $it.Name) -ForegroundColor Cyan
-                $null = Wait-MsiIdle
-                $itStart = Get-Date
-                & $script:WingetExe upgrade --id $it.Id --exact --accept-source-agreements --accept-package-agreements --disable-interactivity
-                $rc = $LASTEXITCODE
-                if ($rc -eq 0) {
-                    $okItems += $it
-                    $spans[$it.Id] = @($itStart, (Get-Date))
-                }
-                elseif (Test-WingetNotApplicable $rc) {
-                    # La nouvelle version ne convient pas à cette installation (aucune mise à niveau applicable, ou
-                    # autre technologie d'installation). Ce n'est pas une panne : l'application se met à jour seule.
-                    $naList += $it.Name
-                    $skip += $it.Id
-                } else {
-                    $koList += [pscustomobject]@{ Item = $it; Code = ('0x{0:X8}' -f $rc) }
-                }
-            }
-        }
-        Write-Host ''
-        Write-Host '   >> Vérification du résultat...' -ForegroundColor DarkCyan
-        $raw2 = (Split-NativeOutput -Lines @(& $script:WingetExe upgrade --accept-source-agreements --disable-interactivity 2>&1)).Out
-        $leftAll = @(ConvertFrom-WingetText $raw2)
-        $verif = Get-WingetScanState $raw2 $leftAll.Count
-        # Certaines applications finissent leur mise à jour en se relançant après la fin de winget (Discord, autre PC
-        # le 20/11/2026 : annoncé « toujours en retard », relancé seul quelques secondes plus tard, à jour au scan
-        # suivant). Nouvelle lecture toutes les 20 s, 3 fois au plus, tant qu'une application annoncée « terminée » est
-        # encore proposée ; une lecture illisible garde la précédente.
-        # Ligne de la nouvelle liste pour une application, $null si elle n'y est plus
-        $rowOf = {
-            param($Id, $Rows)
-            foreach ($r in @($Rows)) { if (Test-WingetStillListed $Id @($r)) { return $r } }
-            return $null
-        }
-        # Encore proposée, mais version inscrite changée : mise à jour faite, l'éditeur numérote autrement
-        $changed = {
-            param($It, $Rows)
-            $r = & $rowOf $It.Id $Rows
-            return ($null -ne $r -and (Get-WingetVersionChange $It.Installed ([string]$r.Installed)) -eq 'CHANGED')
-        }
-        for ($try = 1; $try -le 3 -and $verif -ne 'UNREADABLE'; $try++) {
-            $waiting = @($okItems | Where-Object { (Test-WingetStillListed $_.Id $leftAll) -and -not (& $changed $_ $leftAll) })
-            if ($waiting.Count -eq 0) { break }
-            if ($try -eq 1) {
-                Write-Host '   >> Certaines applications finissent leur mise à jour en se relançant toutes seules.' -ForegroundColor DarkCyan
-            }
-            Write-Host ('   >> Ancienne version encore inscrite pour {0} application(s) : nouvelle vérification dans 20 s ({1}/3)...' -f $waiting.Count, $try) -ForegroundColor DarkCyan
-            Start-Sleep -Seconds 20
-            $raw3 = (Split-NativeOutput -Lines @(& $script:WingetExe upgrade --accept-source-agreements --disable-interactivity 2>&1)).Out
-            $all3 = @(ConvertFrom-WingetText $raw3)
-            if ((Get-WingetScanState $raw3 $all3.Count) -eq 'UNREADABLE') { break }
-            $leftAll = $all3
-        }
-        foreach ($it in $okItems) {
-            # winget a répondu « terminé » : le succès n'est annoncé que si la nouvelle liste le confirme.
-            $still = Test-WingetStillListed $it.Id $leftAll
-            if ($verif -eq 'UNREADABLE') { Write-Action 'INFO' ($it.Name + ' : winget a répondu « terminé », résultat non vérifié') }
-            elseif ($still -and (& $changed $it $leftAll)) {
-                # Preuve : la version inscrite a changé (Google Play Games sur PC-LV, 21/11/2026)
-                $r = & $rowOf $it.Id $leftAll
-                Write-Action 'OK' ('{0} : mise à jour vérifiée ({1} -> {2})' -f $it.Name, $it.Installed, $r.Installed)
-                Write-Sub ('winget annonce encore une version {0}, numérotée autrement par l''éditeur : rien à faire' -f $r.Available)
-                $resolved += $it.Id
-            }
-            elseif ($still -and $spans.ContainsKey($it.Id) -and (Test-AppxInUseBetween $spans[$it.Id][0] $spans[$it.Id][1])) {
-                # Preuve lue dans le journal de Windows (erreur 0x80073D02)
-                Write-Action 'WARN' ($it.Name + ' : nouvelle version téléchargée, mais pas installée : Windows a constaté que l''application tournait encore')
-                $explained += $it.Id
-                Write-Host '          Même sans fenêtre ouverte : icône près de l''horloge ou service en arrière-plan,' -ForegroundColor DarkGray
-                Write-Host '          parfois lancé dès le démarrage de Windows. Le plus sûr : Microsoft Store >' -ForegroundColor DarkGray
-                Write-Host '          Bibliothèque > Obtenir les mises à jour, ou la mise à jour proposée par l''application.' -ForegroundColor DarkGray
-            }
-            elseif ($still) {
-                Write-Action 'WARN' ($it.Name + ' : winget a répondu « terminé », mais l''ancienne version est toujours là')
-                Write-Host '          Si l''application vient de se relancer, refais un scan dans quelques minutes pour vérifier.' -ForegroundColor DarkGray
-            }
-            else { Write-Action 'OK' ($it.Name + ' : mise à jour vérifiée') }
-        }
-        foreach ($k in $koList) {
-            $it = $k.Item
-            $hint = Get-WingetErrorHint $k.Code
-            if ($verif -ne 'UNREADABLE' -and -not (Test-WingetStillListed $it.Id $leftAll)) {
-                # Plus proposée malgré l'erreur : faite quand même, ou application retirée par son propre installateur
-                # (Java sur PC-LV le 21/11/2026 : ancienne version désinstallée, nouvelle refusée, code 1618)
-                $null = & $script:WingetExe list --id $it.Id --exact --accept-source-agreements --disable-interactivity 2>&1
-                $pres = Get-WingetPresence $LASTEXITCODE
-                if ($pres -eq 'ABSENT') {
-                    Write-Action 'FAIL' ('{0} : n''est plus installée (code {1})' -f $it.Name, $k.Code)
-                    Write-Sub 'Son programme d''installation a retiré l''ancienne version, puis n''a pas pu installer la nouvelle.' 'Yellow'
-                    if ($hint) { Write-Sub ('Cause probable : ' + $hint) }
-                    Write-Sub 'Pour la remettre : clic droit sur Démarrer > Windows PowerShell (admin) ou Terminal (admin), puis :' 'Yellow'
-                    Write-Sub ('winget install --id {0} --exact' -f $it.Id) 'Yellow'
-                    $resolved += $it.Id
-                    continue
-                }
-                if ($pres -eq 'PRESENT') {
-                    Write-Action 'INFO' ('{0} : winget a signalé une erreur (code {1}), mais elle n''est plus en retard' -f $it.Name, $k.Code)
-                    continue
-                }
-            }
-            Write-Action 'FAIL' ('{0} : code {1}' -f $it.Name, $k.Code)
-            if ($hint) {
-                Write-Sub $hint
-                # Cause déjà dite : pas de « l'application tournait encore » pour elle dans la liste des retards
-                $explained += $it.Id
-            }
-        }
-        foreach ($n in $selfList) {
-            Write-Action 'INFO' ($n + ' : contient winget, qui ne peut pas se remplacer pendant qu''il tourne ; le Microsoft Store le met à jour')
-        }
-        # Toujours en retard : sans les applications que winget refuse, ni celles réglées ci-dessus
-        $left = @($leftAll | Where-Object {
-                $row = $_
-                ($skip -notcontains $row.Id) -and (@($resolved | Where-Object { Test-WingetStillListed $_ @($row) }).Count -eq 0)
-            })
-        foreach ($n in $naList) {
-            Write-Action 'INFO' ($n + ' : winget n''a pas de version adaptée à cette installation')
-            Write-Host '          Mets-la à jour depuis l''application elle-même (souvent automatique à son ouverture).' -ForegroundColor DarkGray
-        }
-        if ($left.Count -gt 0) {
-            Write-Action 'WARN' ("{0} application(s) toujours en retard :" -f $left.Count)
-            foreach ($l in $left) {
-                Write-Host ('       - ' + (Cut $l.Name 60) + '  ' + $l.Installed + ' -> ' + $l.Available) -ForegroundColor Yellow
-                $script:Report.Add('       - ' + (Cut $l.Name 60) + '  ' + $l.Installed + ' -> ' + $l.Available)
-            }
-            if (@($left | Where-Object { $explained -notcontains $_.Id }).Count -gt 0) {
-                # Au moins un retard sans explication lue dans le journal : cause la plus courante rappelée
-                Write-Host '       Cause fréquente : l''application tournait encore pendant la mise à jour, parfois sans fenêtre' -ForegroundColor DarkGray
-                Write-Host '       (icône près de l''horloge, service en arrière-plan). Ferme-la complètement ou redémarre le PC,' -ForegroundColor DarkGray
-                Write-Host '       puis relance JARVIS ; sinon mets-la à jour depuis l''application ou le Microsoft Store.' -ForegroundColor DarkGray
-            }
-        } elseif ($leftAll.Count -gt 0) {
-            # Seules restent des applications que winget refuse de mettre à jour (signalées ci-dessus)
-            Write-Action 'OK' 'Vérifié : tout ce que winget peut mettre à jour est à jour'
-        } elseif ($verif -eq 'NONE') {
-            Write-Action 'OK' 'Vérifié : toutes les applications sont à jour'
-        } else {
-            # Ni liste lisible, ni message « aucune mise à jour » : on ne conclut pas
-            Write-Action 'WARN' 'Vérification impossible : la réponse de winget n''a pas pu être lue'
-            Write-Host '          Relance un scan pour contrôler.' -ForegroundColor DarkGray
-        }
-    }
-}
-if (@($script:StoreItems).Count -gt 0) {
-    Write-Host ('   [i] Applications du Microsoft Store concernées : ' + (Cut ((@($script:StoreItems) | ForEach-Object { $_.Name }) -join ', ') 80)) -ForegroundColor DarkGray
-    Write-Host '       Une application ouverte ne peut pas être mise à jour : ferme-les avant de valider.' -ForegroundColor DarkGray
-    if (Read-YesNo ("   >> Mettre à jour les {0} application(s) du Microsoft Store ?" -f @($script:StoreItems).Count)) {
-        Write-Host ''
-        Update-StoreApps
-    }
-}
-if ($script:WUCount -eq 0 -and $script:WUManual -gt 0) {
-    Write-Host ''
-    Write-Host ("   {0} mise(s) à jour Windows demandent une action à l'écran (souvent des pilotes de périphériques)." -f $script:WUManual) -ForegroundColor Cyan
-    if (Read-YesNo '   >> Ouvrir Windows Update avec le mode d''emploi ?') { Open-WindowsUpdateGuided }
-}
-if ($script:WUCount -gt 0) {
-    Write-Host ''
-    Write-Host ("   MISES À JOUR WINDOWS : {0} en attente" -f $script:WUCount) -ForegroundColor Cyan
-    $wkeys = @()
-    if ($isAdmin) {
-        Write-Host '   [1] Les installer maintenant avec J.A.R.V.I.S. (recommandé, tout est automatique)' -ForegroundColor Gray
-        $wkeys += '1'
-    }
-    Write-Host '   [2] Ouvrir Windows Update, avec le mode d''emploi' -ForegroundColor Gray
-    Write-Host '   [N] Plus tard' -ForegroundColor Gray
-    $wkeys += '2'; $wkeys += 'N'
-    $a = Read-Choice ('   >> Choix [' + ($wkeys -join '/') + '] (Entrée = N)') $wkeys 'N'
-    if ($a -eq '1' -and $isAdmin) { Install-WindowsUpdates }
-    elseif ($a -eq '2') { Open-WindowsUpdateGuided }
-}
-$cleanProp = Get-CleanProposal $script:CleanTargets $CleanMinBytes $isAdmin
-if (@($cleanProp.Items).Count -gt 0) {
-    Write-Host ''
-    $cpTxt = Format-Bytes $cleanProp.Bytes
-    if (@($cleanProp.Items | Where-Object { $_.Key -eq 'Components' }).Count -gt 0) { $cpTxt += ' + composants Windows' }
-    Write-Host ('   NETTOYAGE : ' + $cpTxt + ' récupérables') -ForegroundColor Cyan
-    Write-Host '   Suppressions définitives : une question par élément, réponse par défaut non.' -ForegroundColor DarkGray
-    foreach ($t in @($cleanProp.Items)) { Invoke-CleanTarget $t }
-}
-if ($script:WinOld) {
-    Write-Host ''
-    Write-Host '   [i] Windows.old : ancienne version de Windows, gardée pour pouvoir y revenir. J.A.R.V.I.S. n''y touche pas.' -ForegroundColor DarkGray
-    if (Read-YesNo '   >> Ouvrir Paramètres > Stockage pour le retirer toi-même ?') {
-        Write-Host '   Dans la fenêtre qui s''ouvre : Fichiers temporaires, coche « Installation(s) précédente(s) de Windows »,' -ForegroundColor Cyan
-        Write-Host '   puis « Supprimer les fichiers ». Après cela, revenir à la version précédente ne sera plus possible.' -ForegroundColor Cyan
-        try { Start-Process 'ms-settings:storagesense' -ErrorAction Stop }
-        catch { Write-Host '   [!] Ouverture impossible : Démarrer > Paramètres > Système > Stockage.' -ForegroundColor Yellow }
-    }
-}
-
-if ($repFile -and $script:Report.Count -gt $repMark) {
-    # Le rapport a été enregistré avant les actions : il est complété avec leur résultat
-    $script:Report.Insert($repMark, '== ACTIONS LANCÉES APRÈS LE SCAN ==')
-    $script:Report.Insert($repMark, '')
-    if (Update-Report $repFile ([string[]]$script:Report)) {
-        Write-Host '   >> Rapport complété avec le résultat des actions.' -ForegroundColor DarkGray
-    } else {
-        Write-Host '   [!] Rapport non complété : le résultat des actions n''y figure pas.' -ForegroundColor Yellow
-    }
-}
-if ($repFile) {
-    if (Read-YesNo '   >> Ouvrir le rapport ?') { Start-Process -FilePath (Get-SystemToolPath 'notepad.exe') -ArgumentList ('"{0}"' -f $repFile) }
-}
+# Actions proposées (rien n'est lancé sans accord) : questions d'abord, travail ensuite (v3.29)
+Invoke-EndOfScan $repFile
 
 $null = Set-NoSleep $false
 Write-Host ''

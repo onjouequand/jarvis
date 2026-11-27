@@ -89,7 +89,20 @@ foreach ($k in $envOver.Keys) { $psi.EnvironmentVariables[$k] = $envOver[$k] }
 foreach ($k in @('JARVIS_SELF', 'JARVIS_ARGS', 'JARVIS_RC')) { $psi.EnvironmentVariables.Remove($k) }
 # Mode source : fenêtre à part, pour que Clear-Host et l'agrandissement de la console ne touchent pas celle de l'appelant
 if ($Mode -eq 'source') { $psi.CreateNoWindow = $true }
+# v3.29 : l'entrée du programme est écrite dans l'encodage d'entrée de cette console. En UTF-8 avec marque (lancement
+# depuis une console PowerShell en UTF-8, relevé le 27/11/2026), .NET écrit la marque BOM dès le lancement : la
+# première question recevait ces trois octets au lieu de la fin de l'entrée. Depuis Git Bash (ibm850) et sur GitHub, pas de marque.
+# Encodage changé seulement s'il porte une marque (même page de code, UTF-8), puis remis juste après le lancement :
+# la console de l'appelant garde son réglage.
+$inEnc = $null
+try {
+    if ([Console]::InputEncoding.GetPreamble().Length -gt 0) {
+        $inEnc = [Console]::InputEncoding
+        [Console]::InputEncoding = New-Object Text.UTF8Encoding $false
+    }
+} catch { $null = $_ }
 $p = [Diagnostics.Process]::Start($psi)
+if ($inEnc) { try { [Console]::InputEncoding = $inEnc } catch { $null = $_ } }
 $outTask = $p.StandardOutput.ReadToEndAsync()
 $errTask = $p.StandardError.ReadToEndAsync()
 if ($stdin) { $p.StandardInput.Write($stdin) }
