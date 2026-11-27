@@ -1,6 +1,6 @@
 <# : JARVIS.cmd. Ne pas modifier ce texte
 @echo off
-rem JARVIS-SHA256=aeb13aa4af81d212897ef38a8dc84868d466374b288e216227a5ef330f5cee10
+rem JARVIS-SHA256=8a101a46f511594bc163ab79bcc3ef417f3fa659cbdb7700f3d698a1c0a4b829
 setlocal
 "%SystemRoot%\System32\chcp.com" 65001 >nul
 set "JARVIS_SELF=%~f0"
@@ -12,7 +12,7 @@ if "%JARVIS_RC%"=="4" pause
 exit /b %JARVIS_RC%
 #>
 <#
-    J.A.R.V.I.S. // Check-up système v3.27
+    J.A.R.V.I.S. // Check-up système v3.28
     -----------------------------------------------------------------
     Modules :
       [01] Système        : version Windows, uptime, redémarrage en attente
@@ -223,7 +223,7 @@ if (-not $PSCommandPath -and $env:JARVIS_SELF -and $env:JARVIS_ARGS) {
 # ------------------------------------------------------------------
 # Identité du programme et emplacement
 # ------------------------------------------------------------------
-$JarvisVersion = '3.27'
+$JarvisVersion = '3.28'
 $JarvisSelf = $env:JARVIS_SELF                     # défini par JARVIS.cmd
 if (-not $JarvisSelf) { $JarvisSelf = $PSCommandPath }  # lancement direct du .ps1
 $JarvisHome = $null
@@ -374,7 +374,7 @@ function Show-Banner {
         foreach ($l in $plain) { Write-Host $l -ForegroundColor Cyan; Pause-Ms 70 }
         Write-Host ''
         Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-        Write-Host '      module check-up v3.27' -ForegroundColor DarkGray
+        Write-Host '      module check-up v3.28' -ForegroundColor DarkGray
         Write-Host ''
         return
     }
@@ -394,7 +394,7 @@ function Show-Banner {
     }
     Write-Host ''
     Write-Host '      Just A Rather Very Intelligent System' -ForegroundColor DarkGray
-    Write-Host '      module check-up v3.27' -ForegroundColor DarkGray
+    Write-Host '      module check-up v3.28' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -3301,9 +3301,21 @@ function Get-CleanupTaskVerdict($State, $LastRun, $LastResult, $Deadline, [datet
 
 function Get-CleanupTaskState {
     # Lecture, sans droits admin, de la tâche de Windows qui nettoie les composants. State = $null : illisible.
+    return (Get-WinTaskState '\Microsoft\Windows\Servicing\' 'StartComponentCleanup')
+}
+
+function Get-OptimizeTaskState {
+    # v3.28 : tâche de Windows qui optimise les lecteurs (TRIM des SSD, défragmentation des disques durs), celle que
+    # règle « Défragmenter et optimiser les lecteurs > Exécution planifiée ». Relevé sur le PC de Thomas le
+    # 26/11/2026 : prête, dernier passage le 20/11/2026, résultat 0. Verdict par Get-CleanupTaskVerdict (T1).
+    return (Get-WinTaskState '\Microsoft\Windows\Defrag\' 'ScheduledDefrag')
+}
+
+function Get-WinTaskState([string]$TaskPath, [string]$TaskName) {
+    # Lecture, sans droits admin, d'une tâche planifiée de Windows. State = $null : illisible.
     $r = [pscustomobject]@{ State = $null; LastRun = $null; LastResult = $null; Deadline = $null; Period = $null }
     try {
-        $task = Get-ScheduledTask -TaskPath '\Microsoft\Windows\Servicing\' -TaskName 'StartComponentCleanup' -ErrorAction Stop
+        $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction Stop
         $ms = $task.Settings.MaintenanceSettings
         if ($ms -and $ms.Deadline) { $r.Deadline = [Xml.XmlConvert]::ToTimeSpan([string]$ms.Deadline) }
         if ($ms -and $ms.Period) { $r.Period = [Xml.XmlConvert]::ToTimeSpan([string]$ms.Period) }
@@ -4871,6 +4883,246 @@ function Get-RegValueSafe([string]$Path, [string]$Name) {
     return $r
 }
 
+# ------------------------------------------------------------------
+# Version de Windows encore maintenue ? (v3.28) Dates relues le 26/11/2026 sur les pages de Microsoft :
+# « Windows 11 release information » (révisée le 19/11/2026) et « lifecycle » de chaque produit (fin de 24H2
+# Famille/Pro : 13/10/2026). À relire à chaque montée de version (règle 13) : un an après AsOf, une version
+# encore maintenue dans la table devient « non vérifiable » plutôt qu'un OK donné de mémoire.
+# ------------------------------------------------------------------
+function Get-WindowsLifecycleTable {
+    # Dans une fonction et non dans une variable : les tests T1 n'ont pas les variables du programme.
+    # Home : éditions Famille et Pro ; Ent : Entreprise et Éducation. EsuEnd : fin du programme ESU grand public
+    # de Windows 10 (page « extended security updates » de Microsoft, relue le 26/11/2026).
+    $rows = @(
+        @(19045, 'Windows 10 22H2', '2025-10-14', '2025-10-14'),
+        @(22000, 'Windows 11 21H2', '2023-10-10', '2024-10-08'),
+        @(22621, 'Windows 11 22H2', '2024-10-08', '2025-10-14'),
+        @(22631, 'Windows 11 23H2', '2025-11-11', '2026-11-10'),
+        @(26100, 'Windows 11 24H2', '2026-10-13', '2027-10-12'),
+        @(26200, 'Windows 11 25H2', '2027-10-12', '2028-10-10'),
+        @(28000, 'Windows 11 26H1', '2028-03-14', '2029-03-13'),
+        @(26300, 'Windows 11 26H2', '2028-10-10', '2029-10-09')
+    )
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $list = foreach ($r in $rows) {
+        [pscustomobject]@{ Build = [int]$r[0]; Name = [string]$r[1]
+                           Home = [datetime]::ParseExact($r[2], 'yyyy-MM-dd', $inv)
+                           Ent = [datetime]::ParseExact($r[3], 'yyyy-MM-dd', $inv) }
+    }
+    return [pscustomobject]@{
+        AsOf = [datetime]::ParseExact('2026-11-19', 'yyyy-MM-dd', $inv)
+        EsuEnd = [datetime]::ParseExact('2027-10-12', 'yyyy-MM-dd', $inv)
+        Rows = @($list)
+    }
+}
+
+function Get-WindowsEditionFamily($EditionId) {
+    # Famille de l'édition (valeur EditionID du registre), qui fixe le calendrier des correctifs. HOME : Famille et
+    # Pro ; ENT : Entreprise et Éducation ; OTHER : LTSC (calendrier de 5 ou 10 ans), Windows Server, édition
+    # inconnue : JARVIS ne juge pas. Fonction pure, T1.
+    $e = ([string]$EditionId).Trim()
+    if ($e -eq '') { return 'OTHER' }
+    if ($e -match '^(Enterprise|IoTEnterprise)S') { return 'OTHER' }
+    if ($e -match '^Server') { return 'OTHER' }
+    if ($e -match '^(Core|Professional)') { return 'HOME' }
+    if ($e -match '^(Enterprise|Education|IoTEnterprise)') { return 'ENT' }
+    return 'OTHER'
+}
+
+function Get-WindowsSupportVerdict($Build, $EditionId, [datetime]$Now) {
+    # Cette version de Windows reçoit-elle encore ses correctifs de sécurité ? Jugé sur le numéro de build et
+    # l'édition, jamais sur ProductName (relevé du 26/11/2026 : « Windows 10 Pro » sur un Windows 11 26H2).
+    # Rend { State ; Text ; Subs ; Kind ; IsWin10 }. Kind : ENDED (WARN), SOON (moins de 90 jours, INFO), OK,
+    # UNKNOWN (INFO « non vérifiable » : build ou édition hors table, table de plus d'un an). Un état inconnu n'est
+    # jamais un avertissement (règle 15). Le dernier jour de service compte encore. Fonction pure, T1.
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $r = [pscustomobject]@{ State = 'INFO'; Text = ''; Subs = @(); Kind = 'UNKNOWN'; IsWin10 = $false }
+    $b = ConvertTo-IntOrNull $Build
+    if ($null -eq $b -or $b -lt 10240) {
+        $r.Text = 'non vérifiable (numéro de version de Windows illisible)'
+        return $r
+    }
+    $fam = Get-WindowsEditionFamily $EditionId
+    if ($fam -eq 'OTHER') {
+        $ed = ([string]$EditionId).Trim()
+        if ($ed -eq '') { $ed = 'inconnue' }
+        $r.Text = ('non vérifiable (édition {0} : calendrier particulier)' -f $ed)
+        return $r
+    }
+    $tab = Get-WindowsLifecycleTable
+    $stale = ($Now -gt $tab.AsOf.AddDays(365))
+    if ($b -lt 22000) {
+        # Windows 10 : toutes les versions sont terminées, la dernière (22H2, build 19045) le 14/10/2025
+        $r.IsWin10 = $true
+        $r.Kind = 'ENDED'
+        $r.State = 'WARN'
+        if ($b -lt 19045) {
+            $r.Text = 'terminés (ancienne version de Windows 10)'
+            $r.Subs = @('Windows ne reçoit plus aucun correctif de sécurité dans cette version.',
+                        'Paramètres > Mise à jour et sécurité > Windows Update : installe tout ce qui est proposé,',
+                        'jusqu''à la version 22H2 de Windows 10, puis relance J.A.R.V.I.S.')
+            return $r
+        }
+        $r.Text = 'terminés le 14/10/2025 (Windows 10)'
+        if ($Now.Date -le $tab.EsuEnd) {
+            $r.Subs = @(('Microsoft en fournit encore jusqu''au {0} aux PC inscrits à son programme ESU' -f $tab.EsuEnd.ToString('dd/MM/yyyy', $inv)),
+                        '(gratuit avec un compte Microsoft) : Paramètres > Mise à jour et sécurité > Windows Update,',
+                        'lien d''inscription aux mises à jour de sécurité étendues. J.A.R.V.I.S. ne sait pas lire si c''est fait.',
+                        'Ensuite, le passage à Windows 11 : voir la ligne « Passage à Windows 11 » en section 06.')
+        } else {
+            $r.Subs = @('Windows 10 ne reçoit plus aucun correctif de sécurité, même par le programme ESU.',
+                        'Passage à Windows 11 conseillé si le matériel le permet (ligne « Passage à Windows 11 » en section 06).')
+        }
+        return $r
+    }
+    $row = $null
+    foreach ($x in @($tab.Rows)) { if ($x.Build -eq $b) { $row = $x } }
+    if ($null -eq $row) {
+        $r.Text = ('non vérifiable (version {0} inconnue de J.A.R.V.I.S. : mets-le à jour)' -f $b)
+        return $r
+    }
+    $end = $row.Home
+    if ($fam -eq 'ENT') { $end = $row.Ent }
+    $endTxt = $end.ToString('dd/MM/yyyy', $inv)
+    if ($Now.Date -gt $end) {
+        $r.Kind = 'ENDED'
+        $r.State = 'WARN'
+        $r.Text = ('terminés le {0} ({1})' -f $endTxt, $row.Name)
+        $r.Subs = @('Cette version de Windows 11 ne reçoit plus de correctifs de sécurité.',
+                    'Paramètres > Windows Update : installe la mise à jour de version proposée (« Windows 11, version ... »).',
+                    'Si rien n''est proposé : installe d''abord les mises à jour en attente, redémarre, puis regarde à nouveau.')
+        return $r
+    }
+    if ($stale) {
+        $r.Text = 'non vérifiable (dates de J.A.R.V.I.S. trop anciennes : mets-le à jour)'
+        return $r
+    }
+    $left = [int][math]::Floor(($end - $Now.Date).TotalDays)
+    if ($left -le 90) {
+        $r.Kind = 'SOON'
+        $r.Text = ('assurés jusqu''au {0} seulement ({1}, encore {2} j)' -f $endTxt, $row.Name, $left)
+        $r.Subs = @('Paramètres > Windows Update : installe la mise à jour de version dès qu''elle est proposée.')
+        return $r
+    }
+    $r.Kind = 'OK'
+    $r.State = 'OK'
+    $r.Text = ('assurés jusqu''au {0} ({1})' -f $endTxt, $row.Name)
+    return $r
+}
+
+function Get-Win11ReadinessVerdict($TpmPresent, $TpmSpec, $SecureBoot, $RamBytes, $SysVolBytes, $Is64) {
+    # PC sous Windows 10 : ce qui s'oppose au passage à Windows 11, dans ce que JARVIS sait lire (puce TPM 2.0,
+    # Secure Boot, 4 Go de mémoire, 64 Go de disque, Windows 64 bits ; page « Windows 11 requirements » de Microsoft).
+    # Le processeur n'est pas contrôlé (liste de modèles tenue par Microsoft) : jamais « compatible » tout court.
+    # Une valeur $null = non lue. Seuils un peu sous l'exigence : Windows annonce 3,9 Go pour 4 Go installés, et le
+    # volume système d'un disque de 64 Go fait environ 57 Go. Toujours INFO (l'avertissement est celui de la
+    # section 01). Rend { State ; Text ; Subs ; Kind } avec Kind : BLOCKED, PARTIAL, CLEAR. Fonction pure, T1.
+    $block = @(); $unk = @()
+    if ($null -eq $Is64) { $unk += 'type de Windows' }
+    elseif (-not $Is64) { $block += 'Windows 10 en 32 bits (une réinstallation complète serait nécessaire)' }
+    if ($null -eq $RamBytes) { $unk += 'mémoire' }
+    elseif ([double]$RamBytes -lt 3.5GB) { $block += ('mémoire de {0} Go (4 Go exigés)' -f [int][math]::Round([double]$RamBytes / 1GB)) }
+    if ($null -eq $SysVolBytes) { $unk += 'disque' }
+    elseif ([double]$SysVolBytes -lt 50GB) { $block += ('disque système de {0} Go (64 Go exigés)' -f [int][math]::Round([double]$SysVolBytes / 1GB)) }
+    if ($null -eq $TpmPresent) { $unk += 'puce TPM' }
+    elseif (-not $TpmPresent) { $block += 'puce de sécurité (TPM) absente ou désactivée dans le BIOS' }
+    elseif (([string]$TpmSpec) -match '^\s*(\d+)\.(\d+)') {
+        if ([int]$Matches[1] -lt 2) { $block += ('puce de sécurité (TPM) en version {0}.{1} (2.0 exigée)' -f $Matches[1], $Matches[2]) }
+    } else { $unk += 'version de la puce TPM' }
+    if ($null -eq $SecureBoot) { $unk += 'Secure Boot' }
+    elseif (-not $SecureBoot) { $block += 'démarrage sécurisé (Secure Boot) désactivé : il s''active dans le BIOS' }
+    $tool = 'Verdict complet : menu Démarrer, tape « Contrôle d''intégrité du PC » (outil de Microsoft) > Vérifier maintenant.'
+    $r = [pscustomobject]@{ State = 'INFO'; Text = ''; Subs = @(); Kind = 'CLEAR' }
+    if ($block.Count -gt 0) {
+        $r.Kind = 'BLOCKED'
+        $r.Text = ('{0} obstacle(s) vu(s)' -f $block.Count)
+        $r.Subs = @($block) + @($tool)
+    } elseif ($unk.Count -gt 0) {
+        $r.Kind = 'PARTIAL'
+        $r.Text = ('non vérifiable en entier (non lu : {0})' -f ($unk -join ', '))
+        $r.Subs = @($tool)
+    } else {
+        $r.Text = 'aucun obstacle vu (processeur non contrôlé)'
+        $r.Subs = @($tool, 'S''il confirme : Paramètres > Mise à jour et sécurité > Windows Update propose Windows 11.')
+    }
+    return $r
+}
+
+function Get-SecureBootCertVerdict($SecureBootOn, $KeyRead, $Status, $ErrorCode) {
+    # Certificats du démarrage sécurisé (v3.28). Ceux de 2011 ont expiré en 2026 (24/06, 27/06 et 19/10, article
+    # 5062710 du support Microsoft) ; Windows Update pose ceux de 2023 et note l'avancement dans
+    # HKLM\SYSTEM\CurrentControlSet\Control\SecureBoot\Servicing : UEFICA2023Status = NotStarted, InProgress ou
+    # Updated, UEFICA2023Error = code du dernier échec. Relevé sur le PC de Thomas le 26/11/2026 : « Updated ».
+    # Lecture seule : JARVIS n'écrit jamais dans cette clé (une pose ratée peut empêcher le PC de démarrer).
+    # $null si Secure Boot n'est pas actif (rien à dire). Rend { State ; Text ; Subs }. Fonction pure, T1.
+    if ($SecureBootOn -isnot [bool] -or -not $SecureBootOn) { return $null }
+    $r = [pscustomobject]@{ State = 'INFO'; Text = ''; Subs = @() }
+    if (-not $KeyRead) { $r.Text = 'lecture impossible'; return $r }
+    $s = ([string]$Status).Trim()
+    if ($s -eq '') {
+        $r.Text = 'non vérifiable (information absente de ce Windows)'
+        $r.Subs = @('Les mises à jour de Windows apportent ces certificats : installe celles qui sont en attente.')
+        return $r
+    }
+    if ($s -match '^Updated$') { $r.State = 'OK'; $r.Text = 'à jour (certificats de 2023)'; return $r }
+    $bios = 'Si la ligne revient après plusieurs semaines : mets à jour le BIOS (lien du fabricant en section 12).'
+    $code = $null
+    if ($null -ne $ErrorCode) { try { $code = [int64]$ErrorCode } catch { $code = $null } }
+    if ($null -ne $code -and $code -lt 0) { $code += 4294967296 }
+    if ($s -match '^(InProgress|NotStarted)$' -and $null -ne $code -and $code -ne 0) {
+        $r.State = 'WARN'
+        $r.Text = ('mise à jour en échec (code 0x{0:X8})' -f $code)
+        $r.Subs = @('Le PC démarre normalement, mais son démarrage sécurisé ne reçoit plus de nouvelles protections.',
+                    'Installe toutes les mises à jour Windows, redémarre deux fois, puis relance le scan.', $bios)
+        return $r
+    }
+    if ($s -match '^InProgress$') {
+        $r.Text = 'mise à jour en cours'
+        $r.Subs = @('Windows la termine seul en un ou deux redémarrages. Rien d''autre à faire.')
+        return $r
+    }
+    if ($s -match '^NotStarted$') {
+        $r.State = 'WARN'
+        $r.Text = 'anciens (ceux de 2011 ont expiré en 2026)'
+        $r.Subs = @('Le PC démarre normalement, mais son démarrage sécurisé ne reçoit plus de nouvelles protections.',
+                    'Installe toutes les mises à jour Windows puis redémarre : Windows pose les nouveaux certificats seul.', $bios)
+        return $r
+    }
+    $r.Text = ('état non reconnu ({0})' -f $s)
+    return $r
+}
+
+function Get-PuaVerdict($Value) {
+    # Blocage des applications potentiellement indésirables de Defender (Get-MpPreference.PUAProtection) :
+    # 0 = désactivé, 1 = actif, 2 = audit. Relevé sur le PC de Thomas le 26/11/2026 : 1. Fonction pure, T1.
+    $n = ConvertTo-IntOrNull $Value
+    if ($null -eq $n) { return 'UNKNOWN' }
+    switch ($n) {
+        0 { return 'OFF' }
+        1 { return 'ON' }
+        2 { return 'AUDIT' }
+    }
+    return 'UNKNOWN'
+}
+
+function Get-StorageSenseVerdict($Policy, $User) {
+    # Assistant de stockage de Windows (Paramètres > Système > Stockage). La stratégie l'emporte
+    # (HKLM\SOFTWARE\Policies\Microsoft\Windows\StorageSense, AllowStorageSenseGlobal : 0 ou 1), puis le réglage du
+    # compte (HKCU\...\StorageSense\Parameters\StoragePolicy, valeur « 01 » : 1 = activé). Valeur absente = jamais
+    # réglé, donc éteint (réglage d'origine de Windows). Relevé sur le PC de Thomas le 26/11/2026 : 01 = 1.
+    # ON, OFF, DEFAULT (jamais réglé) ou UNKNOWN. Fonction pure, T1.
+    $p = ConvertTo-IntOrNull $Policy
+    if ($null -ne $p) {
+        if ($p -eq 0) { return 'OFF' }
+        return 'ON'
+    }
+    if ($null -eq $User) { return 'DEFAULT' }
+    $u = ConvertTo-IntOrNull $User
+    if ($null -eq $u) { return 'UNKNOWN' }
+    if ($u -ne 0) { return 'ON' }
+    return 'OFF'
+}
+
 function Get-TimeSyncMode($Value) {
     # « Régler l'heure automatiquement » (Paramètres > Heure et langue) : valeur Type de W32Time\Parameters.
     # AUTO : NTP (PC seul), NT5DS (domaine), AllSync. OFF : NoSync (réglage coupé). Fonction pure, testée en T1.
@@ -5570,6 +5822,146 @@ function Invoke-SelfTestAnalyzers {
             Assert-True ((Test-ClockManualFix $m[0] $m[1] $m[2]) -eq $m[3]) ('écart {0} s, limites {1}/{2} : mal jugé' -f $m[0], $m[1], $m[2])
         }
         '30/30 cas'
+    }
+    Test-Case 'Windows : fin des correctifs selon la version et l''édition' {
+        # Dates des pages Microsoft relues le 26/11/2026 ; jugé ce jour-là
+        $now = [datetime]'2026-11-26'
+        $n = 0
+        $cases = @(
+            @(26300, 'Professional', 'OK', 'OK', '10/10/2028'),
+            @('26300', 'CoreSingleLanguage', 'OK', 'OK', '10/10/2028'),
+            @(26200, 'Core', 'OK', 'OK', '12/10/2027'),
+            @(28000, 'Core', 'OK', 'OK', '14/03/2028'),
+            @(26100, 'Core', 'WARN', 'ENDED', '13/10/2026'),
+            @(26100, 'Professional', 'WARN', 'ENDED', '13/10/2026'),
+            @(26100, 'Enterprise', 'OK', 'OK', '12/10/2027'),
+            @(22631, 'ProfessionalWorkstation', 'WARN', 'ENDED', '11/11/2025'),
+            @(22631, 'Education', 'WARN', 'ENDED', '10/11/2026'),
+            @(22621, 'Enterprise', 'WARN', 'ENDED', '14/10/2025'),
+            @(22000, 'Core', 'WARN', 'ENDED', '10/10/2023'),
+            @(19045, 'Professional', 'WARN', 'ENDED', '14/10/2025')
+        )
+        foreach ($c in $cases) {
+            $v = Get-WindowsSupportVerdict $c[0] $c[1] $now
+            Assert-True ($v.State -eq $c[2] -and $v.Kind -eq $c[3] -and $v.Text -like ('*' + $c[4] + '*')) ('build {0} {1} : {2} {3} « {4} »' -f $c[0], $c[1], $v.State, $v.Kind, $v.Text)
+            # Règle 14 : un avertissement a son geste juste dessous
+            if ($v.State -eq 'WARN') { Assert-True (@($v.Subs).Count -gt 0) ('build {0} : avertissement sans geste' -f $c[0]) }
+            Assert-True ($v.IsWin10 -eq ($c[0] -eq 19045)) ('build {0} : Windows 10 mal reconnu' -f $c[0])
+            $n++
+        }
+        # Windows 10 : le programme ESU est cité tant qu'il court, plus après
+        $v = Get-WindowsSupportVerdict 19045 'Core' $now
+        Assert-True ((@($v.Subs) -join ' ') -like '*12/10/2027*') 'Windows 10 : date de fin du programme ESU absente'; $n++
+        $v = Get-WindowsSupportVerdict 19045 'Core' ([datetime]'2027-10-13')
+        Assert-True ($v.State -eq 'WARN' -and (@($v.Subs) -join ' ') -notlike '*12/10/2027*') 'Windows 10 : programme ESU encore conseillé après sa fin'; $n++
+        $v = Get-WindowsSupportVerdict 19044 'Core' $now
+        Assert-True ($v.State -eq 'WARN' -and $v.IsWin10 -and (@($v.Subs) -join ' ') -like '*22H2*') 'ancienne version de Windows 10 : pas de renvoi vers la 22H2'; $n++
+        # Inconnu = « non vérifiable », jamais un avertissement ni un OK (règle 15)
+        $unk = @(@(27000, 'Professional'), @(26300, 'EnterpriseS'), @(19044, 'EnterpriseS'), @(20348, 'ServerDatacenter'),
+                 @(26100, 'ServerStandard'), @($null, 'Core'), @('abc', 'Core'), @(9600, 'Core'), @(26300, $null), @(26300, ''), @(26300, 'Autre'))
+        foreach ($c in $unk) {
+            $v = Get-WindowsSupportVerdict $c[0] $c[1] $now
+            Assert-True ($v.State -eq 'INFO' -and $v.Kind -eq 'UNKNOWN' -and -not $v.IsWin10 -and (Test-UnreadValue $v.Text)) ('build « {0} » édition « {1} » : {2} « {3} »' -f $c[0], $c[1], $v.State, $v.Text)
+            $n++
+        }
+        # Le dernier jour de service compte encore ; le lendemain, c'est terminé
+        $v = Get-WindowsSupportVerdict 26100 'Core' ([datetime]'2026-10-13 23:00')
+        Assert-True ($v.Kind -eq 'SOON' -and $v.State -eq 'INFO') ('dernier jour de 24H2 : ' + $v.Kind); $n++
+        $v = Get-WindowsSupportVerdict 26100 'Core' ([datetime]'2026-10-14 00:30')
+        Assert-True ($v.Kind -eq 'ENDED') ('lendemain de la fin de 24H2 : ' + $v.Kind); $n++
+        # Fin proche : information, qui ne part pas sous « Non vérifié »
+        $v = Get-WindowsSupportVerdict 26200 'Core' ([datetime]'2027-08-01')
+        Assert-True ($v.Kind -eq 'SOON' -and $v.Text -like '*encore 72 j*' -and -not (Test-UnreadValue $v.Text)) ('25H2 au 01/08/2027 : ' + $v.Text); $n++
+        $v = Get-WindowsSupportVerdict 26200 'Core' ([datetime]'2027-07-13')
+        Assert-True ($v.Kind -eq 'OK') ('25H2 à 91 jours de sa fin : ' + $v.Kind); $n++
+        # Table de plus d'un an : plus de OK donné de mémoire, mais une fin déjà passée reste une fin
+        $v = Get-WindowsSupportVerdict 26300 'Professional' ([datetime]'2027-11-20')
+        Assert-True ($v.Kind -eq 'UNKNOWN' -and $v.State -eq 'INFO' -and (Test-UnreadValue $v.Text)) ('table périmée : ' + $v.Text); $n++
+        $v = Get-WindowsSupportVerdict 26100 'Core' ([datetime]'2028-03-01')
+        Assert-True ($v.Kind -eq 'ENDED') 'table périmée : fin de 24H2 oubliée'; $n++
+        foreach ($p in @(@('Core', 'HOME'), @('CoreN', 'HOME'), @('Professional', 'HOME'), @('ProfessionalEducation', 'HOME'),
+                         @('Enterprise', 'ENT'), @('Education', 'ENT'), @('IoTEnterprise', 'ENT'), @('EnterpriseS', 'OTHER'),
+                         @('IoTEnterpriseS', 'OTHER'), @('ServerDatacenter', 'OTHER'), @(' professional ', 'HOME'), @($null, 'OTHER'))) {
+            Assert-True ((Get-WindowsEditionFamily $p[0]) -eq $p[1]) ('édition « {0} » mal classée' -f $p[0])
+            $n++
+        }
+        ('{0}/{0} cas' -f $n)
+    }
+    Test-Case 'Windows 10 : obstacles au passage à Windows 11' {
+        $n = 0
+        $v = Get-Win11ReadinessVerdict $true '2.0, 0, 1.59' $true 16GB 475GB $true
+        Assert-True ($v.Kind -eq 'CLEAR' -and $v.State -eq 'INFO' -and $v.Text -like '*processeur non contrôlé*' -and -not (Test-UnreadValue $v.Text)) ('PC conforme : ' + $v.Text); $n++
+        # 4 Go installés = 3,9 Go annoncés ; disque de 64 Go = volume système d'environ 57 Go
+        $v = Get-Win11ReadinessVerdict $true '2.0' $true (3.9GB) (57GB) $true
+        Assert-True ($v.Kind -eq 'CLEAR') ('4 Go et 64 Go réels refusés : ' + (@($v.Subs) -join ' | ')); $n++
+        $cases = @(
+            @($false, $null, $true, 16GB, 475GB, $true, 'TPM'),
+            @($true, '1.2, 2, 3', $true, 16GB, 475GB, $true, '1.2'),
+            @($true, '2.0', $false, 16GB, 475GB, $true, 'Secure Boot'),
+            @($true, '2.0', $true, 2GB, 475GB, $true, 'mémoire de 2 Go'),
+            @($true, '2.0', $true, 16GB, 30GB, $true, 'disque système de 30 Go'),
+            @($true, '2.0', $true, 16GB, 475GB, $false, '32 bits')
+        )
+        foreach ($c in $cases) {
+            $v = Get-Win11ReadinessVerdict $c[0] $c[1] $c[2] $c[3] $c[4] $c[5]
+            Assert-True ($v.Kind -eq 'BLOCKED' -and $v.State -eq 'INFO' -and $v.Text -eq '1 obstacle(s) vu(s)' -and (@($v.Subs) -join ' ') -like ('*' + $c[6] + '*')) ('obstacle « {0} » : {1} / {2}' -f $c[6], $v.Text, (@($v.Subs) -join ' | '))
+            $n++
+        }
+        $v = Get-Win11ReadinessVerdict $false $null $false 2GB 30GB $true
+        Assert-True ($v.Text -eq '4 obstacle(s) vu(s)' -and @($v.Subs).Count -eq 5) ('quatre obstacles : ' + $v.Text); $n++
+        # Une lecture manquante ne vaut jamais « aucun obstacle » ; un obstacle vu reste dit
+        $v = Get-Win11ReadinessVerdict $null $null $null 16GB 475GB $true
+        Assert-True ($v.Kind -eq 'PARTIAL' -and (Test-UnreadValue $v.Text) -and $v.Text -like '*puce TPM*' -and $v.Text -like '*Secure Boot*') ('lectures manquantes : ' + $v.Text); $n++
+        $v = Get-Win11ReadinessVerdict $true $null $true 16GB 475GB $true
+        Assert-True ($v.Kind -eq 'PARTIAL' -and $v.Text -like '*version de la puce TPM*') ('version de TPM non lue : ' + $v.Text); $n++
+        $v = Get-Win11ReadinessVerdict $null $null $null $null $null $null
+        Assert-True ($v.Kind -eq 'PARTIAL') ('rien de lu : ' + $v.Kind); $n++
+        $v = Get-Win11ReadinessVerdict $null $null $true 2GB 475GB $true
+        Assert-True ($v.Kind -eq 'BLOCKED') ('obstacle et lecture manquante : ' + $v.Kind); $n++
+        ('{0}/{0} cas' -f $n)
+    }
+    Test-Case 'Réglages de Windows : certificats Secure Boot, applications indésirables, Assistant de stockage' {
+        $n = 0
+        # Relevé du 26/11/2026 sur le PC de Thomas : Status = « Updated », valeur d'erreur absente
+        $v = Get-SecureBootCertVerdict $true $true 'Updated' $null
+        Assert-True ($v.State -eq 'OK') ('relevé réel : ' + $v.Text); $n++
+        $cases = @(
+            @($true, $true, ' updated ', 0, 'OK', $false),
+            @($true, $true, 'Updated', 5, 'OK', $false),
+            @($true, $true, 'InProgress', 0, 'INFO', $false),
+            @($true, $true, 'InProgress', $null, 'INFO', $false),
+            @($true, $true, 'NotStarted', 0, 'WARN', $false),
+            @($true, $true, 'NotStarted', $null, 'WARN', $false),
+            @($true, $true, 'InProgress', -2147024891, 'WARN', $false),
+            @($true, $true, $null, $null, 'INFO', $true),
+            @($true, $true, '', 0, 'INFO', $true),
+            @($true, $false, 'Updated', 0, 'INFO', $true),
+            @($true, $true, 'Autre', 0, 'INFO', $true)
+        )
+        foreach ($c in $cases) {
+            $v = Get-SecureBootCertVerdict $c[0] $c[1] $c[2] $c[3]
+            Assert-True ($null -ne $v -and $v.State -eq $c[4] -and (Test-UnreadValue $v.Text) -eq $c[5]) ('état « {0} » erreur « {1} » : {2} « {3} »' -f $c[2], $c[3], $v.State, $v.Text)
+            if ($v.State -eq 'WARN') { Assert-True (@($v.Subs).Count -gt 0) ('état « {0} » : avertissement sans geste' -f $c[2]) }
+            $n++
+        }
+        $v = Get-SecureBootCertVerdict $true $true 'InProgress' (-2147024891)
+        Assert-True ($v.Text -like '*0x80070005*') ('code d''erreur mal écrit : ' + $v.Text); $n++
+        # Secure Boot coupé ou non lu : aucune ligne
+        foreach ($sb in @($false, $null, 'True', 1)) {
+            Assert-True ($null -eq (Get-SecureBootCertVerdict $sb $true 'NotStarted' 0)) ('Secure Boot « {0} » : ligne affichée' -f $sb)
+            $n++
+        }
+        foreach ($p in @(@(1, 'ON'), @(0, 'OFF'), @(2, 'AUDIT'), @('1', 'ON'), @([byte]1, 'ON'), @($null, 'UNKNOWN'), @(7, 'UNKNOWN'), @('x', 'UNKNOWN'))) {
+            Assert-True ((Get-PuaVerdict $p[0]) -eq $p[1]) ('applications indésirables « {0} » mal lu' -f $p[0])
+            $n++
+        }
+        # Assistant de stockage : la stratégie l'emporte ; jamais réglé = éteint (DEFAULT), valeur illisible = UNKNOWN
+        foreach ($p in @(@($null, 1, 'ON'), @($null, 0, 'OFF'), @($null, $null, 'DEFAULT'), @(0, 1, 'OFF'), @(1, 0, 'ON'),
+                         @(1, $null, 'ON'), @($null, 'x', 'UNKNOWN'), @($null, '1', 'ON'))) {
+            Assert-True ((Get-StorageSenseVerdict $p[0] $p[1]) -eq $p[2]) ('Assistant de stockage, stratégie « {0} » compte « {1} » : mal lu' -f $p[0], $p[1])
+            $n++
+        }
+        ('{0}/{0} cas' -f $n)
     }
     Test-Case 'Premier plan : structure FLASHWINFO (32 et 64 bits)' {
         Assert-True (Initialize-NativeFocus) 'fonctions de Windows non chargées'
@@ -7080,6 +7472,19 @@ function Invoke-SelfTest {
         if ($null -ne $s.Period) { $per = '{0:N0} j' -f $s.Period.TotalDays }
         ('{0}, dernier passage {1}, période {2}' -f $v, (Format-Date $s.LastRun), $per)
     }
+    Test-Case 'Version de Windows : fin des correctifs lue sur ce PC' {
+        # v3.28. Une version absente de la table (plus récente que ce JARVIS) n'est pas un échec : lecture impossible.
+        $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
+        $v = Get-WindowsSupportVerdict $cv.CurrentBuild $cv.EditionID (Get-Date)
+        if ($v.Kind -eq 'UNKNOWN') { return ('UNREAD:build {0}, édition {1} : {2}' -f $cv.CurrentBuild, $cv.EditionID, $v.Text) }
+        ('build {0}, édition {1} : {2}' -f $cv.CurrentBuild, $cv.EditionID, $v.Text)
+    }
+    Test-Case 'Disques : tâche d''optimisation de Windows lisible' {
+        $s = Get-OptimizeTaskState
+        $v = Get-CleanupTaskVerdict $s.State $s.LastRun $s.LastResult ([TimeSpan]::FromDays(35)) (Get-Date)
+        if ($v -eq 'UNKNOWN') { return 'UNREAD:tâche ScheduledDefrag de Windows illisible' }
+        ('{0}, dernier passage {1}' -f $v, (Format-Date $s.LastRun))
+    }
     Test-Case 'Composants Windows : analyse réelle' {
         # Le scan complet ne lance cette analyse que si Windows ne nettoie plus lui-même ses composants : l'auto-test
         # fait de même. Elle prenait 154 s sur 177 de l'auto-test du PC de Thomas (20/11/2026) et plus de 6 min sur
@@ -7898,10 +8303,10 @@ $os = Get-CimInstance Win32_OperatingSystem
 $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 Write-Status 'Système' ('{0} {1}' -f $os.Caption, $cv.DisplayVersion) 'INFO'
 Write-Status 'Numéro de version (build)' ('{0}.{1}' -f $cv.CurrentBuild, $cv.UBR) 'INFO'
-if ($cv -and $cv.CurrentBuild -and [int]$cv.CurrentBuild -lt 22000) {
-    Write-Status 'Support Windows 10' 'terminé le 14/10/2025 (sauf abonnement ESU)' 'WARN'
-    Write-Sub 'Passage à Windows 11 conseillé si le matériel est compatible'
-}
+# v3.28 : fin des correctifs selon la version exacte et l'édition (avant : Windows 10 seulement, texte figé)
+$winSup = Get-WindowsSupportVerdict $cv.CurrentBuild $cv.EditionID (Get-Date)
+Write-Status 'Correctifs de sécurité Windows' $winSup.Text $winSup.State
+foreach ($l in @($winSup.Subs)) { Write-Sub $l }
 $isLaptop = [bool](Get-CimInstance Win32_Battery)
 $typeTxt = 'PC fixe'
 if ($isLaptop) { $typeTxt = 'PC portable' }
@@ -8667,6 +9072,22 @@ if ($mp -and -not $mp.RealTimeProtectionEnabled -and $avOther.Count -gt 0) {
             Write-Status 'Accès contrôlé : exceptions' 'non lues (liste visible seulement en administrateur)' 'INFO'
         }
     }
+    if ($mp.AntivirusEnabled) {
+        # v3.28 : blocage des applications indésirables (logiciels publicitaires, programmes ajoutés par un installeur)
+        $pua = 'UNKNOWN'
+        if ($mpPref) { $pua = Get-PuaVerdict $mpPref.PUAProtection }
+        switch ($pua) {
+            'ON'    { Write-Status 'Blocage des applis indésirables' 'actif' 'OK' }
+            'AUDIT' { Write-Status 'Blocage des applis indésirables' 'mode audit (note sans rien bloquer)' 'INFO' }
+            'OFF'   {
+                Write-Status 'Blocage des applis indésirables' 'désactivé' 'WARN'
+                Write-Sub 'Arrête les logiciels publicitaires et les programmes ajoutés en douce par certains installeurs. À activer :'
+                Write-Sub 'Sécurité Windows > Contrôle des applications et du navigateur > Protection fondée sur la réputation >'
+                Write-Sub '« Blocage des applications potentiellement indésirables ».'
+            }
+            default { Write-Status 'Blocage des applis indésirables' 'lecture impossible' 'INFO' }
+        }
+    }
     # L'analyse rapide n'est proposée en fin de scan que si Defender est bien l'antivirus en service
     $script:DefenderScan = [bool]$mp.AntivirusEnabled
 } elseif ($avOther.Count -gt 0) {
@@ -8727,8 +9148,10 @@ Write-Status 'Pare-feu' $fv.Text $fv.Level
 foreach ($fwSub in @($fv.Subs)) { Write-Sub $fwSub }
 
 if ($isAdmin) {
+    $sbOn = $null
     try {
         $sb = Confirm-SecureBootUEFI -ErrorAction Stop
+        $sbOn = [bool]$sb
         if ($sb) { Write-Status 'Démarrage sécurisé (Secure Boot)' 'actif' 'OK' }
         else {
             Write-Status 'Démarrage sécurisé (Secure Boot)' 'désactivé' 'WARN'
@@ -8736,6 +9159,15 @@ if ($isAdmin) {
             Write-Sub 'Pas urgent. Jamais allé dans le BIOS ? Fais-toi aider : un mauvais réglage peut empêcher Windows de démarrer'
         }
     } catch { Write-Status 'Démarrage sécurisé (Secure Boot)' 'non vérifiable (BIOS ancien ?)' 'INFO' }
+    # v3.28 : certificats de 2023 du démarrage sécurisé (ceux de 2011 ont expiré en 2026), lecture seule
+    $sbKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\Servicing'
+    $sbSt = Get-RegValueSafe $sbKey 'UEFICA2023Status'
+    $sbErr = Get-RegValueSafe $sbKey 'UEFICA2023Error'
+    $sbCert = Get-SecureBootCertVerdict $sbOn ($sbSt.Ok -or $sbSt.Missing) $sbSt.Value $sbErr.Value
+    if ($null -ne $sbCert) {
+        Write-Status 'Certificats Secure Boot (2023)' $sbCert.Text $sbCert.State
+        foreach ($l in @($sbCert.Subs)) { Write-Sub $l }
+    }
 
     $tpm = Get-Tpm
     if ($tpm) {
@@ -8752,6 +9184,24 @@ if ($isAdmin) {
         }
     } else {
         Write-Status 'Puce de sécurité (TPM)' 'lecture impossible' 'INFO'
+    }
+    if ($winSup.IsWin10) {
+        # v3.28 : PC sous Windows 10, ce qui s'oppose au passage à Windows 11 dans ce que JARVIS sait lire
+        $w11Tpm = $null; $w11Spec = $null
+        if ($tpm) {
+            $w11Tpm = [bool]$tpm.TpmPresent
+            $tpmWmi = Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftTpm' -ClassName Win32_Tpm
+            if ($tpmWmi) { $w11Spec = [string]@($tpmWmi)[0].SpecVersion }
+        }
+        $w11Ram = $null
+        $w11Cs = Get-CimInstance Win32_ComputerSystem
+        if ($w11Cs -and $w11Cs.TotalPhysicalMemory) { $w11Ram = [double]$w11Cs.TotalPhysicalMemory }
+        $w11Vol = $null
+        $w11Ld = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $SysDrive)
+        if ($w11Ld -and $w11Ld.Size) { $w11Vol = [double]$w11Ld.Size }
+        $w11 = Get-Win11ReadinessVerdict $w11Tpm $w11Spec $sbOn $w11Ram $w11Vol ([Environment]::Is64BitOperatingSystem)
+        Write-Status 'Passage à Windows 11' $w11.Text $w11.State
+        foreach ($l in @($w11.Subs)) { Write-Sub $l }
     }
 
     # v3.23 (audit, constat V9) : aucun point de restauration = avertissement (rien pour revenir en arrière), un point
@@ -8785,6 +9235,7 @@ if ($isAdmin) {
     }
 } else {
     Write-Status 'Secure Boot / TPM / restauration' 'nécessite les droits admin' 'INFO'
+    if ($winSup.IsWin10) { Write-Status 'Passage à Windows 11' 'non vérifiable (nécessite les droits admin)' 'INFO' }
 }
 
 # --- Réglages de sécurité de Windows (lecture seule, rien n'est modifié)
@@ -8965,6 +9416,35 @@ foreach ($d in $disks) {
     Write-Status (Cut $d.FriendlyName 32) ("{0}  {1:N0} Go  {2}" -f $media, ($d.Size / 1GB), $dv.Text) $dv.State
     if ($extra.Count -gt 0) { Write-Sub ($extra -join '  //  ') }
     foreach ($l in (Get-DiskAdvice $dv.Why)) { Write-Sub $l }
+}
+
+# v3.28 : Windows entretient-il encore les disques tout seul (TRIM des SSD, défragmentation des disques durs) ?
+# Seule une tâche désactivée est un avertissement : un passage manqué ou en échec peut venir d'un PC peu allumé.
+$optTask = Get-OptimizeTaskState
+$optV = Get-CleanupTaskVerdict $optTask.State $optTask.LastRun $optTask.LastResult ([TimeSpan]::FromDays(35)) (Get-Date)
+$optHow = 'Menu Démarrer, tape « Défragmenter et optimiser les lecteurs »'
+switch ($optV) {
+    'OK'       { Write-Status 'Optimisation des disques' ('faite par Windows (dernier passage le {0})' -f (Format-Date $optTask.LastRun)) 'OK' }
+    'RUNNING'  { Write-Status 'Optimisation des disques' 'en cours (faite par Windows)' 'OK' }
+    'DISABLED' {
+        Write-Status 'Optimisation des disques' 'désactivée' 'WARN'
+        Write-Sub 'Windows n''entretient plus les disques (les SSD ralentissent peu à peu, les disques durs se fragmentent).'
+        Write-Sub ($optHow + ' > Modifier les paramètres >')
+        Write-Sub 'coche « Exécution planifiée (recommandé) », fréquence « Toutes les semaines ».'
+    }
+    'NEVER'    {
+        Write-Status 'Optimisation des disques' 'jamais faite par Windows' 'INFO'
+        Write-Sub ($optHow + ' > bouton Optimiser.')
+    }
+    'FAILED'   {
+        Write-Status 'Optimisation des disques' ('dernier passage du {0} en échec' -f (Format-Date $optTask.LastRun)) 'INFO'
+        Write-Sub ('Souvent sans gravité (PC éteint ou sur batterie). Pour la lancer : ' + $optHow + ' > Optimiser.')
+    }
+    'LATE'     {
+        Write-Status 'Optimisation des disques' ('pas de passage depuis le {0}' -f (Format-Date $optTask.LastRun)) 'INFO'
+        Write-Sub ('Windows la fait quand le PC reste allumé sans servir. Pour la lancer : ' + $optHow + ' > Optimiser.')
+    }
+    default    { Write-Status 'Optimisation des disques' 'lecture impossible' 'INFO' }
 }
 
 if ($isAdmin -and (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue)) {
@@ -9379,6 +9859,23 @@ if ($wo -and $wo.PSIsContainer -and -not ($wo.Attributes -band [IO.FileAttribute
     } else {
         $script:WinOld = $true
         Write-Sub 'Pour le retirer : Paramètres > Système > Stockage > Fichiers temporaires.'
+    }
+}
+
+# --- Assistant de stockage (v3.28) : le nettoyage automatique de Windows, réglage du compte de la session
+if (-not $script:CleanUser) {
+    $ssPol = Get-RegValueSafe 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\StorageSense' 'AllowStorageSenseGlobal'
+    $ssUser = Get-RegValueSafe 'HKCU:\Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' '01'
+    $ssV = 'UNKNOWN'
+    if (($ssPol.Ok -or $ssPol.Missing) -and ($ssUser.Ok -or $ssUser.Missing)) { $ssV = Get-StorageSenseVerdict $ssPol.Value $ssUser.Value }
+    if ($ssV -eq 'ON') {
+        Write-Status 'Assistant de stockage' 'actif (Windows nettoie seul ses fichiers temporaires)' 'OK'
+    } elseif ($ssV -eq 'OFF' -or $ssV -eq 'DEFAULT') {
+        Write-Status 'Assistant de stockage' 'désactivé' 'INFO'
+        Write-Sub 'Windows peut vider seul ses fichiers temporaires et la corbeille quand la place manque :'
+        Write-Sub 'Paramètres > Système > Stockage > Assistant de stockage, bouton sur Activé.'
+    } else {
+        Write-Status 'Assistant de stockage' 'lecture impossible' 'INFO'
     }
 }
 

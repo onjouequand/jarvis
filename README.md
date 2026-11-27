@@ -16,17 +16,17 @@ Lien permanent, il donne toujours la dernière version publiée. Toutes les vers
 
 | N° | Section | Ce qui est vérifié |
 |---|---|---|
-| 01 | Système | version de Windows, fin de support de Windows 10, durée depuis le dernier démarrage, redémarrage en attente, heure du PC comparée à celle d'Internet |
+| 01 | Système | version de Windows, date de fin de ses correctifs de sécurité (Windows 10 et chaque version de Windows 11), durée depuis le dernier démarrage, redémarrage en attente, heure du PC comparée à celle d'Internet |
 | 02 | Windows Update | mises à jour importantes, à faire à l'écran, facultatives ; échecs d'installation des 30 derniers jours |
 | 03 | Applications | mises à jour disponibles via winget et le Microsoft Store |
 | 04 | Pilotes | Wi-Fi, Ethernet, Bluetooth, carte graphique, périphériques en erreur |
 | 05 | Bluetooth | service, adaptateur, économie d'énergie |
-| 06 | Sécurité | antivirus, Defender et ses protections, pare-feu, Secure Boot, TPM, point de restauration, réglages de sécurité de Windows (contrôle de compte, SmartScreen, Bureau à distance, ancien partage SMBv1, comptes, fichier hosts, proxy, activation) |
-| 07 | Stockage | espace libre, santé des disques, température et usure des SSD, BitLocker |
+| 06 | Sécurité | antivirus, Defender et ses protections (dont le blocage des applications indésirables), pare-feu, Secure Boot et ses certificats de 2023, TPM, obstacles au passage à Windows 11 (PC sous Windows 10), point de restauration, réglages de sécurité de Windows (contrôle de compte, SmartScreen, Bureau à distance, ancien partage SMBv1, comptes, fichier hosts, proxy, activation) |
+| 07 | Stockage | espace libre, santé des disques, température et usure des SSD, optimisation automatique des disques, BitLocker |
 | 08 | Ressources | processeur, mémoire, programmes gourmands, démarrage, batterie |
 | 09 | Réseau | box (passerelle), accès et temps de réponse Internet, DNS |
 | 10 | Journaux (7 jours) | arrêts brutaux, écrans bleus, erreurs matérielles et disque |
-| 11 | Nettoyage | fichiers temporaires, corbeille, caches de Windows Update et de l'optimisation de livraison, vidages mémoire de plus de 30 jours, anciens composants de Windows (scan complet, seulement si le nettoyage automatique de Windows ne passe plus), dossier Windows.old (mesuré seulement) |
+| 11 | Nettoyage | fichiers temporaires, corbeille, caches de Windows Update et de l'optimisation de livraison, vidages mémoire de plus de 30 jours, anciens composants de Windows (scan complet, seulement si le nettoyage automatique de Windows ne passe plus), dossier Windows.old (mesuré seulement), Assistant de stockage de Windows (actif ou non) |
 | 12 | BIOS | carte mère, version et date, page de support du fabricant (JARVIS n'installe pas de BIOS) |
 | 13 | Intégrité (scan complet) | DISM, SFC /scannow, CHKDSK |
 
