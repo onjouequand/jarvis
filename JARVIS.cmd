@@ -1,6 +1,6 @@
 <# : JARVIS.cmd. Ne pas modifier ce texte
 @echo off
-rem JARVIS-SHA256=8a101a46f511594bc163ab79bcc3ef417f3fa659cbdb7700f3d698a1c0a4b829
+rem JARVIS-SHA256=ea9a3c9f36fba551070a224516d07d06f0d9b1e7771b0f063897365b210f48b0
 setlocal
 "%SystemRoot%\System32\chcp.com" 65001 >nul
 set "JARVIS_SELF=%~f0"
@@ -4889,6 +4889,54 @@ function Get-RegValueSafe([string]$Path, [string]$Name) {
 # Famille/Pro : 13/10/2026). À relire à chaque montée de version (règle 13) : un an après AsOf, une version
 # encore maintenue dans la table devient « non vérifiable » plutôt qu'un OK donné de mémoire.
 # ------------------------------------------------------------------
+function ConvertFrom-RegFileTime($High, $Low) {
+    # Date rangée dans deux valeurs DWORD du registre (InstallTimeHigh et InstallTimeLow du magasin des composants).
+    # .NET les rend en entiers signés : une moitié négative se remet sur 32 bits non signés (relevé de PC-LV du
+    # 27/11/2026 : Low = -998006017, sans quoi la conversion échouait). $null si illisible ou avant 2000. Pure, T1.
+    if ($null -eq $High -or $null -eq $Low) { return $null }
+    $hv = [int64]0; $lv = [int64]0
+    if (-not [int64]::TryParse(([string]$High).Trim(), [ref]$hv)) { return $null }
+    if (-not [int64]::TryParse(([string]$Low).Trim(), [ref]$lv)) { return $null }
+    if ($hv -lt 0) { $hv += 4294967296 }
+    if ($lv -lt 0) { $lv += 4294967296 }
+    if ($hv -gt 2147483647 -or $lv -gt 4294967295 -or $hv -lt 0 -or $lv -lt 0) { return $null }
+    $d = $null
+    try { $d = [datetime]::FromFileTime($hv * 4294967296 + $lv) } catch { return $null }
+    if ($d.Year -lt 2000) { return $null }
+    return $d
+}
+
+function Select-RollupFixName($Names, $Ubr) {
+    # Nom du paquet de la mise à jour cumulative en place dans le magasin des composants :
+    # Package_for_RollupFix~<jeton>~<architecture>~~<version>.<révision>.<n>.<n> (PC-LV, 27/11/2026 :
+    # ...~~19041.7846.1.22 pour la révision 7846, KB5131096). $null si la révision ou le paquet manque. Pure, T1.
+    $u = ConvertTo-IntOrNull $Ubr
+    if ($null -eq $u) { return $null }
+    $re = '^Package_for_RollupFix~[^~]*~[^~]*~[^~]*~\d+\.' + $u + '\.\d+\.\d+$'
+    foreach ($n in @($Names)) {
+        if ($null -ne $n -and ([string]$n) -match $re) { return [string]$n }
+    }
+    return $null
+}
+
+function Get-CumulativeInstallDate($Ubr) {
+    # v3.28 : date d'installation de la mise à jour cumulative en place (celle qui porte la révision $Ubr), lue dans
+    # HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\Packages, vue 64 bits, sans droits
+    # admin, en 0,2 s. Lue seulement sous Windows 10, pour savoir si le programme ESU suit encore. Relevé de PC-LV
+    # du 27/11/2026 : la liste des correctifs (Win32_QuickFixEngineering) donnait la même date en 54 s, trop lent.
+    # $null si illisible. Lecture seule.
+    try {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+        $k = $base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\Packages')
+        if ($null -eq $k) { return $null }
+        $n = Select-RollupFixName @($k.GetSubKeyNames()) $Ubr
+        if ($null -eq $n) { return $null }
+        $p = $k.OpenSubKey($n)
+        if ($null -eq $p) { return $null }
+        return (ConvertFrom-RegFileTime $p.GetValue('InstallTimeHigh', $null) $p.GetValue('InstallTimeLow', $null))
+    } catch { return $null }
+}
+
 function Get-WindowsLifecycleTable {
     # Dans une fonction et non dans une variable : les tests T1 n'ont pas les variables du programme.
     # Home : éditions Famille et Pro ; Ent : Entreprise et Éducation. EsuEnd : fin du programme ESU grand public
@@ -4909,9 +4957,16 @@ function Get-WindowsLifecycleTable {
                            Home = [datetime]::ParseExact($r[2], 'yyyy-MM-dd', $inv)
                            Ent = [datetime]::ParseExact($r[3], 'yyyy-MM-dd', $inv) }
     }
+    # EsuFirstUbr : révision de Windows 10 22H2 apportée par la première mise à jour réservée au programme ESU
+    # (KB5068781 du 11/11/2025, build 19045.6575 ; page « Windows 10 update history » de Microsoft, lue le
+    # 27/11/2026). Celle du 14/10/2025 (KB5066791) est la 6456 ; la correction hors calendrier KB5071959 du
+    # 11/11/2025 (6466) répare l'inscription et peut donc arriver sur un PC non inscrit (non vérifié) : seule une
+    # révision de 6575 ou plus prouve que le PC a reçu un correctif ESU. Relevé sur PC-LV (Windows 10 Famille
+    # inscrit) le 27/11/2026 : 19045.7846, cumulative de novembre 2026 (KB5131096) installée le 21/11/2026.
     return [pscustomobject]@{
         AsOf = [datetime]::ParseExact('2026-11-19', 'yyyy-MM-dd', $inv)
         EsuEnd = [datetime]::ParseExact('2027-10-12', 'yyyy-MM-dd', $inv)
+        EsuFirstUbr = 6575
         Rows = @($list)
     }
 }
@@ -4929,12 +4984,18 @@ function Get-WindowsEditionFamily($EditionId) {
     return 'OTHER'
 }
 
-function Get-WindowsSupportVerdict($Build, $EditionId, [datetime]$Now) {
+function Get-WindowsSupportVerdict($Build, $EditionId, [datetime]$Now, $Ubr, $LastSecurity) {
     # Cette version de Windows reçoit-elle encore ses correctifs de sécurité ? Jugé sur le numéro de build et
     # l'édition, jamais sur ProductName (relevé du 26/11/2026 : « Windows 10 Pro » sur un Windows 11 26H2).
     # Rend { State ; Text ; Subs ; Kind ; IsWin10 }. Kind : ENDED (WARN), SOON (moins de 90 jours, INFO), OK,
-    # UNKNOWN (INFO « non vérifiable » : build ou édition hors table, table de plus d'un an). Un état inconnu n'est
-    # jamais un avertissement (règle 15). Le dernier jour de service compte encore. Fonction pure, T1.
+    # UNKNOWN (INFO « non vérifiable » : build ou édition hors table, table de plus d'un an), ESU (Windows 10 qui
+    # reçoit les correctifs du programme ESU : OK, WARN si le dernier date de plus de 70 jours, INFO si sa date
+    # n'est pas lue). Ubr : révision (valeur UBR du registre) ; LastSecurity : date du dernier correctif de
+    # sécurité, soit l'installation de la mise à jour cumulative en place (Get-CumulativeInstallDate), lues
+    # seulement sous Windows 10. Un état inconnu n'est jamais un avertissement (règle 15). Le dernier jour de
+    # service compte encore. Fonction pure, T1.
+    # v3.28, relevé de PC-LV du 27/11/2026 : sans la révision, un Windows 10 inscrit au programme ESU et à jour
+    # était dit « terminés » en avertissement.
     $inv = [Globalization.CultureInfo]::InvariantCulture
     $r = [pscustomobject]@{ State = 'INFO'; Text = ''; Subs = @(); Kind = 'UNKNOWN'; IsWin10 = $false }
     $b = ConvertTo-IntOrNull $Build
@@ -4964,10 +5025,48 @@ function Get-WindowsSupportVerdict($Build, $EditionId, [datetime]$Now) {
             return $r
         }
         $r.Text = 'terminés le 14/10/2025 (Windows 10)'
+        $esuTxt = $tab.EsuEnd.ToString('dd/MM/yyyy', $inv)
+        $u = ConvertTo-IntOrNull $Ubr
+        $last = $null
+        if ($LastSecurity -is [datetime]) { $last = $LastSecurity }
+        if ($Now.Date -le $tab.EsuEnd -and $null -ne $u -and $u -ge $tab.EsuFirstUbr) {
+            # Le PC a reçu au moins un correctif réservé au programme ESU : il y est (ou y a été) inscrit
+            $r.Kind = 'ESU'
+            $after = ('Après le {0}, plus aucun correctif : voir la ligne « Passage à Windows 11 » en section 06.' -f $esuTxt)
+            if ($null -eq $last) {
+                $r.State = 'INFO'
+                $r.Text = 'programme ESU de Windows 10 (date du dernier correctif non lue)'
+                $r.Subs = @($after)
+                return $r
+            }
+            $lastTxt = $last.ToString('dd/MM/yyyy', $inv)
+            if (($Now.Date - $last.Date).TotalDays -gt 70) {
+                $r.State = 'WARN'
+                $r.Text = ('aucun correctif depuis le {0} (Windows 10, programme ESU)' -f $lastTxt)
+                $r.Subs = @('Microsoft en publie chaque mois. Paramètres > Mise à jour et sécurité > Windows Update >',
+                            'Rechercher des mises à jour, puis installe tout. Si rien n''arrive : sur cette même page,',
+                            'vérifie que le PC est toujours inscrit aux mises à jour de sécurité étendues.')
+                return $r
+            }
+            $left = [int][math]::Floor(($tab.EsuEnd - $Now.Date).TotalDays)
+            if ($left -le 90) {
+                $r.Kind = 'SOON'
+                $r.State = 'INFO'
+                $r.Text = ('assurés jusqu''au {0} seulement (programme ESU de Windows 10, encore {1} j)' -f $esuTxt, $left)
+                $r.Subs = @($after)
+                return $r
+            }
+            $r.State = 'OK'
+            $r.Text = ('assurés jusqu''au {0} (programme ESU de Windows 10, dernier le {1})' -f $esuTxt, $lastTxt)
+            $r.Subs = @($after)
+            return $r
+        }
         if ($Now.Date -le $tab.EsuEnd) {
-            $r.Subs = @(('Microsoft en fournit encore jusqu''au {0} aux PC inscrits à son programme ESU' -f $tab.EsuEnd.ToString('dd/MM/yyyy', $inv)),
+            $seen = 'J.A.R.V.I.S. ne sait pas lire si c''est fait.'
+            if ($null -ne $u) { $seen = 'Ce PC n''en a encore reçu aucun.' }
+            $r.Subs = @(('Microsoft en fournit encore jusqu''au {0} aux PC inscrits à son programme ESU' -f $esuTxt),
                         '(gratuit avec un compte Microsoft) : Paramètres > Mise à jour et sécurité > Windows Update,',
-                        'lien d''inscription aux mises à jour de sécurité étendues. J.A.R.V.I.S. ne sait pas lire si c''est fait.',
+                        ('lien d''inscription aux mises à jour de sécurité étendues. ' + $seen),
                         'Ensuite, le passage à Windows 11 : voir la ligne « Passage à Windows 11 » en section 06.')
         } else {
             $r.Subs = @('Windows 10 ne reçoit plus aucun correctif de sécurité, même par le programme ESU.',
@@ -5010,13 +5109,97 @@ function Get-WindowsSupportVerdict($Build, $EditionId, [datetime]$Now) {
     return $r
 }
 
-function Get-Win11ReadinessVerdict($TpmPresent, $TpmSpec, $SecureBoot, $RamBytes, $SysVolBytes, $Is64) {
-    # PC sous Windows 10 : ce qui s'oppose au passage à Windows 11, dans ce que JARVIS sait lire (puce TPM 2.0,
-    # Secure Boot, 4 Go de mémoire, 64 Go de disque, Windows 64 bits ; page « Windows 11 requirements » de Microsoft).
-    # Le processeur n'est pas contrôlé (liste de modèles tenue par Microsoft) : jamais « compatible » tout court.
+function Get-Win11ReasonText([string]$Reason) {
+    # Raison d'un refus de Windows 11 donnée par Windows (valeur RedReason, voir Get-Win11Appraisal), en clair.
+    # CpuFms relevé sur PC-LV le 27/11/2026 (Core i5-6200U, 6e génération) ; les autres noms viennent de relevés
+    # publiés sur des forums (non vérifié) : un nom inconnu est cité tel quel. Fonction pure, T1.
+    switch -Regex (([string]$Reason).Trim()) {
+        '^CpuFms$'          { return 'processeur trop ancien pour Windows 11 (absent de la liste de Microsoft)' }
+        '^CpuModel$'        { return 'modèle de processeur non pris en charge par Windows 11' }
+        '^CpuCores$'        { return 'processeur à moins de 2 cœurs' }
+        '^CpuSpeed$'        { return 'processeur trop lent (moins de 1 GHz)' }
+        '^Memory$'          { return 'mémoire insuffisante (4 Go exigés)' }
+        '^SystemDriveSize$' { return 'disque système trop petit (64 Go exigés)' }
+        '^Tpm'              { return 'puce de sécurité (TPM 2.0) absente ou désactivée dans le BIOS' }
+        'SecureBoot'        { return 'démarrage UEFI avec Secure Boot indisponible (réglage du BIOS)' }
+    }
+    return ('raison donnée par Windows : {0}' -f ([string]$Reason).Trim())
+}
+
+function Select-Win11Appraisal($Entries) {
+    # Parmi les avis de compatibilité lus par Get-Win11Appraisal (une entrée par version visée : GE24H2, GE26H2...),
+    # celui de la version de Windows 11 la plus récente (DestBuildNum de 22000 ou plus) qui porte un verdict (UpgEx).
+    # Les versions de Windows 10 visées (21H1, 21H2) sont écartées. $null si aucun. Fonction pure, T1.
+    $best = $null; $bestN = -1
+    foreach ($e in @($Entries)) {
+        if ($null -eq $e) { continue }
+        $n = ConvertTo-IntOrNull $e.Dest
+        if ($null -eq $n -or $n -lt 22000) { continue }
+        if (([string]$e.UpgEx).Trim() -eq '') { continue }
+        if ($n -gt $bestN) { $best = $e; $bestN = $n }
+    }
+    return $best
+}
+
+function Get-Win11Appraisal {
+    # v3.28 : avis de Windows lui-même sur le passage à Windows 11, celui qui décide si Windows Update le propose.
+    # Lu dans HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\TargetVersionUpgradeExperienceIndicators
+    # (une sous-clé par version visée ; UpgEx = Green ou Red, RedReason = raisons du refus). Clé non documentée par
+    # Microsoft, relevée sur PC-LV le 27/11/2026 : GE26H2 (26300), UpgEx Red, RedReason CpuFms. $null si absente
+    # ou illisible. Lecture seule.
+    $root = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\TargetVersionUpgradeExperienceIndicators'
+    $list = New-Object System.Collections.Generic.List[object]
+    try {
+        foreach ($k in @(Get-ChildItem -LiteralPath $root -ErrorAction Stop)) {
+            $red = $k.GetValue('RedReason', $null)
+            $reasons = @()
+            if ($null -ne $red) { $reasons = @($red | ForEach-Object { [string]$_ }) }
+            $list.Add([pscustomobject]@{ Name = $k.PSChildName; Dest = $k.GetValue('DestBuildNum', $null)
+                                         UpgEx = $k.GetValue('UpgEx', $null); Red = $reasons })
+        }
+    } catch { return $null }
+    return (Select-Win11Appraisal $list.ToArray())
+}
+
+function Get-Win11ReadinessVerdict($TpmPresent, $TpmSpec, $SecureBoot, $RamBytes, $SysVolBytes, $Is64, $WinUpgEx, $WinRed) {
+    # PC sous Windows 10 : ce qui s'oppose au passage à Windows 11. D'abord l'avis de Windows lui-même ($WinUpgEx =
+    # Green ou Red, $WinRed = raisons, lus par Get-Win11Appraisal) : il contrôle aussi le processeur et c'est lui qui
+    # décide si Windows Update propose Windows 11. v3.28, relevé de PC-LV du 27/11/2026 : sans lui, « aucun obstacle
+    # vu » sur un PC que Windows refuse (processeur de 6e génération). Sans avis lisible : ce que JARVIS sait lire
+    # (puce TPM 2.0, Secure Boot, 4 Go de mémoire, 64 Go de disque, Windows 64 bits ; page « Windows 11
+    # requirements » de Microsoft), processeur non contrôlé, donc jamais « compatible » tout court.
     # Une valeur $null = non lue. Seuils un peu sous l'exigence : Windows annonce 3,9 Go pour 4 Go installés, et le
     # volume système d'un disque de 64 Go fait environ 57 Go. Toujours INFO (l'avertissement est celui de la
     # section 01). Rend { State ; Text ; Subs ; Kind } avec Kind : BLOCKED, PARTIAL, CLEAR. Fonction pure, T1.
+    $tool = 'Verdict complet : menu Démarrer, tape « Contrôle d''intégrité du PC » (outil de Microsoft) > Vérifier maintenant.'
+    $r = [pscustomobject]@{ State = 'INFO'; Text = ''; Subs = @(); Kind = 'CLEAR' }
+    $wx = ([string]$WinUpgEx).Trim()
+    if ($wx -eq 'Red') {
+        $why = @()
+        foreach ($x in @($WinRed)) {
+            foreach ($y in (([string]$x) -split '[,;\s]+')) {
+                if ($y -ne '' -and $y -ne 'None') { $why += (Get-Win11ReasonText $y) }
+            }
+        }
+        $r.Kind = 'BLOCKED'
+        if ($why.Count -eq 0) {
+            $r.Text = 'refusé par Windows (raison non donnée)'
+            $r.Subs = @($tool)
+        } else {
+            $r.Text = ('refusé par Windows ({0} obstacle(s))' -f $why.Count)
+            $r.Subs = @($why)
+            if (@($WinRed | Where-Object { ([string]$_) -match 'Cpu' }).Count -gt 0) {
+                $r.Subs += 'Un processeur ne se met pas à jour : Windows 11 demandera un autre PC.'
+            }
+            $r.Subs += 'Windows Update ne proposera donc pas Windows 11 sur ce PC.'
+        }
+        return $r
+    }
+    if ($wx -eq 'Green') {
+        $r.Text = 'possible d''après Windows'
+        $r.Subs = @('Paramètres > Mise à jour et sécurité > Windows Update le propose quand Microsoft l''ouvre à ce PC.')
+        return $r
+    }
     $block = @(); $unk = @()
     if ($null -eq $Is64) { $unk += 'type de Windows' }
     elseif (-not $Is64) { $block += 'Windows 10 en 32 bits (une réinstallation complète serait nécessaire)' }
@@ -5031,8 +5214,6 @@ function Get-Win11ReadinessVerdict($TpmPresent, $TpmSpec, $SecureBoot, $RamBytes
     } else { $unk += 'version de la puce TPM' }
     if ($null -eq $SecureBoot) { $unk += 'Secure Boot' }
     elseif (-not $SecureBoot) { $block += 'démarrage sécurisé (Secure Boot) désactivé : il s''active dans le BIOS' }
-    $tool = 'Verdict complet : menu Démarrer, tape « Contrôle d''intégrité du PC » (outil de Microsoft) > Vérifier maintenant.'
-    $r = [pscustomobject]@{ State = 'INFO'; Text = ''; Subs = @(); Kind = 'CLEAR' }
     if ($block.Count -gt 0) {
         $r.Kind = 'BLOCKED'
         $r.Text = ('{0} obstacle(s) vu(s)' -f $block.Count)
@@ -5918,6 +6099,103 @@ function Invoke-SelfTestAnalyzers {
         Assert-True ($v.Kind -eq 'PARTIAL') ('rien de lu : ' + $v.Kind); $n++
         $v = Get-Win11ReadinessVerdict $null $null $true 2GB 475GB $true
         Assert-True ($v.Kind -eq 'BLOCKED') ('obstacle et lecture manquante : ' + $v.Kind); $n++
+        ('{0}/{0} cas' -f $n)
+    }
+    Test-Case 'Windows 10 : programme ESU suivi et avis de Windows sur Windows 11' {
+        # v3.28, relevé de PC-LV du 27/11/2026 : Windows 10 Famille 19045.7846 inscrit au programme ESU (dernier
+        # correctif le 21/11/2026), Core i5-6200U refusé par Windows (GE26H2 : Red, CpuFms)
+        $n = 0
+        $now = [datetime]'2026-11-27'
+        $v = Get-WindowsSupportVerdict 19045 'Core' $now 7846 ([datetime]'2026-11-21')
+        Assert-True ($v.State -eq 'OK' -and $v.Kind -eq 'ESU' -and $v.IsWin10 -and $v.Text -like '*12/10/2027*' -and $v.Text -like '*21/11/2026*') ('PC-LV : {0} {1} « {2} »' -f $v.State, $v.Kind, $v.Text); $n++
+        Assert-True ((@($v.Subs) -join ' ') -like '*section 06*') 'PC-LV : passage à Windows 11 non cité'; $n++
+        # Révision en texte (registre lu autrement) : même verdict
+        $v = Get-WindowsSupportVerdict '19045' 'Professional' $now '7846' ([datetime]'2026-11-21')
+        Assert-True ($v.Kind -eq 'ESU' -and $v.State -eq 'OK') ('révision en texte : ' + $v.Kind); $n++
+        # Seuil : 6575 = premier correctif ESU (11/11/2025) ; 6456 (14/10/2025) et 6466 (correction ouverte à tous) non
+        $v = Get-WindowsSupportVerdict 19045 'Core' $now 6575 ([datetime]'2026-11-21')
+        Assert-True ($v.Kind -eq 'ESU') ('révision 6575 : ' + $v.Kind); $n++
+        foreach ($u in @(6456, 6466, 1)) {
+            $v = Get-WindowsSupportVerdict 19045 'Core' $now $u ([datetime]'2026-11-21')
+            Assert-True ($v.State -eq 'WARN' -and $v.Kind -eq 'ENDED' -and (@($v.Subs) -join ' ') -like '*encore reçu aucun*') ('révision {0} : {1} {2} / {3}' -f $u, $v.State, $v.Kind, (@($v.Subs) -join ' | ')); $n++
+        }
+        # Révision non lue : comme avant, J.A.R.V.I.S. dit qu'il ne sait pas
+        $v = Get-WindowsSupportVerdict 19045 'Core' $now $null ([datetime]'2026-11-21')
+        Assert-True ($v.State -eq 'WARN' -and (@($v.Subs) -join ' ') -like '*ne sait pas lire*') ('révision non lue : ' + (@($v.Subs) -join ' | ')); $n++
+        # Plus de 70 jours sans correctif : avertissement avec le geste ; 70 jours pile : encore bon
+        $v = Get-WindowsSupportVerdict 19045 'Core' $now 7846 ([datetime]'2026-09-17')
+        Assert-True ($v.State -eq 'WARN' -and $v.Kind -eq 'ESU' -and $v.Text -like '*17/09/2026*' -and @($v.Subs).Count -gt 0 -and -not (Test-UnreadValue $v.Text)) ('71 jours sans correctif : ' + $v.Text); $n++
+        $v = Get-WindowsSupportVerdict 19045 'Core' $now 7846 ([datetime]'2026-09-18')
+        Assert-True ($v.State -eq 'OK') ('70 jours sans correctif : ' + $v.State); $n++
+        # Date du dernier correctif non lue : information sous « Non vérifié », jamais un OK
+        $v = Get-WindowsSupportVerdict 19045 'Core' $now 7846 $null
+        Assert-True ($v.State -eq 'INFO' -and (Test-UnreadValue $v.Text)) ('date non lue : {0} « {1} »' -f $v.State, $v.Text); $n++
+        $v = Get-WindowsSupportVerdict 19045 'Core' $now 7846 'pas une date'
+        Assert-True ($v.State -eq 'INFO' -and (Test-UnreadValue $v.Text)) ('date illisible : ' + $v.State); $n++
+        # Fin du programme proche, puis passée
+        $v = Get-WindowsSupportVerdict 19045 'Core' ([datetime]'2027-08-01') 9000 ([datetime]'2027-07-20')
+        Assert-True ($v.Kind -eq 'SOON' -and $v.State -eq 'INFO' -and $v.Text -like '*encore 72 j*') ('ESU au 01/08/2027 : ' + $v.Text); $n++
+        $v = Get-WindowsSupportVerdict 19045 'Core' ([datetime]'2027-10-13') 9000 ([datetime]'2027-10-12')
+        Assert-True ($v.State -eq 'WARN' -and $v.Kind -eq 'ENDED' -and (@($v.Subs) -join ' ') -like '*même par le programme ESU*') ('après le programme ESU : ' + $v.Kind); $n++
+        # Windows 11 : la révision ne change rien
+        $v = Get-WindowsSupportVerdict 26300 'Professional' $now 10075 $null
+        Assert-True ($v.Kind -eq 'OK' -and $v.State -eq 'OK') ('Windows 11 avec révision : ' + $v.Kind); $n++
+
+        # Avis de Windows : la version de Windows 11 la plus récente visée, avec un verdict (vraies sous-clés de PC-LV)
+        $e = @(
+            [pscustomobject]@{ Name = '21H1'; Dest = 19043; UpgEx = 'Green'; Red = @('None') },
+            [pscustomobject]@{ Name = '21H2'; Dest = 19044; UpgEx = 'Green'; Red = @('None') },
+            [pscustomobject]@{ Name = 'CO21H2'; Dest = 22000; UpgEx = 'Red'; Red = @('CpuFms') },
+            [pscustomobject]@{ Name = 'GE24H2'; Dest = 26100; UpgEx = 'Red'; Red = @('CpuFms') },
+            [pscustomobject]@{ Name = 'GE26H2'; Dest = 26300; UpgEx = 'Red'; Red = @('CpuFms') },
+            [pscustomobject]@{ Name = 'GE25H2'; Dest = 26200; UpgEx = 'Red'; Red = @('CpuFms') },
+            [pscustomobject]@{ Name = 'NI23H2'; Dest = 22631; UpgEx = 'Red'; Red = @('CpuFms') },
+            [pscustomobject]@{ Name = 'UNV'; Dest = $null; UpgEx = $null; Red = @() },
+            [pscustomobject]@{ Name = 'XX'; Dest = 28000; UpgEx = ''; Red = @() }
+        )
+        $p = Select-Win11Appraisal $e
+        Assert-True ($null -ne $p -and $p.Name -eq 'GE26H2') ('avis choisi : ' + $(if ($p) { $p.Name } else { 'aucun' })); $n++
+        Assert-True ($null -eq (Select-Win11Appraisal @($e[0], $e[1], $e[7]))) 'avis de Windows 10 seul pris pour Windows 11'; $n++
+        Assert-True ($null -eq (Select-Win11Appraisal @())) 'liste vide : un avis inventé'; $n++
+        Assert-True ($null -eq (Select-Win11Appraisal $null)) 'aucune liste : un avis inventé'; $n++
+        # Refus de Windows : il l'emporte sur « aucun obstacle vu » (PC-LV : TPM 2.0, Secure Boot, 8 Go, 464 Go)
+        $v = Get-Win11ReadinessVerdict $true '2.0, 0, 1.16' $true 7.9GB 464GB $true 'Red' @('CpuFms')
+        $subs = @($v.Subs) -join ' '
+        Assert-True ($v.Kind -eq 'BLOCKED' -and $v.State -eq 'INFO' -and $v.Text -like '*refusé par Windows*' -and $subs -like '*processeur trop ancien*' -and $subs -like '*autre PC*' -and $subs -notlike '*non contrôlé*') ('PC-LV : {0} / {1}' -f $v.Text, $subs); $n++
+        $v = Get-Win11ReadinessVerdict $true '2.0' $true 16GB 475GB $true 'Red' @('Tpm UefiSecureBoot')
+        $subs = @($v.Subs) -join ' '
+        Assert-True ($v.Text -like '*2 obstacle(s)*' -and $subs -like '*TPM 2.0*' -and $subs -like '*Secure Boot*' -and $subs -notlike '*autre PC*') ('TPM et Secure Boot : {0} / {1}' -f $v.Text, $subs); $n++
+        $v = Get-Win11ReadinessVerdict $true '2.0' $true 16GB 475GB $true 'Red' @('Inconnu42')
+        Assert-True ((@($v.Subs) -join ' ') -like '*Inconnu42*') 'raison inconnue de Windows non citée'; $n++
+        $v = Get-Win11ReadinessVerdict $true '2.0' $true 16GB 475GB $true 'Red' @('None')
+        Assert-True ($v.Kind -eq 'BLOCKED' -and $v.Text -like '*raison non donnée*') ('refus sans raison : ' + $v.Text); $n++
+        # Accord de Windows : il l'emporte sur la lecture de JARVIS (Secure Boot exigé « possible », pas « actif »)
+        $v = Get-Win11ReadinessVerdict $true '2.0' $false 16GB 475GB $true 'Green' @('None')
+        Assert-True ($v.Kind -eq 'CLEAR' -and $v.Text -like '*possible*' -and -not (Test-UnreadValue $v.Text)) ('accord de Windows : ' + $v.Text); $n++
+        # Verdict de Windows absent ou non reconnu : lecture de JARVIS, processeur non contrôlé
+        foreach ($wx in @($null, '', 'Yellow')) {
+            $v = Get-Win11ReadinessVerdict $true '2.0' $true 16GB 475GB $true $wx $null
+            Assert-True ($v.Kind -eq 'CLEAR' -and $v.Text -like '*processeur non contrôlé*') ('verdict « {0} » : {1}' -f $wx, $v.Text); $n++
+        }
+        # Date d'installation de la cumulative : vraies valeurs de PC-LV (moitié basse négative) et nom de son paquet
+        $d = ConvertFrom-RegFileTime 31291841 (-998006017)
+        Assert-True ($d -is [datetime] -and $d.ToString('yyyy-MM-dd') -eq '2026-11-21') ('date de PC-LV : ' + $d); $n++
+        $d2 = ConvertFrom-RegFileTime '31291841' '3296961279'
+        Assert-True ($d2 -is [datetime] -and $d2 -eq $d) 'moitié basse non signée : autre date'; $n++
+        foreach ($bad in @(@($null, 1), @(1, $null), @('abc', 1), @(0, 0), @(4294967295, 0))) {
+            Assert-True ($null -eq (ConvertFrom-RegFileTime $bad[0] $bad[1])) ('date « {0} / {1} » acceptée' -f $bad[0], $bad[1]); $n++
+        }
+        $pk = @('Package_for_RollupFix~31bf3856ad364e35~amd64~~19041.7417.1.15', 'Package_for_KB5126256~31bf3856ad364e35~amd64~~19041.7846.1.3',
+                'Package_for_RollupFix~31bf3856ad364e35~amd64~~19041.7846.1.22', 'Package_for_RollupFix~31bf3856ad364e35~amd64~~19041.78460.1.1')
+        Assert-True ((Select-RollupFixName $pk 7846) -eq $pk[2]) ('paquet de la révision 7846 : ' + (Select-RollupFixName $pk 7846)); $n++
+        Assert-True ((Select-RollupFixName $pk '7417') -eq $pk[0]) 'paquet de la révision 7417 (texte) non trouvé'; $n++
+        Assert-True ($null -eq (Select-RollupFixName $pk 784)) 'révision 784 prise pour 7846'; $n++
+        Assert-True ($null -eq (Select-RollupFixName $pk $null)) 'révision absente : un paquet choisi'; $n++
+        Assert-True ($null -eq (Select-RollupFixName @() 7846)) 'liste vide : un paquet inventé'; $n++
+        foreach ($c in @(@('CpuFms', 'trop ancien'), @('cpufms', 'trop ancien'), @('CpuCores', '2 cœurs'), @('Memory', '4 Go'),
+                         @('SystemDriveSize', '64 Go'), @('TpmVersion', 'TPM'), @('UefiSecureBoot', 'Secure Boot'), @(' Xyz ', 'Xyz'))) {
+            Assert-True ((Get-Win11ReasonText $c[0]) -like ('*' + $c[1] + '*')) ('raison « {0} » : {1}' -f $c[0], (Get-Win11ReasonText $c[0])); $n++
+        }
         ('{0}/{0} cas' -f $n)
     }
     Test-Case 'Réglages de Windows : certificats Secure Boot, applications indésirables, Assistant de stockage' {
@@ -7475,7 +7753,9 @@ function Invoke-SelfTest {
     Test-Case 'Version de Windows : fin des correctifs lue sur ce PC' {
         # v3.28. Une version absente de la table (plus récente que ce JARVIS) n'est pas un échec : lecture impossible.
         $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
-        $v = Get-WindowsSupportVerdict $cv.CurrentBuild $cv.EditionID (Get-Date)
+        $ls = $null
+        if ((ConvertTo-IntOrNull $cv.CurrentBuild) -lt 22000) { $ls = Get-CumulativeInstallDate $cv.UBR }
+        $v = Get-WindowsSupportVerdict $cv.CurrentBuild $cv.EditionID (Get-Date) $cv.UBR $ls
         if ($v.Kind -eq 'UNKNOWN') { return ('UNREAD:build {0}, édition {1} : {2}' -f $cv.CurrentBuild, $cv.EditionID, $v.Text) }
         ('build {0}, édition {1} : {2}' -f $cv.CurrentBuild, $cv.EditionID, $v.Text)
     }
@@ -8303,8 +8583,12 @@ $os = Get-CimInstance Win32_OperatingSystem
 $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 Write-Status 'Système' ('{0} {1}' -f $os.Caption, $cv.DisplayVersion) 'INFO'
 Write-Status 'Numéro de version (build)' ('{0}.{1}' -f $cv.CurrentBuild, $cv.UBR) 'INFO'
-# v3.28 : fin des correctifs selon la version exacte et l'édition (avant : Windows 10 seulement, texte figé)
-$winSup = Get-WindowsSupportVerdict $cv.CurrentBuild $cv.EditionID (Get-Date)
+# v3.28 : fin des correctifs selon la version exacte et l'édition (avant : Windows 10 seulement, texte figé) ;
+# sous Windows 10, révision et date du dernier correctif disent si le programme ESU suit (relevé de PC-LV, 27/11/2026)
+$winLastSec = $null
+$winBuildN = ConvertTo-IntOrNull $cv.CurrentBuild
+if ($null -ne $winBuildN -and $winBuildN -lt 22000) { $winLastSec = Get-CumulativeInstallDate $cv.UBR }
+$winSup = Get-WindowsSupportVerdict $cv.CurrentBuild $cv.EditionID (Get-Date) $cv.UBR $winLastSec
 Write-Status 'Correctifs de sécurité Windows' $winSup.Text $winSup.State
 foreach ($l in @($winSup.Subs)) { Write-Sub $l }
 $isLaptop = [bool](Get-CimInstance Win32_Battery)
@@ -9199,7 +9483,10 @@ if ($isAdmin) {
         $w11Vol = $null
         $w11Ld = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $SysDrive)
         if ($w11Ld -and $w11Ld.Size) { $w11Vol = [double]$w11Ld.Size }
-        $w11 = Get-Win11ReadinessVerdict $w11Tpm $w11Spec $sbOn $w11Ram $w11Vol ([Environment]::Is64BitOperatingSystem)
+        $w11Win = Get-Win11Appraisal
+        $w11UpgEx = $null; $w11Red = $null
+        if ($w11Win) { $w11UpgEx = $w11Win.UpgEx; $w11Red = $w11Win.Red }
+        $w11 = Get-Win11ReadinessVerdict $w11Tpm $w11Spec $sbOn $w11Ram $w11Vol ([Environment]::Is64BitOperatingSystem) $w11UpgEx $w11Red
         Write-Status 'Passage à Windows 11' $w11.Text $w11.State
         foreach ($l in @($w11.Subs)) { Write-Sub $l }
     }

@@ -55,7 +55,7 @@ $LowDeleteAllowed = @{ 'Remove-TempCandidates' = 2; 'Remove-EmptyDir' = 1; 'Remo
 # suppression différée de l'ancien JARVIS.cmd, qui ne peut pas s'effacer lui-même pendant qu'il tourne.
 $CmdDeleteAllowed = @{ 'Start-DelayedDelete' = 1 }
 # Nombre minimal de tests T1 attendus (garde-fou contre un lot de tests vidé par erreur).
-$MinT1 = 89
+$MinT1 = 90
 
 $script:Fails = New-Object System.Collections.Generic.List[string]
 function Add-Fail([string]$Message) {
