@@ -73,3 +73,7 @@ python build.py
 `build.py` vérifie la structure du script, refuse les caractères qui posent problème à PowerShell 5.1 (guillemets typographiques), calcule l'empreinte et écrit `JARVIS.cmd` en UTF-8 sans BOM avec des fins de ligne Windows. L'auto-test (menu `[3]` ou `JARVIS.cmd -SelfTest`) vérifie chaque composant sur le PC où il tourne.
 
 Options en ligne de commande : `-Quick`, `-Deep`, `-SelfTest`, `-Update`, `-Uninstall`, `-NoAnim`, `-NoWinget`, `-Ascii`, `-Name "Prénom"`. La liste complète est en tête de `src/jarvis-checkup.ps1`.
+
+## Soutenir
+
+JARVIS est gratuit : toutes les fonctions sont dans le fichier, sans publicité. S'il t'a rendu service et que tu veux encourager la suite, tu peux [offrir un café sur Ko-fi](https://ko-fi.com/onjouequand). C'est facultatif, et ça ne change rien à ce que l'outil fait pour toi.
