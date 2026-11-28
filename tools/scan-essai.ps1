@@ -1,6 +1,6 @@
 ﻿<#
 Scan rapide réel de J.A.R.V.I.S., sans clavier (v3.25, audit du 23/11/2026, constat T1). Les tests T1 ne vérifient que
-des fonctions ; ce script fait tourner le programme principal (sections 01 à 12, synthèse, rapport, questions de fin de
+des fonctions ; ce script fait tourner le programme principal (sections 01 à 13, synthèse, rapport, questions de fin de
 scan) et refuse le résultat à la moindre erreur PowerShell. Lancé par GitHub à chaque envoi (.github/workflows/check.yml).
 
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\scan-essai.ps1 [-Mode cmd|source] [-OutDir dossier]
@@ -165,9 +165,9 @@ if (-not $rep) {
     Copy-Item -LiteralPath $rep.FullName -Destination (Join-Path $OutDir $rep.Name) -Force
     $lines = @(Get-Content -LiteralPath $rep.FullName -Encoding UTF8)
     Add-Pass ('rapport écrit : ' + $rep.FullName)
-    # Chaque section du scan rapide (01 à 12) présente, avec au moins une ligne d'état ; la 13 (scan complet) absente
+    # Chaque section du scan rapide (01 à 13) présente, avec au moins une ligne d'état ; la 14 (scan complet) absente
     $missing = @(); $empty = @()
-    for ($s = 1; $s -le 12; $s++) {
+    for ($s = 1; $s -le 13; $s++) {
         $num = '{0:D2}' -f $s
         $i = -1
         for ($j = 0; $j -lt $lines.Count; $j++) { if ($lines[$j].StartsWith("== [$num] ")) { $i = $j; break } }
@@ -180,8 +180,8 @@ if (-not $rep) {
     }
     if ($missing.Count -gt 0) { Add-Fail ('sections absentes du rapport : ' + ($missing -join ', ')) }
     elseif ($empty.Count -gt 0) { Add-Fail ('sections sans aucune ligne d''état : ' + ($empty -join ', ')) }
-    else { Add-Pass 'sections 01 à 12 présentes, chacune avec au moins une ligne d''état' }
-    if (@($lines | Where-Object { $_.StartsWith('== [13] ') }).Count -gt 0) { Add-Fail 'section 13 (scan complet) lancée en scan rapide' }
+    else { Add-Pass 'sections 01 à 13 présentes, chacune avec au moins une ligne d''état' }
+    if (@($lines | Where-Object { $_.StartsWith('== [14] ') }).Count -gt 0) { Add-Fail 'section 14 (scan complet) lancée en scan rapide' }
     $syn = [array]::IndexOf($lines, '== SYNTHÈSE ==')
     if ($syn -lt 0 -or -not ($lines | Where-Object { $_ -like 'État général : *' })) { Add-Fail 'synthèse absente du rapport' }
     else {

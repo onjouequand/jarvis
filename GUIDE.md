@@ -33,11 +33,12 @@ C'est fait. La prochaine fois, ouvre JARVIS depuis le **menu Démarrer** (tape �
 2. La première fois, JARVIS affiche « Identité détectée » avec ton prénom : appuie sur **Entrée** s'il est juste, sinon tape ton prénom puis **Entrée**.
 3. Laisse-le travailler. Ne tape rien pendant le scan.
 4. La **synthèse** donne l'état général de ton PC : **en bon état** (vert), **à surveiller** (jaune, rien d'urgent) ou **à traiter** (rouge). Sous chaque ligne jaune ou rouge du scan, JARVIS écrit quoi faire ; le numéro entre crochets dans la synthèse dit dans quelle section la retrouver.
-5. À la fin, JARVIS affiche l'**entretien recommandé** : une liste numérotée (analyse antivirus, mises à jour des applications et de Windows, fichiers temporaires), avec la durée de chaque élément, puis une seule question :
+5. À la fin, JARVIS affiche l'**entretien recommandé** : une liste numérotée (analyse antivirus, mises à jour des applications et de Windows, fichiers temporaires, liens vers des programmes qui n'existent plus), avec la durée de chaque élément, puis une seule question :
    - tape **o** puis **Entrée** pour tout faire : JARVIS enchaîne tout seul, tu peux laisser le PC travailler (enregistre d'abord ton travail : certaines applications se ferment pendant leur mise à jour) ;
    - tape **d** puis **Entrée** pour décider élément par élément (une question pour chacun) ;
    - appuie sur **Entrée** ou **Échap** pour ne rien faire.
    À la fin de l'entretien, une ligne fait le bilan : ce qui est fait, ce qui est à reprendre (le geste est écrit sous chaque ligne jaune ou rouge).
+   Les liens retirés (programme au démarrage, raccourci du menu Démarrer ou tâche planifiée qui mènent à un programme disparu) sont d'abord sauvegardés : JARVIS écrit le dossier de la sauvegarde, et le fichier **LISEZMOI.txt** qu'il y dépose explique comment en remettre un (un double-clic suffit pour un programme au démarrage).
 6. Viennent ensuite, une par une, les questions de ménage (corbeille, caches…). Lis la question, puis :
    - tape **o** puis **Entrée** pour accepter ;
    - appuie sur **Échap** pour refuser (Échap veut toujours dire « non ») ;

@@ -42,20 +42,29 @@ $RecurseAllowed = @{ 'Uninstall-Jarvis' = 1 }
 # Invoke-SelfTest : fichier d'essai d'écriture ; Save-Report : rapports au-delà de 30 ; Invoke-LegacyCleanup : fichiers
 # connus de l'ancien dossier C:\Outils\JARVIS (vrais fichiers seulement) ; Install-Jarvis : retour arrière d'une
 # installation ratée ; Invoke-JarvisSelfUpdate : fichier téléchargé ; Uninstall-Jarvis : raccourcis, rapports, marqueur et
-# clé de désinstallation. Un nouveau Remove-Item doit être ajouté ici, avec sa raison.
+# clé de désinstallation ; Remove-DeadShortcut (v3.30, lot 3) : raccourci mort du menu Démarrer, sous liste blanche
+# (Get-DeadLinkScope), copié dans la sauvegarde avant. Un nouveau Remove-Item doit être ajouté ici, avec sa raison.
 $RemoveAllowed = @{ 'Invoke-ProcessSpinner' = 3; 'Get-ReportDir' = 1; 'Save-Report' = 1; 'Invoke-LegacyCleanup' = 1;
-                    'Install-Jarvis' = 4; 'Invoke-JarvisSelfUpdate' = 1; 'Uninstall-Jarvis' = 5; 'Invoke-SelfTest' = 1 }
+                    'Install-Jarvis' = 4; 'Invoke-JarvisSelfUpdate' = 1; 'Uninstall-Jarvis' = 5; 'Invoke-SelfTest' = 1;
+                    'Remove-DeadShortcut' = 1 }
 # Suppressions de bas niveau autorisées, par fonction (règle 18) : [IO.File]::Delete, [IO.Directory]::Delete, toute méthode
 # Delete... d'un objet (FileInfo.Delete(), Scripting.FileSystemObject.DeleteFile...) depuis la v3.25, vidage de la corbeille
 # (SHEmptyRecycleBin) et suppression par CIM (Invoke-CimMethod -MethodName Delete).
-# Invoke-SelfTest : jonctions et fichiers des bacs à sable des tests T5 seulement.
+# Invoke-SelfTest : jonctions et fichiers des bacs à sable des tests T5 seulement. v3.30 (lot 3) : Remove-DeadRunValue
+# (RegistryKey.DeleteValue d'une valeur Run morte) et Remove-DeadTask (DeleteTask du Planificateur, tâche hors
+# \Microsoft\), tous deux sous liste blanche (Get-DeadLinkScope) et après une sauvegarde relue.
 $LowDeleteAllowed = @{ 'Remove-TempCandidates' = 2; 'Remove-EmptyDir' = 1; 'Remove-TreeNoJunction' = 1; 'Clear-CleanTarget' = 1;
-                       'Clear-RecycleBinChecked' = 1; 'Clear-DoCache' = 1; 'Invoke-SelfTest' = 5 }
+                       'Clear-RecycleBinChecked' = 1; 'Clear-DoCache' = 1; 'Invoke-SelfTest' = 5; 'Remove-DeadRunValue' = 1;
+                       'Remove-DeadTask' = 1 }
 # Commandes de suppression de cmd (del, erase, rd, rmdir) écrites dans une chaîne, par fonction (v3.25) : seulement la
 # suppression différée de l'ancien JARVIS.cmd, qui ne peut pas s'effacer lui-même pendant qu'il tourne.
 $CmdDeleteAllowed = @{ 'Start-DelayedDelete' = 1 }
+# Retraits dans le registre et le Planificateur de tâches par commande (v3.30, lot 3) : Remove-ItemProperty (alias rp),
+# Clear-ItemProperty (clp), Unregister-ScheduledTask, « reg delete », « schtasks /Delete », « sc delete ». Aucun autorisé :
+# les liens morts se retirent par DeleteValue et DeleteTask, comptés dans $LowDeleteAllowed.
+$RegTaskDeleteAllowed = @{}
 # Nombre minimal de tests T1 attendus (garde-fou contre un lot de tests vidé par erreur).
-$MinT1 = 95
+$MinT1 = 104
 
 $script:Fails = New-Object System.Collections.Generic.List[string]
 function Add-Fail([string]$Message) {
@@ -282,6 +291,52 @@ foreach ($g in ($cmdDel | Group-Object { Get-OuterFunction $_ })) {
     }
 }
 if ($cmdOk) { Add-Pass ("commandes de suppression de cmd : {0}, toutes sur liste blanche" -f $cmdDel.Count) }
+
+# Retraits dans le registre et le Planificateur de tâches par commande (v3.30, lot 3)
+# Relecture du lot 3 : Clear-Item (alias cli) vide toutes les valeurs d'une clé ; une liste d'arguments en une seule
+# chaîne (-ArgumentList '/Delete /TN x /F') et l'argument attaché (-ArgumentList:'delete') sont comptés aussi.
+$regNames = @('Remove-ItemProperty', 'Microsoft.PowerShell.Management\Remove-ItemProperty', 'rp', 'Clear-ItemProperty',
+              'Microsoft.PowerShell.Management\Clear-ItemProperty', 'clp', 'Unregister-ScheduledTask', 'ScheduledTasks\Unregister-ScheduledTask',
+              'Clear-Item', 'Microsoft.PowerShell.Management\Clear-Item', 'cli')
+$regDel = @($commands | Where-Object { $regNames -contains [string]$_.GetCommandName() })
+$regDelRx = '(?i)(^|[\s&|("''\\])(reg|schtasks|sc)(\.exe)?["'']?\s+/?delete\b'
+$regDel += @($ast.FindAll({
+    param($n)
+    ($n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or
+     $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) -and [string]$n.Value -match $regDelRx
+}, $true))
+# En argument isolé : & $reg delete ..., schtasks.exe /Delete ..., -ArgumentList 'delete' (sauf -MethodName Delete, compté
+# avec les suppressions de bas niveau)
+$regDel += @($ast.FindAll({
+    param($n)
+    if (-not ($n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or
+              $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) -or
+        [string]$n.Value -notmatch '^(?i)\s*/?delete(\s|$)') { return $false }
+    $pa = $n.Parent
+    if ($pa -is [System.Management.Automation.Language.CommandParameterAst]) {
+        return -not ('MethodName'.StartsWith($pa.ParameterName, [StringComparison]::OrdinalIgnoreCase))
+    }
+    if ($pa -is [System.Management.Automation.Language.CommandAst]) {
+        $i = $pa.CommandElements.IndexOf($n)
+        if ($i -lt 1) { return $false }
+        $prev = $pa.CommandElements[$i - 1]
+        if ($prev -is [System.Management.Automation.Language.CommandParameterAst] -and $prev.ParameterName.Length -ge 1 -and
+            'MethodName'.StartsWith($prev.ParameterName, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+        return $true
+    }
+    return ($pa -is [System.Management.Automation.Language.ArrayLiteralAst])
+}, $true))
+$regOk = $true
+foreach ($g in ($regDel | Group-Object { Get-OuterFunction $_ })) {
+    $allowed = 0
+    if ($RegTaskDeleteAllowed.ContainsKey($g.Name)) { $allowed = $RegTaskDeleteAllowed[$g.Name] }
+    if ($g.Count -gt $allowed) {
+        $regOk = $false
+        $where = ($g.Group | ForEach-Object { $_.Extent.StartLineNumber }) -join ', '
+        Add-Fail ("retrait dans le registre ou le Planificateur par commande dans {0} : {1} trouvé(s), {2} autorisé(s) (lignes {3})" -f $g.Name, $g.Count, $allowed, $where)
+    }
+}
+if ($regOk) { Add-Pass ("retraits du registre et du Planificateur par commande : {0}, tous sur liste blanche" -f $regDel.Count) }
 
 # Outils système appelés par leur seul nom : un programme du même nom placé dans le PATH serait lancé en admin
 $bare = @($commands | Where-Object {

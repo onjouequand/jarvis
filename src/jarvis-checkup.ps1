@@ -15,7 +15,9 @@
       [11] Nettoyage      : temporaires, corbeille, caches de Windows Update, vidages
                             mémoire, composants Windows (mode complet), Windows.old
       [12] BIOS           : version et date du firmware
-      [13] Intégrité      : DISM, SFC /scannow, CHKDSK  (mode complet uniquement)
+      [13] Restes         : liens vers des programmes absents (démarrage, menu Démarrer,
+                            tâches, services, liste des applications), dossiers restants
+      [14] Intégrité      : DISM, SFC /scannow, CHKDSK  (mode complet uniquement)
 
     Le mode rapide ne modifie rien.
     Le mode complet lance SFC /scannow, qui répare lui-même les fichiers
@@ -333,6 +335,10 @@ $script:SpinState   = ''         # fin du dernier Invoke-Spinner : DONE, TIMEOUT
 $script:ConModeSaved = $null     # mode de la console au lancement (sélection à la souris remise en partant)
 $script:ConFontSaved = $null     # police de l'ancienne console au lancement, quand JARVIS l'a agrandie
 $script:StoreItems  = @()        # applications du Microsoft Store à mettre à jour (Pfn, Name)
+$script:DeadLinks   = @()        # liens morts retirables trouvés par la section 13 (v3.30)
+$script:RemnantRoots = @{}       # dossiers Programmes du menu Démarrer (User, Common), section 13
+$script:RemnantOtherUser = $false # JARVIS élevé sous un autre compte que celui de la session, section 13
+$script:JarvisDriveKinds = @{}   # type de chaque lecteur, lu une fois par scan (Get-DriveKind)
 # v3.29 (lot 2 du plan « entretien ») : fin de scan en deux temps, questions d'abord, travail ensuite
 $script:ActionStates = New-Object System.Collections.Generic.List[string]   # état de chaque ligne écrite (Get-ActionOutcome)
 $script:FollowUps   = New-Object System.Collections.Generic.List[string]   # pages à proposer après l'entretien : STORE, WU
@@ -1443,13 +1449,14 @@ function Get-CleanProposal($Targets, [int64]$MinBytes, [bool]$IsAdmin) {
     return [pscustomobject]@{ Items = $keep; Bytes = $sum }
 }
 
-function Get-MaintenancePlan([bool]$Defender, [int]$WingetCount, [bool]$WingetReady, [int]$StoreCount, [int]$WuCount, [bool]$IsAdmin, $TempBytes) {
+function Get-MaintenancePlan([bool]$Defender, [int]$WingetCount, [bool]$WingetReady, [int]$StoreCount, [int]$WuCount, [bool]$IsAdmin, $TempBytes, [int]$DeadLinkCount = 0) {
     # v3.29 (lot 2 du plan « entretien », décision de Thomas du 26/11/2026) : l'entretien courant proposé en une
     # seule question en fin de scan. Rend les éléments dans l'ordre où ils sont faits : Key, Label (nom court du
     # bilan), Text (ligne de la liste), Time (durée annoncée), Bytes (fichiers temporaires seulement, sinon $null).
     # Mises à jour Windows : seulement en administrateur (sinon la page Windows Update est proposée à part).
     # $TempBytes : $null quand la section 11 ne propose pas les fichiers temporaires. Les suppressions définitives
     # (corbeille, caches, vidages, composants) et la réparation de Windows restent des questions à part.
+    # v3.30 (lot 3) : $DeadLinkCount liens morts retirables (section 13), en dernier, sauvegardés avant.
     # Fonction pure, T1.
     $items = @()
     $mk = { param($k, $l, $t, $d, $b) [pscustomobject]@{ Key = $k; Label = $l; Text = $t; Time = $d; Bytes = $b } }
@@ -1468,6 +1475,9 @@ function Get-MaintenancePlan([bool]$Defender, [int]$WingetCount, [bool]$WingetRe
     if ($null -ne $TempBytes) {
         # Taille du scan : la place réelle est remesurée juste avant la suppression, et le résultat l'écrit
         $items += & $mk 'Temp' 'Fichiers temporaires' ('Suppression des fichiers temporaires de plus de 24 h ({0} au moment du scan)' -f (Format-Bytes $TempBytes)) 'environ 1 min' ([int64]$TempBytes)
+    }
+    if ($DeadLinkCount -gt 0) {
+        $items += & $mk 'DeadLinks' 'Liens morts' ('Retrait de {0} lien(s) vers des programmes absents (sauvegardés avant)' -f $DeadLinkCount) 'quelques secondes' $null
     }
     return $items
 }
@@ -2848,6 +2858,7 @@ function Uninstall-Jarvis {
     Write-Host ("     - {0}\JARVIS.cmd" -f $JarvisHome) -ForegroundColor Gray
     Write-Host '     - raccourcis JARVIS du menu Démarrer et du Bureau' -ForegroundColor Gray
     Write-Host '     - profil et choix mémorisés (%APPDATA%\JARVIS), rapports (%LOCALAPPDATA%\JARVIS)' -ForegroundColor Gray
+    Write-Host '     - sauvegardes des liens morts retirés (%LOCALAPPDATA%\JARVIS\Sauvegardes)' -ForegroundColor Gray
     if (Test-WingetModule) { Write-Host '     (le module winget de Microsoft est conservé : d''autres outils peuvent s''en servir)' -ForegroundColor DarkGray }
     Write-Host '   Pour annuler : appuie sur Entrée ou Échap.' -ForegroundColor DarkGray
     $a = Read-Answer '   >> Pour confirmer, tape DESINSTALLER'
@@ -4196,6 +4207,8 @@ function Get-StartupEntries([switch]$MachineOnly) {
     # Run du compte et de la machine (64 et 32 bits, registre en vue 64 bits même depuis une console 32 bits),
     # dossiers Démarrage du compte et de tous les utilisateurs, chacun avec sa valeur StartupApproved
     # ('ABSENT' si Windows ne l'a jamais écrite). Les applications du Store qui démarrent seules n'y sont pas.
+    # v3.30 (lot 3) : chaque entrée dit aussi d'où elle vient (Source Run, Run32 ou Folder ; Hive, SubKey, File) et,
+    # pour une clé Run, la commande telle qu'écrite (Raw, variables non remplacées) et son type (RawKind).
     # -MachineOnly : partie commune seulement (JARVIS élevé sous un autre compte : HKCU et le dossier Démarrage
     # seraient ceux de cet autre compte). Rend un tableau (vide possible) ; $null = lecture impossible.
     $apr = 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\'
@@ -4205,12 +4218,12 @@ function Get-StartupEntries([switch]$MachineOnly) {
     try {
         $hkcu = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::CurrentUser, [Microsoft.Win32.RegistryView]::Registry64)
         $hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
-        $sources = @(@($hkcu, $run, 'Run'), @($hklm, $run, 'Run'),
-                     @($hklm, 'Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run', 'Run32'))
-        $folders = @(@('Startup', $hkcu), @('CommonStartup', $hklm))
+        $sources = @(@($hkcu, $run, 'Run', 'HKCU'), @($hklm, $run, 'Run', 'HKLM'),
+                     @($hklm, 'Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run', 'Run32', 'HKLM'))
+        $folders = @(@('Startup', $hkcu, 'HKCU'), @('CommonStartup', $hklm, 'HKLM'))
         if ($MachineOnly) {
             $sources = @($sources | Where-Object { $_[0] -eq $hklm })
-            $folders = @(, @('CommonStartup', $hklm))
+            $folders = @(, @('CommonStartup', $hklm, 'HKLM'))
         }
         foreach ($src in $sources) {
             $k = $src[0].OpenSubKey($src[1])
@@ -4222,7 +4235,11 @@ function Get-StartupEntries([switch]$MachineOnly) {
                     $b = $null
                     if ($null -ne $a) { $b = $a.GetValue($n) }
                     if ($null -eq $b) { $b = 'ABSENT' }
-                    $list.Add([pscustomobject]@{ Name = $n; Approved = $b })
+                    $raw = ''; $kind = ''
+                    try { $raw = [string]$k.GetValue($n, $null, 'DoNotExpandEnvironmentNames'); $kind = [string]$k.GetValueKind($n) }
+                    catch { $raw = ''; $kind = '' }   # retirée entre la liste et la lecture : ni jugée ni retirée
+                    $list.Add([pscustomobject]@{ Name = $n; Approved = $b; Source = $src[2]; Hive = $src[3]; SubKey = $src[1]
+                                                 Raw = $raw; RawKind = $kind; File = '' })
                 }
             } finally { $k.Close(); if ($null -ne $a) { $a.Close() } }
         }
@@ -4237,7 +4254,8 @@ function Get-StartupEntries([switch]$MachineOnly) {
                     $b = $null
                     if ($null -ne $a) { $b = $a.GetValue($n) }
                     if ($null -eq $b) { $b = 'ABSENT' }
-                    $list.Add([pscustomobject]@{ Name = $n; Approved = $b })
+                    $list.Add([pscustomobject]@{ Name = $n; Approved = $b; Source = 'Folder'; Hive = $f[2]; SubKey = ''
+                                                 Raw = ''; RawKind = ''; File = $fi })
                 }
             } finally { if ($null -ne $a) { $a.Close() } }
         }
@@ -4248,6 +4266,991 @@ function Get-StartupEntries([switch]$MachineOnly) {
         if ($null -ne $hklm) { $hklm.Close() }
     }
     return , ($list.ToArray())
+}
+
+# ------------------------------------------------------------------
+# Restes de programmes (v3.30, lot 3 du plan « entretien », décision de Thomas du 26/11/2026). Section 13 :
+# signaler les liens qui mènent à un fichier absent (démarrage, menu Démarrer, tâches planifiées, services, liste des
+# applications) et les gros dossiers de Program Files sans programme. Fin de scan : seuls les liens morts du
+# démarrage, du menu Démarrer et des tâches planifiées sont proposés au retrait, chacun sauvegardé avant, revérifié
+# juste avant et relu après. Les dossiers, services et entrées de la liste des applications ne sont jamais
+# supprimés par JARVIS. Un chemin n'est « absent » que si Windows dit qu'il n'existe pas : accès refusé, lecteur
+# débranché, chemin réseau, variable inconnue ou nom seul ne rendent jamais un lien mort.
+# ------------------------------------------------------------------
+function Expand-JarvisEnvVars([string]$Text, $Vars) {
+    # Variables %NOM% remplacées par la table $Vars (Get-JarvisEnvTable : dossiers demandés à Windows, jamais $env:,
+    # règle 33). Une variable absente de la table reste écrite telle quelle : le chemin est alors jugé inconnu.
+    # Fonction pure, T1.
+    if ($null -eq $Text) { return '' }
+    if ($null -eq $Vars) { return $Text }
+    $sb = New-Object System.Text.StringBuilder
+    $pos = 0
+    foreach ($m in [regex]::Matches($Text, '%([^%\s]+)%')) {
+        [void]$sb.Append($Text.Substring($pos, $m.Index - $pos))
+        $v = [string]$Vars[$m.Groups[1].Value]
+        if ($v) { [void]$sb.Append($v.TrimEnd('\')) } else { [void]$sb.Append($m.Value) }
+        $pos = $m.Index + $m.Length
+    }
+    [void]$sb.Append($Text.Substring($pos))
+    return $sb.ToString()
+}
+
+function Get-CommandHead([string]$Text) {
+    # Premier élément d'une ligne de commande : le chemin entre guillemets ; sans guillemets, chaque début de ligne
+    # qui finit par une extension de programme devant une espace ou la fin (Windows essaie « C:\Program Files\X\x.exe
+    # -a » morceau par morceau). Rend Candidates (un ou plusieurs chemins possibles) et Rest (la suite du premier).
+    # Fonction pure, T1 par ConvertFrom-CommandLine.
+    $s = ([string]$Text).Trim()
+    if ($s.StartsWith('"')) {
+        $end = $s.IndexOf('"', 1)
+        if ($end -lt 0) { return [pscustomobject]@{ Candidates = @($s.Substring(1).Trim()); Rest = '' } }
+        return [pscustomobject]@{ Candidates = @($s.Substring(1, $end - 1).Trim()); Rest = $s.Substring($end + 1).Trim() }
+    }
+    $rx = '(?i)\.(exe|com|bat|cmd|lnk|vbs|vbe|js|jse|wsf|ps1|msc|cpl|scr|pif|dll)$'
+    $cands = @()
+    $rest = ''
+    $cuts = @()
+    for ($i = 0; $i -lt $s.Length; $i++) { if ($s[$i] -eq ' ') { $cuts += $i } }
+    $cuts += $s.Length
+    foreach ($i in $cuts) {
+        $p = $s.Substring(0, $i).TrimEnd()
+        if ($p -match $rx -and -not ($cands -contains $p)) {
+            if ($cands.Count -eq 0) { $rest = $s.Substring($i).Trim() }
+            $cands += $p
+        }
+    }
+    if ($cands.Count -gt 0) { return [pscustomobject]@{ Candidates = $cands; Rest = $rest } }
+    $sp = $s.IndexOf(' ')
+    if ($sp -lt 0) { return [pscustomobject]@{ Candidates = @($s); Rest = '' } }
+    return [pscustomobject]@{ Candidates = @($s.Substring(0, $sp)); Rest = $s.Substring($sp + 1).Trim() }
+}
+
+function Get-PathKind([string]$Path) {
+    # Nature d'un chemin, sans toucher au disque : Path (absolu sur un lecteur), Network (\\serveur), Bare (nom seul,
+    # cherché par Windows dans ses dossiers), Unknown (variable non remplacée, chemin relatif), Empty. Pure, T1.
+    $p = ([string]$Path).Trim()
+    if (-not $p) { return 'Empty' }
+    if ($p.Contains('%')) { return 'Unknown' }
+    if ($p -match '^[A-Za-z]:\\') { return 'Path' }
+    if ($p.StartsWith('\\')) { return 'Network' }
+    if (-not $p.Contains('\') -and -not $p.Contains('/')) { return 'Bare' }
+    return 'Unknown'
+}
+
+function Add-Wow64Alternatives($Candidates, $Vars) {
+    # Programme 32 bits : un chemin sous Windows\System32 est lu par Windows dans Windows\SysWOW64. Chaque chemin
+    # System32 reçoit son double SysWOW64 (le lien n'est mort que si les deux manquent). Relecture du lot 3 : valeur
+    # Run32, entrée de désinstallation 32 bits, rundll32 ou wscript de SysWOW64. Fonction pure, T1.
+    $out = @()
+    $sr = ([string]$Vars['SystemRoot']).TrimEnd('\')
+    foreach ($c in @($Candidates)) {
+        if (-not $c) { continue }
+        if ($out -notcontains $c) { $out += $c }
+        $p = $sr + '\System32\'
+        if ($sr -and ([string]$c).StartsWith($p, [StringComparison]::OrdinalIgnoreCase)) {
+            $alt = $sr + '\SysWOW64\' + ([string]$c).Substring($p.Length)
+            if ($out -notcontains $alt) { $out += $alt }
+        }
+    }
+    return $out
+}
+
+function ConvertFrom-CommandLine([string]$Line, $Vars, [switch]$Service, [switch]$Wow64) {
+    # Ligne de commande (valeur Run, action d'une tâche, ImagePath d'un service, programme de désinstallation) : rend
+    # Kind, Exe (programme lancé) et Candidates (fichiers dont l'absence rend le lien mort). Kind : Path, Rundll32 et
+    # Script (la cible est la bibliothèque ou le script passé à rundll32, wscript ou cscript), Msi (msiexec : géré par
+    # Windows Installer, jamais jugé), Bare, Network, Unknown, Empty. Seuls Path, Rundll32 et Script se jugent sur le
+    # disque, et seulement si chaque chemin possible a une extension (sans extension, Windows en essaie plusieurs).
+    # -Service : chemins propres aux services (\SystemRoot\, system32\ relatif au dossier Windows). -Wow64 : ligne lue
+    # par un programme 32 bits (Add-Wow64Alternatives), comme un rundll32 ou un wscript de SysWOW64. Un chemin possible
+    # qui ne peut pas être un nom de fichier (« : » au milieu, < > | ? *) est écarté. Variables remplacées d'abord,
+    # comme Windows le fait avant de lancer. Fonction pure, T1.
+    $r = [pscustomobject]@{ Kind = 'Empty'; Exe = ''; Candidates = @() }
+    if ($null -eq $Line) { return $r }
+    $s = ([string]$Line -replace '[\x00-\x1F]', ' ').Trim()
+    if ($s.StartsWith('"\??\')) { $s = '"' + $s.Substring(5) }
+    elseif ($s.StartsWith('\??\')) { $s = $s.Substring(4) }
+    if ($Service) {
+        if ($s -match '^(?i)\\SystemRoot\\') { $s = '%SystemRoot%' + $s.Substring(11) }
+        elseif ($s -match '^(?i)system32\\') { $s = '%SystemRoot%\' + $s }
+    }
+    $s = (Expand-JarvisEnvVars $s $Vars).Trim()
+    if (-not $s) { return $r }
+    $head = Get-CommandHead $s
+    $exe = [string]@($head.Candidates)[0]
+    $r.Exe = $exe
+    $leaf = ($exe -split '[\\/]')[-1]
+    $kind = 'Path'
+    $extRx = '(?i)\.(exe|com|bat|cmd|lnk|vbs|vbe|js|jse|wsf|ps1|msc|cpl|scr|pif|dll)$'
+    $cands = @($head.Candidates)
+    if ($leaf -match '^(?i)rundll32(\.exe)?$') {
+        $kind = 'Rundll32'
+        $extRx = '\.[A-Za-z0-9]{1,5}$'
+        $a = $head.Rest
+        if ($a.StartsWith('"')) { $cands = @(@((Get-CommandHead $a).Candidates)[0]) }
+        elseif ($a) { $cands = @((($a -split ',', 2)[0]).Trim()) }
+        else { $cands = @() }
+    } elseif ($leaf -match '^(?i)[wc]script(\.exe)?$') {
+        $kind = 'Script'
+        $extRx = '\.[A-Za-z0-9]{1,5}$'
+        $a = $head.Rest
+        while ($a -match '^/\S*\s*') { $a = $a.Substring($Matches[0].Length) }
+        if ($a) { $cands = @((Get-CommandHead $a).Candidates) } else { $cands = @() }
+    } elseif ($leaf -match '^(?i)msiexec(\.exe)?$') {
+        $r.Kind = 'Msi'
+        $r.Candidates = @($exe)
+        return $r
+    }
+    $cands = @($cands | Where-Object { $_ -and ([string]$_).IndexOf(':', 2) -lt 0 -and [string]$_ -notmatch '[<>"|?*]' })
+    if ($Wow64 -or ($kind -ne 'Path' -and $exe -match '(?i)\\SysWOW64\\')) { $cands = @(Add-Wow64Alternatives $cands $Vars) }
+    $r.Candidates = $cands
+    if ($cands.Count -eq 0) { $r.Kind = 'Unknown'; return $r }
+    foreach ($c in $cands) {
+        $k = Get-PathKind $c
+        if ($k -ne 'Path') { $r.Kind = $k; return $r }
+        if ($c -notmatch $extRx) { $r.Kind = 'Unknown'; return $r }
+    }
+    $r.Kind = $kind
+    return $r
+}
+
+function Get-LinkVerdict($States) {
+    # Verdict d'un lien d'après l'état de chacun de ses chemins possibles (Get-PathState) : OK si l'un existe, DEAD
+    # seulement si tous sont absents, NODRIVE si l'un est sur un lecteur absent (disque externe, clé USB), UNKNOWN dès
+    # qu'un état est inconnu (accès refusé, chemin réseau) ou qu'aucun état n'est donné. Fonction pure, T1.
+    $s = @(@($States) | Where-Object { $null -ne $_ } | ForEach-Object { ([string]$_).ToUpperInvariant() })
+    if ($s.Count -eq 0) { return 'UNKNOWN' }
+    if ($s -contains 'PRESENT') { return 'OK' }
+    if (@($s | Where-Object { @('ABSENT', 'NODRIVE') -notcontains $_ }).Count -gt 0) { return 'UNKNOWN' }
+    if ($s -contains 'NODRIVE') { return 'NODRIVE' }
+    return 'DEAD'
+}
+
+function Get-DriveKind([string]$Letter) {
+    # FIXED (disque interne présent), OTHER (clé USB, carte, DVD, lecteur réseau, disque virtuel), NONE (lettre sans
+    # lecteur) ou UNKNOWN. Gardé en mémoire pour le scan : un lecteur réseau hors ligne n'est interrogé qu'une fois, et
+    # son type se lit sans contacter le serveur.
+    if ($null -eq (Get-Variable -Name JarvisDriveKinds -Scope Script -ErrorAction SilentlyContinue)) { $script:JarvisDriveKinds = @{} }
+    $l = ([string]$Letter).ToUpperInvariant()
+    if ($script:JarvisDriveKinds.ContainsKey($l)) { return $script:JarvisDriveKinds[$l] }
+    $k = 'UNKNOWN'
+    try {
+        $t = (New-Object IO.DriveInfo $l).DriveType
+        if ($t -eq [IO.DriveType]::Fixed) {
+            $k = 'FIXED'
+            if (-not [IO.Directory]::Exists($l + ':\')) { $k = 'NONE' }
+        }
+        elseif ($t -eq [IO.DriveType]::NoRootDirectory) { $k = 'NONE' }
+        else { $k = 'OTHER' }
+    } catch { $k = 'UNKNOWN' }
+    $script:JarvisDriveKinds[$l] = $k
+    return $k
+}
+
+function Get-PathState([string]$Path) {
+    # État d'un fichier ou d'un dossier : PRESENT, ABSENT, NODRIVE (lecteur absent, ou qui n'est pas un disque interne)
+    # ou UNKNOWN (accès refusé, chemin réseau ou relatif, nom invalide). [IO.File]::Exists rend faux aussi sur un accès
+    # refusé : d'où GetAttributes et le type de l'erreur. Relecture du lot 3 : seul un disque interne (Get-DriveKind) se
+    # juge, car une clé USB ou une carte peut avoir pris la lettre d'un disque externe débranché. Console 32 bits :
+    # System32 lu par Sysnative (sinon Windows y montrerait SysWOW64). T1 sur le dossier Windows, qui existe partout.
+    if (-not $Path -or $Path -notmatch '^[A-Za-z]:\\') { return 'UNKNOWN' }
+    $p = $Path
+    if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+        $win = [Environment]::GetFolderPath('Windows')
+        $sys = Join-Path $win 'System32'
+        if ($p.StartsWith($sys + '\', [StringComparison]::OrdinalIgnoreCase)) { $p = (Join-Path $win 'Sysnative') + $p.Substring($sys.Length) }
+    }
+    $dk = Get-DriveKind $p.Substring(0, 1)
+    if ($dk -eq 'UNKNOWN') { return 'UNKNOWN' }
+    if ($dk -ne 'FIXED') { return 'NODRIVE' }
+    try {
+        [void][IO.File]::GetAttributes($p)
+        return 'PRESENT'
+    }
+    catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] { return 'ABSENT' }
+    catch { return 'UNKNOWN' }
+}
+
+function Get-CommandVerdict($Parsed) {
+    # Verdict d'une ligne lue par ConvertFrom-CommandLine : seuls Path, Rundll32 et Script se jugent sur le disque
+    if ($null -eq $Parsed -or @('Path', 'Rundll32', 'Script') -notcontains $Parsed.Kind) { return 'UNKNOWN' }
+    return (Get-LinkVerdict @(@($Parsed.Candidates) | ForEach-Object { Get-PathState $_ }))
+}
+
+function Test-UserVarPath([string]$Text) {
+    # Chemin qui dépend du compte (%APPDATA%, %LOCALAPPDATA%...) : pour la tâche d'un autre compte, il ne se juge pas
+    # depuis celui-ci (la tâche OneDrive d'un autre utilisateur du PC paraîtrait morte). Fonction pure, T1.
+    return ([string]$Text -match '(?i)%(APPDATA|LOCALAPPDATA|USERPROFILE|TEMP|TMP|HOMEPATH|HOMEDRIVE|HOMESHARE|USERNAME|ONEDRIVE\w*)%')
+}
+
+function Test-SameTaskUser([string]$UserId, [string]$FullName, [string]$Sid) {
+    # Compte d'une tâche planifiée (« PC\Marie », « .\Marie », « Marie » ou S-1-5-21-...) = compte qui exécute JARVIS
+    # ($FullName : « PC\Marie », lu par WindowsIdentity) ? Relecture du lot 3 : le domaine ou le PC est comparé aussi
+    # (« DOMAINE\Marie » n'est pas le compte local Marie). Inconnu (vide, groupe, adresse de messagerie) = non.
+    # Fonction pure, T1.
+    $u = ([string]$UserId).Trim()
+    if (-not $u) { return $false }
+    if ($Sid -and [string]::Equals($u, $Sid, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    $f = ([string]$FullName).Trim()
+    if (-not $f) { return $false }
+    $leaf = ($f -split '\\')[-1]
+    $dom = ''
+    if ($f.Contains('\')) { $dom = ($f -split '\\')[0] }
+    if ($u.Contains('\')) {
+        $ud = ($u -split '\\')[0]
+        if (-not [string]::Equals(($u -split '\\')[-1], $leaf, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+        return ($ud -eq '.' -or ($dom -and [string]::Equals($ud, $dom, [StringComparison]::OrdinalIgnoreCase)))
+    }
+    return [string]::Equals($u, $leaf, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-UnderRoot([string]$Path, [string]$Root) {
+    # $Path est-il dans le dossier $Root (ou est-il ce dossier) ? Comparaison sans casse, $Root vide = non. Pure, T1.
+    $r = ([string]$Root).TrimEnd('\')
+    $p = [string]$Path
+    if (-not $r -or -not $p) { return $false }
+    return ([string]::Equals($p.TrimEnd('\'), $r, [StringComparison]::OrdinalIgnoreCase) -or
+            $p.StartsWith($r + '\', [StringComparison]::OrdinalIgnoreCase))
+}
+
+function Test-NotFoundHResult($HResult) {
+    # Code d'erreur Windows « introuvable » (0x80070002 fichier, 0x80070003 chemin) : seule preuve qu'une tâche ou un
+    # dossier du Planificateur n'existe plus (un accès refusé n'en est pas une). Fonction pure, T1.
+    if ($null -eq $HResult) { return $false }
+    return (@(-2147024894, -2147024893) -contains [int]$HResult)
+}
+
+function Get-InnerHResult($ErrorRecord) {
+    # Code d'erreur de l'exception la plus profonde (une erreur COM arrive enveloppée par PowerShell)
+    $ex = $null
+    if ($null -ne $ErrorRecord) { $ex = $ErrorRecord.Exception }
+    while ($null -ne $ex -and $null -ne $ex.InnerException) { $ex = $ex.InnerException }
+    if ($null -eq $ex) { return $null }
+    return $ex.HResult
+}
+
+function Get-JarvisEnvTable([bool]$WithUser) {
+    # Table des variables pour Expand-JarvisEnvVars, lue par [Environment]::GetFolderPath (règle 33), au sens 64 bits
+    # (Explorer, le Planificateur de tâches et le gestionnaire des services sont en 64 bits). -WithUser : dossiers du
+    # compte, seulement quand JARVIS tourne sous le compte de la session (sinon ce seraient ceux d'un autre compte).
+    $win = [Environment]::GetFolderPath('Windows')
+    $pf = Get-ProgramFilesDir
+    $pf86 = [Environment]::GetFolderPath('ProgramFilesX86')
+    $pd = [Environment]::GetFolderPath('CommonApplicationData')
+    $t = @{ SystemRoot = $win; windir = $win; ProgramData = $pd; ALLUSERSPROFILE = $pd }
+    if ($win -match '^[A-Za-z]:') { $t['SystemDrive'] = $win.Substring(0, 2) }
+    if ($pf) {
+        $t['ProgramFiles'] = $pf; $t['ProgramW6432'] = $pf
+        $t['CommonProgramFiles'] = (Join-Path $pf 'Common Files'); $t['CommonProgramW6432'] = (Join-Path $pf 'Common Files')
+    }
+    if ($pf86) { $t['ProgramFiles(x86)'] = $pf86; $t['CommonProgramFiles(x86)'] = (Join-Path $pf86 'Common Files') }
+    $pub = [Environment]::GetFolderPath('CommonDocuments')
+    if ($pub) { $t['PUBLIC'] = (Split-Path -Parent $pub) }
+    if ($WithUser) {
+        $t['APPDATA'] = [Environment]::GetFolderPath('ApplicationData')
+        $t['LOCALAPPDATA'] = [Environment]::GetFolderPath('LocalApplicationData')
+        $t['USERPROFILE'] = [Environment]::GetFolderPath('UserProfile')
+    }
+    foreach ($k in @($t.Keys)) { if (-not $t[$k]) { $t.Remove($k) } }
+    return $t
+}
+
+function Get-NameKey([string]$Text) {
+    # Nom ramené à ses lettres et chiffres, en minuscules, sans forme juridique finale (« NVIDIA Corporation » et
+    # « NVIDIA » donnent « nvidia »). Fonction pure, T1 par Test-NameClaimed.
+    $s = ([string]$Text).ToLowerInvariant().Trim()
+    $s = $s -replace '[,\.\s]+(inc|corp|corporation|ltd|llc|gmbh|sa|sas|srl|limited|co|ag|bv)\.?$', ''
+    return ($s -replace '[^\p{L}\p{N}]', '')
+}
+
+function Test-NameClaimed([string]$Folder, $Claims) {
+    # Dossier de Program Files revendiqué par une application ou un éditeur installé (le nom de l'un contenu dans
+    # l'autre, après Get-NameKey). Nom trop court pour juger (moins de 3 lettres) = réputé revendiqué : dans le doute,
+    # le dossier n'est pas montré. Fonction pure, T1.
+    $f = Get-NameKey $Folder
+    if ($f.Length -lt 3) { return $true }
+    foreach ($c in @($Claims)) {
+        $k = Get-NameKey ([string]$c)
+        if ($k.Length -lt 3) { continue }
+        if ($k.Contains($f) -or $f.Contains($k)) { return $true }
+    }
+    return $false
+}
+
+function Get-ShortcutVerdict($Shell, [string]$Path, [string]$WinDir, [string]$UsersRoot = '') {
+    # Verdict d'un raccourci .lnk (cible lue par WScript.Shell). Cible vide (élément de Windows, application du
+    # Store), raccourci d'installation MSI (cible dans Windows\Installer, réparée par Windows Installer), chemin
+    # réseau ou raccourci illisible : UNKNOWN, jamais mort. Relecture du lot 3 : console 32 bits = UNKNOWN (vérifié le
+    # 27/11/2026, WScript.Shell y réécrit « C:\Program Files\... » en « C:\Program Files (x86)\... » : Excel et Chrome
+    # paraissaient morts) ; $UsersRoot (dossier des profils, pour un raccourci commun à tous les comptes) : cible dans
+    # un profil = UNKNOWN, car WScript.Shell remplace %LOCALAPPDATA% par le dossier du compte qui lance JARVIS.
+    if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) { return [pscustomobject]@{ Verdict = 'UNKNOWN'; Target = '' } }
+    $t = ''
+    try { $t = ([string]$Shell.CreateShortcut($Path).TargetPath).Trim() }
+    catch { return [pscustomobject]@{ Verdict = 'UNKNOWN'; Target = '' } }
+    if (-not $t -or (Get-PathKind $t) -ne 'Path') { return [pscustomobject]@{ Verdict = 'UNKNOWN'; Target = $t } }
+    if (($WinDir -and (Test-UnderRoot $t (Join-Path $WinDir 'Installer'))) -or (Test-UnderRoot $t $UsersRoot)) {
+        return [pscustomobject]@{ Verdict = 'UNKNOWN'; Target = $t }
+    }
+    return [pscustomobject]@{ Verdict = (Get-LinkVerdict @(Get-PathState $t)); Target = $t }
+}
+
+function Find-CodeFile([string]$Path, [int]$MaxEntries = 20000, [int]$MaxMs = 3000) {
+    # Le dossier contient-il un programme (exe, dll, pilote, script) ? YES dès le premier trouvé, NO après un parcours
+    # complet (jonctions jamais suivies), UNKNOWN si le parcours est trop long ou qu'un sous-dossier est illisible.
+    $rx = '^(?i)\.(exe|dll|sys|com|msi|msix|cmd|bat|ps1|jar|py)$'
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $n = 0
+    $stack = New-Object System.Collections.Stack
+    $stack.Push($Path)
+    while ($stack.Count -gt 0) {
+        $cur = [string]$stack.Pop()
+        try {
+            foreach ($it in (New-Object IO.DirectoryInfo $cur).EnumerateFileSystemInfos()) {
+                $n++
+                if ($n -gt $MaxEntries -or $sw.ElapsedMilliseconds -gt $MaxMs) { return 'UNKNOWN' }
+                if ($it.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+                if ($it -is [IO.DirectoryInfo]) { $stack.Push($it.FullName); continue }
+                if ($it.Extension -match $rx) { return 'YES' }
+            }
+        } catch { return 'UNKNOWN' }
+    }
+    return 'NO'
+}
+
+function New-RemnantItem([string]$Source, [string]$Name, [string]$Target, [string]$Verdict, [string]$Location) {
+    # Un reste trouvé : Source (Startup, Shortcut, Task, Uninstall, Service, Folder), Verdict (DEAD, NODRIVE, LEFT pour
+    # un dossier), Location (clé, fichier ou chemin de la tâche). Hive, SubKey, Raw, RawKind : valeur Run d'origine.
+    return [pscustomobject]@{ Source = $Source; Name = $Name; Target = $Target; Verdict = $Verdict; Location = $Location
+                              Hive = ''; SubKey = ''; Raw = ''; RawKind = ''; Active = $true; Bytes = $null }
+}
+
+function Get-RemnantStartup($Entries, $Vars, $Shell, [string]$WinDir, [string]$UsersRoot = '') {
+    # Démarrage (clés Run et dossiers Démarrage lus par Get-StartupEntries) vers un programme absent ou un lecteur absent.
+    # Relecture du lot 3 : une entrée commune à tous les comptes (HKLM, dossier Démarrage commun) qui passe par un
+    # dossier du compte (%LOCALAPPDATA%..., ou cible dans un profil) ne se juge pas : Windows la lit pour chaque compte,
+    # et l'application peut exister chez un autre. Run32 : chemins System32 lus aussi dans SysWOW64.
+    $items = [System.Collections.Generic.List[object]]::new()
+    foreach ($e in @($Entries)) {
+        if ($null -eq $e) { continue }
+        $it = $null
+        if ($e.Source -eq 'Folder') {
+            if ($e.File -notmatch '(?i)\.lnk$') { continue }   # programme posé tel quel dans le dossier : il existe
+            $ur = ''
+            if ($e.Hive -eq 'HKLM') { $ur = $UsersRoot }
+            $sv = Get-ShortcutVerdict $Shell $e.File $WinDir $ur
+            if (@('DEAD', 'NODRIVE') -notcontains $sv.Verdict) { continue }
+            $it = New-RemnantItem 'Startup' ([IO.Path]::GetFileNameWithoutExtension([string]$e.Name)) $sv.Target $sv.Verdict $e.File
+        } else {
+            if (@('String', 'ExpandString') -notcontains [string]$e.RawKind) { continue }
+            if ($e.Hive -eq 'HKLM' -and (Test-UserVarPath $e.Raw)) { continue }
+            $pc = ConvertFrom-CommandLine $e.Raw $Vars -Wow64:($e.Source -eq 'Run32')
+            $v = Get-CommandVerdict $pc
+            if (@('DEAD', 'NODRIVE') -notcontains $v) { continue }
+            $it = New-RemnantItem 'Startup' ([string]$e.Name) ([string](@($pc.Candidates) | Select-Object -First 1)) $v ($e.Hive + '\' + $e.SubKey)
+            $it.Hive = $e.Hive; $it.SubKey = $e.SubKey; $it.Raw = $e.Raw; $it.RawKind = $e.RawKind
+        }
+        $it.Active = ((Get-StartupApprovedState $e.Approved) -ne 'OFF')
+        $items.Add($it)
+    }
+    # Liste rendue élément par élément (pas « , tableau ») : @(Get-RemnantStartup ...) doit donner les restes eux-mêmes.
+    # Banc du 27/11/2026 : rendue emballée, la section 13 recevait un seul objet qui contenait toute la liste.
+    return $items.ToArray()
+}
+
+function Get-RemnantShortcuts([string[]]$Roots, [string[]]$Skip, $Shell, [string]$WinDir, [string]$SharedRoot = '', [string]$UsersRoot = '') {
+    # Raccourcis du menu Démarrer (Programmes du compte et de tous les utilisateurs ; dossiers Démarrage exclus, vus
+    # avec le démarrage) dont la cible est absente. $SharedRoot : dossier commun, dont les cibles dans un profil ne se
+    # jugent pas ($UsersRoot, voir Get-ShortcutVerdict). Read = $false si un dossier n'a pas pu être lu.
+    $r = [pscustomobject]@{ Read = $true; Items = @(); Seen = 0 }
+    $items = [System.Collections.Generic.List[object]]::new()
+    foreach ($root in @($Roots | Where-Object { $_ })) {
+        if (-not [IO.Directory]::Exists($root)) { continue }
+        $ur = ''
+        if ($SharedRoot -and (Test-UnderRoot $root $SharedRoot)) { $ur = $UsersRoot }
+        $stack = New-Object System.Collections.Stack
+        $stack.Push($root)
+        while ($stack.Count -gt 0) {
+            $cur = [string]$stack.Pop()
+            try {
+                foreach ($it in (New-Object IO.DirectoryInfo $cur).EnumerateFileSystemInfos()) {
+                    if ($it.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+                    if ($it -is [IO.DirectoryInfo]) {
+                        $skipIt = $false
+                        foreach ($s in @($Skip)) { if ($s -and [string]::Equals($it.FullName.TrimEnd('\'), $s.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) { $skipIt = $true } }
+                        if (-not $skipIt) { $stack.Push($it.FullName) }
+                        continue
+                    }
+                    if ($it.Extension -ne '.lnk') { continue }
+                    $r.Seen++
+                    $sv = Get-ShortcutVerdict $Shell $it.FullName $WinDir $ur
+                    if (@('DEAD', 'NODRIVE') -notcontains $sv.Verdict) { continue }
+                    $items.Add((New-RemnantItem 'Shortcut' $it.BaseName $sv.Target $sv.Verdict $it.FullName))
+                }
+            } catch { $r.Read = $false }
+        }
+    }
+    $r.Items = $items.ToArray()
+    return $r
+}
+
+function Get-TaskVerdict($Task, $Vars, [string]$UserFullName, [string]$UserSid) {
+    # Verdict d'une tâche planifiée (objet COM) : DEAD si toutes ses actions lancent un programme absent, NODRIVE si
+    # elles mènent à un lecteur absent, UNKNOWN sinon. Une tâche qui fait autre chose que lancer un programme (action
+    # COM, courriel) ne se juge pas ; un chemin du compte (%LOCALAPPDATA%...) seulement pour une tâche de ce compte.
+    $def = $Task.Definition
+    $acts = @($def.Actions)
+    $res = [pscustomobject]@{ Verdict = 'UNKNOWN'; Target = '' }
+    if ($acts.Count -eq 0 -or @($acts | Where-Object { $_.Type -ne 0 }).Count -gt 0) { return $res }
+    $uid = [string]$def.Principal.UserId
+    $verdicts = @()
+    foreach ($a in $acts) {
+        $line = '"' + ([string]$a.Path).Trim().Trim('"') + '" ' + [string]$a.Arguments
+        if ((Test-UserVarPath $line) -and -not (Test-SameTaskUser $uid $UserFullName $UserSid)) { $verdicts += 'UNKNOWN'; continue }
+        $pc = ConvertFrom-CommandLine $line $Vars
+        if (-not $res.Target) { $res.Target = [string](@($pc.Candidates) | Select-Object -First 1) }
+        $verdicts += (Get-CommandVerdict $pc)
+    }
+    if (@($verdicts | Where-Object { $_ -ne 'DEAD' }).Count -eq 0) { $res.Verdict = 'DEAD' }
+    elseif (@($verdicts | Where-Object { @('DEAD', 'NODRIVE') -notcontains $_ }).Count -eq 0) { $res.Verdict = 'NODRIVE' }
+    return $res
+}
+
+function Get-RemnantTasks($Vars, [string]$UserFullName, [string]$UserSid) {
+    # Tâches planifiées hors \Microsoft\ (objet COM Schedule.Service, pas le module CIM : règle 29). Partial = $true si
+    # un dossier ou une tâche n'a pas pu être lu ; sans droits admin, Windows cache en plus certaines tâches.
+    $r = [pscustomobject]@{ Read = $false; Partial = $false; Items = @(); Seen = 0 }
+    $items = [System.Collections.Generic.List[object]]::new()
+    $stack = New-Object System.Collections.Stack
+    try {
+        $svc = New-Object -ComObject 'Schedule.Service'
+        $svc.Connect()
+        $stack.Push($svc.GetFolder('\'))
+    } catch { return $r }
+    $r.Read = $true
+    while ($stack.Count -gt 0) {
+        $f = $stack.Pop()
+        try {
+            foreach ($sub in @($f.GetFolders(0))) {
+                if ([string]$sub.Path -notmatch '^(?i)\\Microsoft(\\|$)') { $stack.Push($sub) }
+            }
+        } catch { $r.Partial = $true }
+        $tasks = @()
+        try { $tasks = @($f.GetTasks(1)) } catch { $r.Partial = $true; continue }
+        foreach ($t in $tasks) {
+            $r.Seen++
+            try {
+                $tv = Get-TaskVerdict $t $Vars $UserFullName $UserSid
+                if (@('DEAD', 'NODRIVE') -notcontains $tv.Verdict) { continue }
+                $it = New-RemnantItem 'Task' ([string]$t.Name) $tv.Target $tv.Verdict ([string]$t.Path)
+                $it.Active = [bool]$t.Enabled
+                $items.Add($it)
+            } catch { $r.Partial = $true }
+        }
+    }
+    $r.Items = $items.ToArray()
+    return $r
+}
+
+function Get-RemnantUninstall($Vars, [bool]$WithUser) {
+    # Liste des applications installées (clés Uninstall) : entrée dont le dossier d'installation ET le programme de
+    # désinstallation ont disparu. Jamais jugées : composants système, entrées de Windows Installer (MSI), mises à jour
+    # (ParentKeyName), entrées sans nom ou sans dossier renseigné. Claims : noms et éditeurs de toutes les entrées
+    # (pour Test-NameClaimed). Partial : une entrée illisible.
+    $r = [pscustomobject]@{ Read = $false; Partial = $false; Items = @(); Claims = @(); Seen = 0 }
+    $items = [System.Collections.Generic.List[object]]::new()
+    $claims = [System.Collections.Generic.List[string]]::new()
+    $u = 'Software\Microsoft\Windows\CurrentVersion\Uninstall'
+    $hkcu = $null; $hklm = $null
+    try {
+        $hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+        $src = @(@($hklm, $u, 'HKLM', $false), @($hklm, 'Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM', $true))
+        if ($WithUser) {
+            $hkcu = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::CurrentUser, [Microsoft.Win32.RegistryView]::Registry64)
+            $src += , @($hkcu, $u, 'HKCU', $false)
+        }
+        foreach ($s in $src) {
+            $k = $s[0].OpenSubKey($s[1])
+            if ($null -eq $k) { continue }
+            try {
+                foreach ($n in $k.GetSubKeyNames()) {
+                    $e = $null
+                    try {
+                        $e = $k.OpenSubKey($n)
+                        if ($null -eq $e) { continue }
+                        $r.Seen++
+                        $dn = ([string]$e.GetValue('DisplayName')).Trim()
+                        $pub = ([string]$e.GetValue('Publisher')).Trim()
+                        if ($dn) { $claims.Add($dn) }
+                        if ($pub) { $claims.Add($pub) }
+                        if (-not $dn) { continue }
+                        if ((ConvertTo-IntOrNull $e.GetValue('SystemComponent')) -eq 1) { continue }
+                        if ((ConvertTo-IntOrNull $e.GetValue('WindowsInstaller')) -eq 1) { continue }
+                        if ($e.GetValue('ParentKeyName')) { continue }
+                        $loc = ([string]$e.GetValue('InstallLocation', $null, 'DoNotExpandEnvironmentNames')).Trim().Trim('"').Trim()
+                        $uns = [string]$e.GetValue('UninstallString', $null, 'DoNotExpandEnvironmentNames')
+                        if (-not $loc -or -not $uns.Trim()) { continue }
+                        $loc = Expand-JarvisEnvVars $loc $Vars
+                        if ((Get-PathKind $loc) -ne 'Path') { continue }
+                        $pc = ConvertFrom-CommandLine $uns $Vars -Wow64:([bool]$s[3])
+                        if ($pc.Kind -eq 'Msi') { continue }
+                        if ((Get-PathState $loc) -ne 'ABSENT') { continue }
+                        if ((Get-CommandVerdict $pc) -ne 'DEAD') { continue }
+                        $items.Add((New-RemnantItem 'Uninstall' $dn $loc 'DEAD' ($s[2] + '\' + $s[1] + '\' + $n)))
+                    } catch { $r.Partial = $true }
+                    finally { if ($null -ne $e) { $e.Close() } }
+                }
+            } finally { $k.Close() }
+        }
+        $r.Read = $true
+    } catch {
+        $r.Read = $false
+    } finally {
+        if ($null -ne $hkcu) { $hkcu.Close() }
+        if ($null -ne $hklm) { $hklm.Close() }
+    }
+    $r.Items = $items.ToArray()
+    $r.Claims = $claims.ToArray()
+    return $r
+}
+
+function Get-RemnantServices($Vars) {
+    # Services (types 0x10 et 0x20 : des programmes, pas les pilotes) dont le programme a disparu. Partial : un service
+    # illisible.
+    $r = [pscustomobject]@{ Read = $false; Partial = $false; Items = @(); Seen = 0 }
+    $items = [System.Collections.Generic.List[object]]::new()
+    $hklm = $null
+    try {
+        $hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+        $k = $hklm.OpenSubKey('SYSTEM\CurrentControlSet\Services')
+        if ($null -eq $k) { return $r }
+        try {
+            foreach ($n in $k.GetSubKeyNames()) {
+                $e = $null
+                try {
+                    $e = $k.OpenSubKey($n)
+                    if ($null -eq $e) { continue }
+                    $ty = ConvertTo-IntOrNull $e.GetValue('Type')
+                    if ($null -eq $ty -or ($ty -band 0x30) -eq 0) { continue }
+                    $r.Seen++
+                    $ip = [string]$e.GetValue('ImagePath', $null, 'DoNotExpandEnvironmentNames')
+                    if (-not $ip.Trim()) { continue }
+                    $pc = ConvertFrom-CommandLine $ip $Vars -Service
+                    $v = Get-CommandVerdict $pc
+                    if (@('DEAD', 'NODRIVE') -notcontains $v) { continue }
+                    $dn = ([string]$e.GetValue('DisplayName')).Trim()
+                    if (-not $dn -or $dn.StartsWith('@')) { $dn = $n }
+                    $it = New-RemnantItem 'Service' $dn ([string](@($pc.Candidates) | Select-Object -First 1)) $v $n
+                    $it.Active = ((ConvertTo-IntOrNull $e.GetValue('Start')) -ne 4)
+                    $items.Add($it)
+                } catch { $r.Partial = $true }
+                finally { if ($null -ne $e) { $e.Close() } }
+            }
+        } finally { $k.Close() }
+        $r.Read = $true
+    } catch {
+        $r.Read = $false
+    } finally { if ($null -ne $hklm) { $hklm.Close() } }
+    $r.Items = $items.ToArray()
+    return $r
+}
+
+function Get-RemnantFolders([string[]]$Roots, $Claims, [string[]]$Skip, [int64]$MinBytes, [int]$BudgetSeconds = 20) {
+    # Dossiers directs de Program Files sans aucun programme (Find-CodeFile), qu'aucune application ni aucun éditeur
+    # installé ne revendique (Test-NameClaimed) et d'au moins $MinBytes. Relevé du 27/11/2026 sur le PC de Thomas : sans
+    # seuil, les 3 dossiers trouvés étaient de faux restes de moins de 1 Mo (VulkanRT, journal du composant Vulkan
+    # installé par le pilote graphique, et Epic Online Services, clé de la machine utilisée par des jeux). Dossiers de
+    # Windows, cachés, système ou modifiés depuis moins de 24 h (installation en cours) : jamais montrés. Seulement
+    # signalés, jamais supprimés. Partial : temps écoulé, ou dossier trop long ou impossible à parcourir.
+    $known = @('Common Files', 'Internet Explorer', 'Microsoft Update Health Tools', 'ModifiableWindowsApps', 'MSBuild',
+               'Reference Assemblies', 'Uninstall Information', 'Windows Defender', 'Windows Defender Advanced Threat Protection',
+               'Windows Mail', 'Windows Media Player', 'Windows Multimedia Platform', 'Windows NT', 'Windows Photo Viewer',
+               'Windows Portable Devices', 'Windows Security', 'Windows Sidebar', 'WindowsApps', 'WindowsPowerShell',
+               'Microsoft.NET', 'dotnet', 'Windows Kits', 'Microsoft SDKs', 'Package Cache', 'Microsoft')
+    $r = [pscustomobject]@{ Read = $true; Partial = $false; Items = @(); Seen = 0 }
+    $items = [System.Collections.Generic.List[object]]::new()
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $seen = @()
+    foreach ($root in @($Roots | Where-Object { $_ })) {
+        if ($seen -contains $root.ToLowerInvariant()) { continue }
+        $seen += $root.ToLowerInvariant()
+        $dirs = @()
+        try { $dirs = @((New-Object IO.DirectoryInfo $root).GetDirectories()) } catch { $r.Read = $false; continue }
+        foreach ($d in $dirs) {
+            if ($sw.Elapsed.TotalSeconds -ge $BudgetSeconds) { $r.Partial = $true; break }
+            if ($d.Attributes -band ([IO.FileAttributes]::ReparsePoint -bor [IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System)) { continue }
+            if ($known -contains $d.Name) { continue }
+            $r.Seen++
+            $skipIt = $false
+            foreach ($s in @($Skip)) { if ($s -and [string]::Equals($d.FullName.TrimEnd('\'), $s.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) { $skipIt = $true } }
+            if ($skipIt -or $d.LastWriteTime -gt (Get-Date).AddDays(-1)) { continue }
+            if (Test-NameClaimed $d.Name $Claims) { continue }
+            $code = Find-CodeFile $d.FullName
+            if ($code -eq 'UNKNOWN') { $r.Partial = $true; continue }
+            if ($code -ne 'NO') { continue }
+            $m = Measure-FolderBounded $d.FullName 3
+            if ($m.Bytes -lt $MinBytes) {
+                if (-not $m.Complete) { $r.Partial = $true }
+                continue
+            }
+            $it = New-RemnantItem 'Folder' $d.Name '' 'LEFT' $d.FullName
+            $it.Bytes = $m.Bytes
+            $items.Add($it)
+        }
+    }
+    $r.Items = $items.ToArray()
+    return $r
+}
+
+function Get-RemnantRows($Items) {
+    # Lignes de la section 13, une par sorte de reste, dans l'ordre d'affichage. Démarrage actif vers un programme
+    # absent = WARN (Windows essaie de le lancer à chaque ouverture de session) ; le reste en INFO. Un lien vers un
+    # lecteur absent ou qui n'est pas un disque interne (clé USB, lecteur réseau) est rangé à part et n'est jamais
+    # compté mort. Fonction pure, T1.
+    $defs = @(
+        @('Startup', 'Démarrage : programme absent', '{0} entrée(s)'),
+        @('Shortcut', 'Menu Démarrer : raccourci cassé', '{0} raccourci(s)'),
+        @('Task', 'Tâche planifiée sans programme', '{0} tâche(s)'),
+        @('Uninstall', 'Liste des applications', '{0} entrée(s) sans programme'),
+        @('Service', 'Service sans programme', '{0} service(s)'),
+        @('Folder', 'Dossier restant (Program Files)', '{0} dossier(s)'),
+        @('NoDrive', 'Lien vers un lecteur externe', '{0} lien(s)'))
+    $all = @(@($Items) | Where-Object { $null -ne $_ })
+    $rows = @()
+    foreach ($d in $defs) {
+        if ($d[0] -eq 'NoDrive') { $sel = @($all | Where-Object { $_.Verdict -eq 'NODRIVE' }) }
+        else { $sel = @($all | Where-Object { $_.Source -eq $d[0] -and $_.Verdict -ne 'NODRIVE' }) }
+        if ($sel.Count -eq 0) { continue }
+        $state = 'INFO'
+        $off = @($sel | Where-Object { -not $_.Active }).Count
+        $value = $d[2] -f $sel.Count
+        if ($d[0] -eq 'Startup') {
+            if ($off -lt $sel.Count) { $state = 'WARN' }
+            if ($off -gt 0) { $value += (' dont {0} désactivée(s)' -f $off) }
+        }
+        if ($d[0] -eq 'Folder') {
+            $b = [int64]0
+            foreach ($x in $sel) { if ($null -ne $x.Bytes) { $b += [int64]$x.Bytes } }
+            $value += (', ' + (Format-Bytes $b))
+        }
+        $rows += [pscustomobject]@{ Key = $d[0]; Label = $d[1]; State = $state; Value = $value; Items = $sel }
+    }
+    return $rows
+}
+
+function Get-DeadLinkScope($Item, $Roots) {
+    # Liste blanche des liens que JARVIS peut retirer (plan du lot 3 : « Test-DeadLinkAllowed ») ; rend HKCU ou HKLM
+    # (valeur des clés Run et Run32 exactes, jamais RunOnce ni les stratégies), USER ou COMMON (raccourci .lnk sous les
+    # Programmes du menu Démarrer du compte ou de tous les utilisateurs, dossiers Démarrage compris), TASK (tâche hors
+    # \Microsoft\), ou '' (refusé). $Roots : @{ User = Programmes du compte ; Common = Programmes communs }. Seuls les
+    # liens morts (DEAD) sont acceptés, jamais un lecteur absent. Fonction pure, T1.
+    if ($null -eq $Item -or [string]$Item.Verdict -ne 'DEAD') { return '' }
+    $run = 'Software\Microsoft\Windows\CurrentVersion\Run'
+    $run32 = 'Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'
+    $loc = [string]$Item.Location
+    switch ([string]$Item.Source) {
+        'Startup' {
+            if ($Item.SubKey) {
+                if (-not $Item.Name -or @('String', 'ExpandString') -notcontains [string]$Item.RawKind) { return '' }
+                $sk = [string]$Item.SubKey
+                if ($Item.Hive -eq 'HKCU' -and [string]::Equals($sk, $run, [StringComparison]::OrdinalIgnoreCase)) { return 'HKCU' }
+                if ($Item.Hive -eq 'HKLM' -and ([string]::Equals($sk, $run, [StringComparison]::OrdinalIgnoreCase) -or
+                                                [string]::Equals($sk, $run32, [StringComparison]::OrdinalIgnoreCase))) { return 'HKLM' }
+                return ''
+            }
+        }
+        'Shortcut' { }
+        'Task' {
+            if (-not $loc.StartsWith('\') -or $loc.Length -lt 2 -or $loc -match '^(?i)\\Microsoft(\\|$)' -or
+                $loc -match '\\\.\.?(\\|$)' -or $loc.Contains('*')) { return '' }
+            return 'TASK'
+        }
+        default { return '' }
+    }
+    # Raccourci (Shortcut, ou fichier du dossier Démarrage)
+    if ($loc -notmatch '(?i)^[A-Za-z]:\\.+\.lnk$' -or $loc -match '\\\.\.?\\' -or $loc.Contains('~') -or $null -eq $Roots) { return '' }
+    foreach ($k in @('User', 'Common')) {
+        $root = ([string]$Roots[$k]).TrimEnd('\')
+        if ($root -and $loc.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            if ($k -eq 'User') { return 'USER' }
+            return 'COMMON'
+        }
+    }
+    return ''
+}
+
+function Test-DeadLinkRemovable($Item, $Roots, [bool]$IsAdmin) {
+    # Le lien peut-il être retiré avec les droits actuels ? Compte : toujours ; machine (HKLM, raccourcis communs,
+    # tâches) : en administrateur seulement. Fonction pure, T1.
+    $s = Get-DeadLinkScope $Item $Roots
+    if (-not $s) { return $false }
+    return (@('HKCU', 'USER') -contains $s -or $IsAdmin)
+}
+
+function Get-SafeFileName([string]$Name, [int]$Max = 40) {
+    # Nom de fichier de sauvegarde tiré du nom d'un lien : lettres, chiffres, espaces, - _ ( ) ; le reste devient _.
+    # Fonction pure, T1.
+    $s = [regex]::Replace(([string]$Name).Trim(), '[^\p{L}\p{N} _\-\(\)]', '_').Trim()
+    if ($s.Length -gt $Max) { $s = $s.Substring(0, $Max).Trim() }
+    if (-not $s -or $s -match '^[_ ]+$') { return 'element' }
+    return $s
+}
+
+function ConvertTo-RegFileText([string]$Hive, [string]$SubKey, [string]$Name, [string]$Value, [string]$Kind) {
+    # Fichier .reg qui remet une valeur Run retirée (double-clic, puis Oui). Texte simple entre guillemets pour une
+    # chaîne ordinaire ; hex(2) pour une chaîne à variables (REG_EXPAND_SZ, comme l'exporte l'Éditeur du Registre) ;
+    # hex(1) pour une chaîne qui contient un caractère de contrôle. $null si la ruche ou le type n'est pas prévu.
+    # Écrit en UTF-16 avec BOM par l'appelant (format de « Windows Registry Editor Version 5.00 »). Fonction pure, T1.
+    $roots = @{ HKCU = 'HKEY_CURRENT_USER'; HKLM = 'HKEY_LOCAL_MACHINE' }
+    if (-not $roots.ContainsKey([string]$Hive) -or -not $SubKey -or -not $Name) { return $null }
+    if (@('String', 'ExpandString') -notcontains $Kind) { return $null }
+    $esc = { param($t) ([string]$t).Replace('\', '\\').Replace('"', '\"') }
+    $v = [string]$Value
+    if ($Kind -eq 'String' -and $v -notmatch '[\x00-\x1F]') {
+        $data = '"' + (& $esc $v) + '"'
+    } else {
+        $bytes = [Text.Encoding]::Unicode.GetBytes($v + [char]0)
+        $hex = (@($bytes | ForEach-Object { $_.ToString('x2') }) -join ',')
+        if ($Kind -eq 'ExpandString') { $data = 'hex(2):' + $hex } else { $data = 'hex(1):' + $hex }
+    }
+    return ('Windows Registry Editor Version 5.00' + "`r`n`r`n" + '[' + $roots[$Hive] + '\' + $SubKey + ']' + "`r`n" +
+            '"' + (& $esc $Name) + '"=' + $data + "`r`n")
+}
+
+function Get-DeadLinkReadme($Done, [string]$When) {
+    # Mode d'emploi LISEZMOI.txt du dossier de sauvegarde : ce qui a été retiré, d'où, et comment le remettre.
+    # $Done : objets { File (nom du fichier de sauvegarde), Kind (Run, Shortcut, Task), Name, From }. Pure, T1.
+    $l = @(('J.A.R.V.I.S. : liens morts retirés le {0}. Ils menaient à des programmes absents.' -f $When), '',
+           'Pour en remettre un :',
+           '- fichier .reg (démarrage) : double-clic dessus, puis Oui. L''entrée revient à la prochaine ouverture de session.',
+           '- fichier .lnk (raccourci) : copie-le dans le dossier indiqué ci-dessous, puis renomme-le comme indiqué.',
+           '- fichier .xml (tâche planifiée) : Démarrer > Planificateur de tâches > Action > Importer une tâche, puis ce fichier.',
+           '', 'Retirés :')
+    foreach ($d in @($Done | Where-Object { $null -ne $_ })) {
+        switch ([string]$d.Kind) {
+            'Run' { $l += ('{0} : démarrage « {1} » ({2})' -f $d.File, $d.Name, $d.From) }
+            'Shortcut' { $l += ('{0} : raccourci « {1} », à remettre dans {2} sous le nom {3}' -f $d.File, $d.Name, (Split-Path -Parent ([string]$d.From)), (Split-Path -Leaf ([string]$d.From))) }
+            'Task' { $l += ('{0} : tâche planifiée « {1} » ({2})' -f $d.File, $d.Name, $d.From) }
+        }
+    }
+    $l += ''
+    $l += 'Ce dossier est supprimé avec J.A.R.V.I.S. si tu le désinstalles.'
+    return $l
+}
+
+function Test-OwnDirSafe([string]$Path) {
+    # Dossier créé par JARVIS dans le profil : vrai s'il n'existe pas encore, ou s'il n'est ni une jonction ni un lien
+    $at = $null
+    try { $at = [IO.File]::GetAttributes($Path) }
+    catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] { return $true }
+    catch { return $false }
+    return (-not ($at -band [IO.FileAttributes]::ReparsePoint))
+}
+
+function New-DeadLinkBackupDir {
+    # %LOCALAPPDATA%\JARVIS\Sauvegardes\AAAAMMJJ_HHMMSS (dossier du profil demandé à Windows, règle 33), refusé si un
+    # dossier de la chaîne est une jonction ou un lien, avant comme après sa création. $null = rien ne sera retiré.
+    $base = [Environment]::GetFolderPath('LocalApplicationData')
+    if (-not $base) { return $null }
+    $j = Join-Path $base 'JARVIS'
+    $s = Join-Path $j 'Sauvegardes'
+    $d = Join-Path $s (Get-Date -Format 'yyyyMMdd_HHmmss')
+    foreach ($p in @($j, $s, $d)) { if (-not (Test-OwnDirSafe $p)) { return $null } }
+    try { [void][IO.Directory]::CreateDirectory($d) } catch { return $null }
+    foreach ($p in @($j, $s, $d)) { if (-not (Test-OwnDirSafe $p)) { return $null } }
+    if (-not [IO.Directory]::Exists($d)) { return $null }
+    return $d
+}
+
+function Write-BackupFile([string]$Path, [string]$Text) {
+    # Fichier de sauvegarde écrit en UTF-16 avec BOM (.reg, .xml de tâche) puis relu : $true seulement s'il est identique
+    try {
+        if ([IO.File]::Exists($Path)) { return $false }
+        [IO.File]::WriteAllText($Path, $Text, [Text.Encoding]::Unicode)
+        return ([IO.File]::ReadAllText($Path, [Text.Encoding]::Unicode) -ceq $Text)
+    } catch { return $false }
+}
+
+function Remove-DeadRunValue($Item, [string]$BackupDir, [int]$Index, $Vars) {
+    # Retire une valeur Run morte : liste blanche (Get-DeadLinkScope), valeur relue et inchangée depuis le scan,
+    # programme toujours absent, sauvegarde .reg écrite et relue, suppression, puis relecture. Rend 'DONE|fichier',
+    # 'GONE' (déjà retirée), 'BACK' (le programme est revenu), 'SKIP:raison' ou 'FAIL:raison'.
+    $scope = Get-DeadLinkScope $Item $null
+    if (@('HKCU', 'HKLM') -notcontains $scope) { return 'FAIL:emplacement non autorisé' }
+    $hive = [Microsoft.Win32.RegistryHive]::CurrentUser
+    if ($scope -eq 'HKLM') { $hive = [Microsoft.Win32.RegistryHive]::LocalMachine }
+    $base = $null; $k = $null
+    try {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($hive, [Microsoft.Win32.RegistryView]::Registry64)
+        $k = $base.OpenSubKey([string]$Item.SubKey, $true)
+        if ($null -eq $k) { return 'FAIL:clé du démarrage non ouverte en écriture' }
+        $name = [string]$Item.Name
+        if (@($k.GetValueNames()) -notcontains $name) { return 'GONE' }
+        $raw = [string]$k.GetValue($name, $null, 'DoNotExpandEnvironmentNames')
+        $kind = [string]$k.GetValueKind($name)
+        if ($raw -cne [string]$Item.Raw -or $kind -ne [string]$Item.RawKind) { return 'SKIP:modifié depuis le scan' }
+        $v = Get-CommandVerdict (ConvertFrom-CommandLine $raw $Vars -Wow64:([string]$Item.SubKey -match '(?i)\\WOW6432Node\\'))
+        if ($v -eq 'OK') { return 'BACK' }
+        if ($v -ne 'DEAD') { return 'SKIP:cible illisible ou sur un lecteur externe' }
+        $text = ConvertTo-RegFileText $scope $Item.SubKey $name $raw $kind
+        if (-not $text) { return 'FAIL:sauvegarde impossible' }
+        $file = Join-Path $BackupDir ('{0:D2}_demarrage_{1}.reg' -f $Index, (Get-SafeFileName $name))
+        if (-not (Write-BackupFile $file $text)) { return 'FAIL:sauvegarde non écrite, rien n''a été retiré' }
+        $k.DeleteValue($name, $false)
+        if (@($k.GetValueNames()) -contains $name) { return 'FAIL:toujours présente après le retrait' }
+        return ('DONE|' + $file)
+    } catch {
+        return ('FAIL:' + (Cut ([string]$_.Exception.Message) 60))
+    } finally {
+        if ($null -ne $k) { $k.Close() }
+        if ($null -ne $base) { $base.Close() }
+    }
+}
+
+function Remove-DeadShortcut($Item, [string]$BackupDir, [int]$Index, $Roots, $Shell, [string]$WinDir) {
+    # Retire un raccourci mort du menu Démarrer ou d'un dossier Démarrage : liste blanche, aucune jonction entre le
+    # dossier Programmes et le fichier, cible toujours absente, copie du .lnk dans la sauvegarde puis comparée,
+    # suppression, puis vérification. Le dossier qui le contenait est laissé, même vide. Mêmes retours que
+    # Remove-DeadRunValue.
+    $scope = Get-DeadLinkScope $Item $Roots
+    if (@('USER', 'COMMON') -notcontains $scope) { return 'FAIL:emplacement non autorisé' }
+    $p = [string]$Item.Location
+    $root = [string]$Roots['User']
+    if ($scope -eq 'COMMON') { $root = [string]$Roots['Common'] }
+    try {
+        $at = $null
+        try { $at = [IO.File]::GetAttributes($p) }
+        catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] { return 'GONE' }
+        if ($at -band ([IO.FileAttributes]::ReparsePoint -bor [IO.FileAttributes]::Directory)) { return 'FAIL:ce n''est plus un simple raccourci' }
+        if (-not (Test-NoLinkInChain $root $p)) { return 'FAIL:dossier remplacé par une jonction' }
+        $ur = ''
+        if ($scope -eq 'COMMON') { $ur = Split-Path -Parent ([Environment]::GetFolderPath('UserProfile')) }
+        $v = (Get-ShortcutVerdict $Shell $p $WinDir $ur).Verdict
+        if ($v -eq 'OK') { return 'BACK' }
+        if ($v -ne 'DEAD') { return 'SKIP:cible illisible ou sur un lecteur externe' }
+        $file = Join-Path $BackupDir ('{0:D2}_raccourci_{1}.lnk' -f $Index, (Get-SafeFileName ([IO.Path]::GetFileNameWithoutExtension($p))))
+        [IO.File]::Copy($p, $file, $false)
+        $a = [IO.File]::ReadAllBytes($p)
+        $b = [IO.File]::ReadAllBytes($file)
+        if ($a.Length -ne $b.Length -or (Get-Sha256Hex $a) -ne (Get-Sha256Hex $b)) { return 'FAIL:sauvegarde différente, rien n''a été retiré' }
+        Remove-Item -LiteralPath $p -Force -ErrorAction Stop
+        if ([IO.File]::Exists($p)) { return 'FAIL:toujours présent après le retrait' }
+        return ('DONE|' + $file)
+    } catch {
+        return ('FAIL:' + (Cut ([string]$_.Exception.Message) 60))
+    }
+}
+
+function Remove-DeadTask($Item, [string]$BackupDir, [int]$Index, $Vars, [string]$UserFullName, [string]$UserSid) {
+    # Retire une tâche planifiée morte (hors \Microsoft\) : liste blanche, tâche relue, toujours morte, définition
+    # XML sauvegardée et relue, suppression par le Planificateur, puis vérification. Mêmes retours que
+    # Remove-DeadRunValue.
+    if ((Get-DeadLinkScope $Item $null) -ne 'TASK') { return 'FAIL:emplacement non autorisé' }
+    $path = [string]$Item.Location
+    $cut = $path.LastIndexOf('\')
+    $folderPath = '\'
+    if ($cut -gt 0) { $folderPath = $path.Substring(0, $cut) }
+    $name = $path.Substring($cut + 1)
+    try {
+        $svc = New-Object -ComObject 'Schedule.Service'
+        $svc.Connect()
+        $folder = $null
+        $task = $null
+        try { $folder = $svc.GetFolder($folderPath); $task = $folder.GetTask($name) }
+        catch {
+            if (Test-NotFoundHResult (Get-InnerHResult $_)) { return 'GONE' }
+            return 'FAIL:tâche illisible'
+        }
+        $v = (Get-TaskVerdict $task $Vars $UserFullName $UserSid).Verdict
+        if ($v -eq 'OK') { return 'BACK' }
+        if ($v -ne 'DEAD') { return 'SKIP:cible illisible ou sur un lecteur externe' }
+        $xml = [string]$task.Xml
+        if (-not $xml) { return 'FAIL:définition de la tâche illisible' }
+        $file = Join-Path $BackupDir ('{0:D2}_tache_{1}.xml' -f $Index, (Get-SafeFileName $name))
+        if (-not (Write-BackupFile $file $xml)) { return 'FAIL:sauvegarde non écrite, rien n''a été retiré' }
+        $folder.DeleteTask($name, 0)
+        $still = $true
+        try { [void]$folder.GetTask($name) }
+        catch {
+            if (-not (Test-NotFoundHResult (Get-InnerHResult $_))) { return 'FAIL:vérification impossible après le retrait' }
+            $still = $false
+        }
+        if ($still) { return 'FAIL:toujours présente après le retrait' }
+        return ('DONE|' + $file)
+    } catch {
+        return ('FAIL:' + (Cut ([string]$_.Exception.Message) 60))
+    }
+}
+
+function Get-DeadLinkNamesText($Items) {
+    # « Foo », « Mod Organizer » et 2 autre(s) : noms des liens morts proposés au retrait. Fonction pure.
+    $all = @(@($Items) | Where-Object { $null -ne $_ })
+    $names = @($all | Select-Object -First 3 | ForEach-Object { '« ' + (Cut ([string]$_.Name) 30) + ' »' })
+    $t = $names -join ', '
+    if ($all.Count -gt 3) { $t += (' et {0} autre(s)' -f ($all.Count - 3)) }
+    return $t
+}
+
+function Invoke-DeadLinkCleanup {
+    # Élément « Liens morts » de l'entretien de fin de scan : retire $script:DeadLinks (liens morts que la section 13 a
+    # jugés retirables avec les droits actuels), un par un, sauvegardés avant. Sauvegarde impossible = rien n'est retiré.
+    $targets = @($script:DeadLinks)
+    if ($targets.Count -eq 0) { return }
+    $dir = New-DeadLinkBackupDir
+    if (-not $dir) {
+        Write-Action 'WARN' 'Liens morts : dossier de sauvegarde impossible à créer, rien n''a été retiré.'
+        Write-Sub 'Relance un scan plus tard : J.A.R.V.I.S. te les reproposera.'
+        return
+    }
+    $vars = Get-JarvisEnvTable (-not $script:RemnantOtherUser)
+    $shell = New-Object -ComObject WScript.Shell
+    $sid = ''; $full = ''
+    try { $me = [Security.Principal.WindowsIdentity]::GetCurrent(); $sid = $me.User.Value; $full = $me.Name } catch { $sid = '' }
+    $done = @()
+    $i = 0
+    foreach ($t in $targets) {
+        $i++
+        $what = 'démarrage'
+        $kind = 'Run'
+        if ($t.Source -eq 'Task') { $what = 'tâche planifiée'; $kind = 'Task' }
+        elseif ($t.Source -eq 'Shortcut' -or -not $t.SubKey) { $what = 'raccourci'; $kind = 'Shortcut' }
+        switch ($kind) {
+            'Run' { $res = Remove-DeadRunValue $t $dir $i $vars }
+            'Task' { $res = Remove-DeadTask $t $dir $i $vars $full $sid }
+            default { $res = Remove-DeadShortcut $t $dir $i $script:RemnantRoots $shell $WinDir }
+        }
+        $res = [string]$res
+        $whatCap = $what.Substring(0, 1).ToUpperInvariant() + $what.Substring(1)   # pas $What : même variable que $what (règle 23)
+        if ($res.StartsWith('DONE|')) {
+            $f = $res.Substring(5)
+            Write-Action 'OK' ('Lien mort retiré : {0} « {1} » (sauvegardé)' -f $what, (Cut $t.Name 40))
+            $done += [pscustomobject]@{ File = (Split-Path -Leaf $f); Kind = $kind; Name = $t.Name; From = $t.Location }
+        } elseif ($res -eq 'GONE') {
+            Write-Action 'INFO' ('{0} « {1} » : déjà retiré' -f $whatCap, (Cut $t.Name 40)) -BilanState 'OK'
+        } elseif ($res -eq 'BACK') {
+            Write-Action 'INFO' ('{0} « {1} » laissé : son programme est revenu' -f $whatCap, (Cut $t.Name 40)) -BilanState 'OK'
+        } elseif ($res.StartsWith('SKIP:')) {
+            Write-Action 'INFO' ('{0} « {1} » laissé : {2}' -f $whatCap, (Cut $t.Name 40), $res.Substring(5))
+        } else {
+            $why = $res -replace '^FAIL:', ''
+            Write-Action 'WARN' ('{0} « {1} » non retiré : {2}' -f $whatCap, (Cut $t.Name 40), $why)
+            Write-Sub 'Relance un scan plus tard : J.A.R.V.I.S. te le reproposera.'
+        }
+    }
+    if ($done.Count -eq 0) {
+        [void](Remove-EmptyDir $dir)
+        return
+    }
+    $readme = Get-DeadLinkReadme $done (Get-Date -Format "dd/MM/yyyy 'à' HH 'h' mm")
+    $rf = Join-Path $dir 'LISEZMOI.txt'
+    $ok = $false
+    try {
+        [IO.File]::WriteAllLines($rf, [string[]]$readme, (New-Object System.Text.UTF8Encoding $true))
+        $ok = ([IO.File]::ReadAllLines($rf, [Text.Encoding]::UTF8).Count -eq $readme.Count)
+    } catch { $ok = $false }
+    Write-Sub ('Sauvegarde : ' + $dir)
+    if ($ok) { Write-Sub 'Pour remettre un lien : LISEZMOI.txt, dans ce dossier, explique comment.' }
+    else { Write-Sub 'Mode d''emploi non écrit : un fichier .reg se remet par double-clic, un .lnk en le recopiant.' }
 }
 
 # ------------------------------------------------------------------
@@ -5880,6 +6883,11 @@ function Read-MaintenanceItem($Item) {
             if ($script:CleanUser) { $who = ', compte ' + $script:CleanUser }
             if (Read-YesNo ('   >> Supprimer les fichiers temporaires de plus de 24 h ({0}{1}) ?' -f (Format-Bytes $Item.Bytes), $who)) { return 'RUN' }
         }
+        'DeadLinks' {
+            Write-Host ('   [i] Liens morts : ' + (Get-DeadLinkNamesText $script:DeadLinks)) -ForegroundColor DarkGray
+            Write-Host '       Chacun est sauvegardé avant : un double-clic ou une copie le remet (mode d''emploi fourni).' -ForegroundColor DarkGray
+            if (Read-YesNo ('   >> Retirer les {0} lien(s) vers des programmes absents ?' -f @($script:DeadLinks).Count)) { return 'RUN' }
+        }
     }
     return $null
 }
@@ -5902,6 +6910,7 @@ function Read-MaintenanceChoice($Plan) {
                 Write-Host '      Une application ouverte ne peut pas être mise à jour : ferme-les avant de valider.' -ForegroundColor Yellow
             }
             if ($Plan[$i].Key -eq 'Temp' -and $script:CleanUser) { Write-Host ('      Compte ' + $script:CleanUser) -ForegroundColor DarkGray }
+            if ($Plan[$i].Key -eq 'DeadLinks') { Write-Host ('      ' + (Get-DeadLinkNamesText $script:DeadLinks)) -ForegroundColor DarkGray }
         }
         if ($keys -contains 'Winget') {
             Write-Host '   [!] winget peut fermer les applications concernées (navigateur, jeux, messageries) : enregistre ton travail avant.' -ForegroundColor Yellow
@@ -6123,6 +7132,7 @@ function Invoke-MaintenanceItem($Choice, $Outcomes) {
                 $t = @($script:CleanTargets | Where-Object { $_.Key -eq 'Temp' }) | Select-Object -First 1
                 Invoke-CleanTarget $t -Approved
             }
+            'DeadLinks' { Write-Host ''; Invoke-DeadLinkCleanup }
         }
     } catch {
         $threw = $true
@@ -6188,7 +7198,7 @@ function Invoke-EndOfScan([string]$RepFile) {
     $cleanProp = Get-CleanProposal $script:CleanTargets $CleanMinBytes $isAdmin
     $tempBytes = $null
     foreach ($t in @($cleanProp.Items)) { if ($t.Key -eq 'Temp') { $tempBytes = $t.Bytes } }
-    $plan = @(Get-MaintenancePlan $script:DefenderScan $script:WGCount ([bool]$script:WingetExe) @($script:StoreItems).Count $script:WUCount $isAdmin $tempBytes)
+    $plan = @(Get-MaintenancePlan $script:DefenderScan $script:WGCount ([bool]$script:WingetExe) @($script:StoreItems).Count $script:WUCount $isAdmin $tempBytes @($script:DeadLinks).Count)
     $chosen = @(Read-MaintenanceChoice $plan)
     if ($repair) {
         $rep = [pscustomobject]@{ Item = [pscustomobject]@{ Key = 'Repair'; Label = 'Réparation de Windows' }; Mode = 'RUN' }
@@ -8063,6 +9073,10 @@ function Invoke-SelfTestAnalyzers {
                 Assert-True ([bool]$it.Label -and [bool]$it.Text -and [bool]$it.Time) ('libellé, texte ou durée vide : ' + $it.Key)
             }
         }
+        # v3.30 : liens morts en dernier, seulement s'il y en a
+        $p = @(Get-MaintenancePlan $false 0 $true 0 0 $false $tmp 3)
+        Assert-True ((@($p | ForEach-Object { $_.Key }) -join ',') -eq 'Temp,DeadLinks' -and $p[1].Text -match '3 lien\(s\)') ('liens morts : ' + (@($p | ForEach-Object { $_.Key }) -join ','))
+        Assert-True (@(Get-MaintenancePlan $false 0 $true 0 0 $true $null 0).Count -eq 0) 'liens morts proposés sans en avoir'
         $p = @(Get-MaintenancePlan $true 5 $true 2 3 $true $tmp)
         Assert-True ($p[1].Text -match '5 application\(s\) avec winget') ('nombre winget absent : ' + $p[1].Text)
         Assert-True ($p[2].Text -match '2 application\(s\) du Microsoft Store') ('nombre Store absent : ' + $p[2].Text)
@@ -8118,6 +9132,263 @@ function Invoke-SelfTestAnalyzers {
             Assert-True ((Get-MenuChoice $bad $keys 'N') -eq '') ('réponse non affichée acceptée : ' + $bad)
         }
         '9/9 cas'
+    }
+    Test-Case 'Restes : lecture des lignes de commande' {
+        # v3.30 (lot 3) : valeurs Run, actions de tâches, ImagePath de services et programmes de désinstallation relevés
+        # sur le PC de Thomas le 27/11/2026, plus les formes connues (guillemets, espaces sans guillemets, rundll32,
+        # wscript, msiexec, chemins courts, variables, fins de ligne Windows). Attendu : Kind, puis le premier chemin.
+        $v = @{ SystemRoot = 'C:\Windows'; windir = 'C:\Windows'; ProgramFiles = 'C:\Program Files'; LOCALAPPDATA = 'C:\Users\Marie\AppData\Local' }
+        $cases = @(
+            @('"C:\Program Files\Microsoft OneDrive\OneDrive.exe" /background', 'Path', 'C:\Program Files\Microsoft OneDrive\OneDrive.exe'),
+            @('"C:\Program Files\PDFgear\PDFMonitor.exe"', 'Path', 'C:\Program Files\PDFgear\PDFMonitor.exe'),
+            @('C:\Program Files (x86)\Common Files\Java\Java Update\jusched.exe', 'Path', 'C:\Program Files (x86)\Common Files\Java\Java Update\jusched.exe'),
+            @('C:\Users\Marie\AppData\Local\Programs\DockerDesktop\Docker Desktop.exe', 'Path', 'C:\Users\Marie\AppData\Local\Programs\DockerDesktop\Docker Desktop.exe'),
+            @('C:\Users\Marie\AppData\Local\Handy\handy.exe ', 'Path', 'C:\Users\Marie\AppData\Local\Handy\handy.exe'),
+            @('C:\Program Files\X\x.exe -s', 'Path', 'C:\Program Files\X\x.exe'),
+            @('C:\Users\Marie\AppData\Local\Discord\Update.exe --processStart Discord.exe', 'Path', 'C:\Users\Marie\AppData\Local\Discord\Update.exe'),
+            @('%windir%\system32\SecurityHealthSystray.exe', 'Path', 'C:\Windows\system32\SecurityHealthSystray.exe'),
+            @('"%ProgramFiles%\X\x.exe" -a', 'Path', 'C:\Program Files\X\x.exe'),
+            @('%LOCALAPPDATA%\Programs\x.exe --hidden', 'Path', 'C:\Users\Marie\AppData\Local\Programs\x.exe'),
+            @('%INCONNUE%\x.exe', 'Unknown', ''),
+            @('rundll32.exe C:\Windows\System32\foo.dll,Entry', 'Rundll32', 'C:\Windows\System32\foo.dll'),
+            @('C:\Windows\system32\rundll32.exe "C:\Program Files\X\x.dll",Start arg', 'Rundll32', 'C:\Program Files\X\x.dll'),
+            @('rundll32.exe shell32.dll,Control_RunDLL', 'Bare', ''),
+            @('"C:\Windows\System32\WScript.exe" //B //Nologo "C:\Users\Marie\x.vbs"', 'Script', 'C:\Users\Marie\x.vbs'),
+            @('wscript.exe C:\Scripts\a.vbs /arg', 'Script', 'C:\Scripts\a.vbs'),
+            @('MsiExec.exe /X{90160000-008C-0000-1000-0000000FF1CE}', 'Msi', ''),
+            @('C:\WINDOWS\system32\msiexec.exe /i {GUID}', 'Msi', ''),
+            @('ctfmon.exe', 'Bare', ''),
+            @('\\serveur\partage\x.exe', 'Network', ''),
+            @('', 'Empty', ''),
+            @('"C:\Program Files\X\x.exe"--minimized', 'Path', 'C:\Program Files\X\x.exe'),
+            @('"C:\Program Files\X\x.exe', 'Path', 'C:\Program Files\X\x.exe'),
+            @('C:\PROGRA~1\X\x.exe /bg', 'Path', 'C:\PROGRA~1\X\x.exe'),
+            @("`"C:\Program Files\X\x.exe`" -a`r`n", 'Path', 'C:\Program Files\X\x.exe'),
+            @('  "C:\x.exe"  ', 'Path', 'C:\x.exe'),
+            @('C:\Tools\app -s', 'Unknown', ''),
+            @('"C:\Tools\app"', 'Unknown', ''),
+            @('cmd.exe /c start "" "C:\x.exe"', 'Bare', ''),
+            @('"C:\Program Files\X\x.exe" "C:\Program Files\X\y.exe"', 'Path', 'C:\Program Files\X\x.exe'),
+            @('%SYSTEMROOT%\x.exe', 'Path', 'C:\Windows\x.exe')
+        )
+        foreach ($c in $cases) {
+            $p = ConvertFrom-CommandLine $c[0] $v
+            $first = [string](@($p.Candidates) | Select-Object -First 1)
+            Assert-True ($p.Kind -eq $c[1]) ('« {0} » : {1} au lieu de {2}' -f $c[0].Trim(), $p.Kind, $c[1])
+            if ($c[2]) { Assert-True ($first -eq $c[2]) ('« {0} » : chemin « {1} »' -f $c[0].Trim(), $first) }
+        }
+        Assert-True ((ConvertFrom-CommandLine $null $v).Kind -eq 'Empty') 'valeur nulle mal lue'
+        # Services : \SystemRoot\, system32\ relatif, \??\
+        $svc = @(
+            @('\SystemRoot\System32\svchost.exe -k netsvcs', 'C:\Windows\System32\svchost.exe'),
+            @('system32\svchost.exe -k LocalService', 'C:\Windows\system32\svchost.exe'),
+            @('\??\C:\Program Files\X\agent.exe', 'C:\Program Files\X\agent.exe'),
+            @('"C:\Program Files\NVIDIA Corporation\Display.NvContainer\NVDisplay.Container.exe" -s NVDisplay', 'C:\Program Files\NVIDIA Corporation\Display.NvContainer\NVDisplay.Container.exe')
+        )
+        foreach ($c in $svc) {
+            $p = ConvertFrom-CommandLine $c[0] $v -Service
+            $first = [string](@($p.Candidates) | Select-Object -First 1)
+            Assert-True ($p.Kind -eq 'Path' -and $first -eq $c[1]) ('service « {0} » : {1} {2}' -f $c[0], $p.Kind, $first)
+        }
+        Assert-True ((ConvertFrom-CommandLine 'system32\svchost.exe' $v).Kind -eq 'Unknown') 'chemin relatif jugé hors service'
+        # Sans guillemets, chaque début qui finit par .exe est un chemin possible : mort seulement si tous manquent
+        $p = ConvertFrom-CommandLine 'C:\Apps\a.exe b.exe' $v
+        Assert-True (@($p.Candidates).Count -eq 2) ('chemins possibles : ' + (@($p.Candidates) -join ' | '))
+        # Relecture du lot 3 : un chemin qui ne peut pas être un nom de fichier est écarté (sinon lien jamais jugé)
+        $p = ConvertFrom-CommandLine 'C:\Nope\x.exe C:\b.bat' $v
+        Assert-True ($p.Kind -eq 'Path' -and (@($p.Candidates) -join '|') -eq 'C:\Nope\x.exe') ('chemin impossible gardé : ' + (@($p.Candidates) -join ' | '))
+        # Programme 32 bits : System32 lu aussi dans SysWOW64 (Run32, désinstallation 32 bits, rundll32 de SysWOW64)
+        $p = ConvertFrom-CommandLine 'C:\Windows\System32\foo.exe /x' $v -Wow64
+        Assert-True ((@($p.Candidates) -join '|') -eq 'C:\Windows\System32\foo.exe|C:\Windows\SysWOW64\foo.exe') ('-Wow64 : ' + (@($p.Candidates) -join ' | '))
+        $p = ConvertFrom-CommandLine 'C:\Windows\SysWOW64\rundll32.exe C:\Windows\System32\x.dll,Entry' $v
+        Assert-True ($p.Kind -eq 'Rundll32' -and @($p.Candidates) -contains 'C:\Windows\SysWOW64\x.dll') ('rundll32 32 bits : ' + (@($p.Candidates) -join ' | '))
+        $p = ConvertFrom-CommandLine 'C:\Windows\System32\rundll32.exe C:\Windows\System32\x.dll,Entry' $v
+        Assert-True (@($p.Candidates).Count -eq 1) 'rundll32 64 bits : double SysWOW64 ajouté à tort'
+        Assert-True ((@(Add-Wow64Alternatives @('D:\x.exe', 'C:\Windows\system32\a.dll') $v) -join '|') -eq 'D:\x.exe|C:\Windows\system32\a.dll|C:\Windows\SysWOW64\a.dll') 'double SysWOW64 faux'
+        '{0}/{0} cas' -f ($cases.Count + $svc.Count + 8)
+    }
+    Test-Case 'Restes : variables et verdict d''un lien' {
+        $v = @{ windir = 'C:\Windows'; 'ProgramFiles(x86)' = 'C:\Program Files (x86)'; DATA = 'D:\Data\' }
+        Assert-True ((Expand-JarvisEnvVars '%windir%\x' $v) -eq 'C:\Windows\x') 'windir non remplacé'
+        Assert-True ((Expand-JarvisEnvVars '%WINDIR%\x' $v) -eq 'C:\Windows\x') 'casse de la variable'
+        Assert-True ((Expand-JarvisEnvVars '%ProgramFiles(x86)%\y' $v) -eq 'C:\Program Files (x86)\y') 'variable à parenthèses'
+        Assert-True ((Expand-JarvisEnvVars '%DATA%\f' $v) -eq 'D:\Data\f') 'barre finale de la valeur gardée'
+        Assert-True ((Expand-JarvisEnvVars '%NOPE%\z' $v) -eq '%NOPE%\z') 'variable inconnue remplacée'
+        Assert-True ((Expand-JarvisEnvVars '%windir%%DATA%' $v) -eq 'C:\WindowsD:\Data') 'deux variables collées'
+        Assert-True ((Expand-JarvisEnvVars $null $v) -eq '') 'texte nul'
+        Assert-True ((Expand-JarvisEnvVars 'C:\sans' $null) -eq 'C:\sans') 'table nulle'
+        $cases = @(
+            @(@('PRESENT'), 'OK'), @(@('ABSENT'), 'DEAD'), @(@('ABSENT', 'ABSENT'), 'DEAD'), @(@('ABSENT', 'PRESENT'), 'OK'),
+            @(@('ABSENT', 'UNKNOWN'), 'UNKNOWN'), @(@('NODRIVE'), 'NODRIVE'), @(@('ABSENT', 'NODRIVE'), 'NODRIVE'),
+            @(@(), 'UNKNOWN'), @(@('absent'), 'DEAD'), @(@('bizarre'), 'UNKNOWN'), @(@('NODRIVE', 'UNKNOWN'), 'UNKNOWN')
+        )
+        foreach ($c in $cases) {
+            $got = Get-LinkVerdict $c[0]
+            Assert-True ($got -eq $c[1]) ('{0} : {1} au lieu de {2}' -f (@($c[0]) -join ','), $got, $c[1])
+        }
+        Assert-True ((Get-LinkVerdict $null) -eq 'UNKNOWN') 'aucun état : pas UNKNOWN'
+        Assert-True ((Get-CommandVerdict ([pscustomobject]@{ Kind = 'Bare'; Exe = 'x.exe'; Candidates = @('x.exe') })) -eq 'UNKNOWN') 'nom seul jugé'
+        Assert-True ((Get-CommandVerdict ([pscustomobject]@{ Kind = 'Msi'; Exe = 'msiexec'; Candidates = @('msiexec') })) -eq 'UNKNOWN') 'msiexec jugé'
+        '{0}/{0} cas' -f ($cases.Count + 11)
+    }
+    Test-Case 'Restes : état d''un chemin (dossier Windows)' {
+        # Seule lecture du disque de T1 : le dossier Windows existe sur tout PC (et sur la machine de GitHub)
+        $w = [Environment]::GetFolderPath('Windows')
+        $g = [guid]::NewGuid().ToString('N')
+        Assert-True ((Get-PathState $w) -eq 'PRESENT') ('dossier Windows : ' + (Get-PathState $w))
+        Assert-True ((Get-PathState (Join-Path $w ($g + '.exe'))) -eq 'ABSENT') 'fichier absent mal lu'
+        Assert-True ((Get-PathState (Join-Path $w ($g + '\x.exe'))) -eq 'ABSENT') 'dossier absent mal lu'
+        foreach ($bad in @('', 'relatif\x.exe', '\\serveur\partage\x.exe', ($w + '\a<b>.exe'))) {
+            Assert-True ((Get-PathState $bad) -eq 'UNKNOWN') ('chemin non jugeable lu comme ' + (Get-PathState $bad) + ' : ' + $bad)
+        }
+        Assert-True ((Get-PathKind 'C:/x/y.exe') -eq 'Unknown' -and (Get-PathKind '') -eq 'Empty') 'nature de chemin'
+        '9/9 cas'
+    }
+    Test-Case 'Restes : compte d''une tâche, dossier revendiqué' {
+        Assert-True (Test-UserVarPath '"%APPDATA%\x.exe"') '%APPDATA% non vu'
+        Assert-True (Test-UserVarPath '%localappdata%\Microsoft\OneDrive\OneDriveStandaloneUpdater.exe') '%localappdata% non vu'
+        Assert-True (-not (Test-UserVarPath '%ProgramFiles%\x.exe')) '%ProgramFiles% pris pour une variable du compte'
+        Assert-True (-not (Test-UserVarPath 'C:\Users\Marie\x.exe')) 'chemin écrit en clair pris pour une variable'
+        $sid = 'S-1-5-21-1-2-3-1001'
+        Assert-True (Test-SameTaskUser 'PC\Marie' 'PC\Marie' $sid) 'PC\Marie non reconnu'
+        Assert-True (Test-SameTaskUser 'marie' 'PC\Marie' '') 'casse du nom ou nom seul'
+        Assert-True (Test-SameTaskUser '.\Marie' 'PC\Marie' '') '.\Marie (compte local) non reconnu'
+        Assert-True (Test-SameTaskUser $sid 'PC\x' $sid) 'identifiant du compte non reconnu'
+        Assert-True (-not (Test-SameTaskUser 'SYSTEM' 'PC\Marie' $sid)) 'SYSTEM pris pour le compte'
+        Assert-True (-not (Test-SameTaskUser '' 'PC\Marie' '')) 'compte vide pris pour le compte'
+        Assert-True (-not (Test-SameTaskUser 'PC\Paul' 'PC\Marie' $sid)) 'autre compte pris pour le compte'
+        Assert-True (-not (Test-SameTaskUser 'DOMAINE\Marie' 'PC\Marie' $sid)) 'compte du domaine pris pour le compte local du même nom'
+        Assert-True (-not (Test-SameTaskUser 'marie@domaine.fr' 'PC\Marie' $sid)) 'adresse de messagerie prise pour le compte'
+        Assert-True (Test-UnderRoot 'C:\Users\Marie\AppData\x.exe' 'C:\Users\' -and (Test-UnderRoot 'c:\users' 'C:\Users')) 'dossier contenu non reconnu'
+        Assert-True (-not (Test-UnderRoot 'C:\UsersX\a.exe' 'C:\Users') -and -not (Test-UnderRoot 'C:\a.exe' '')) 'dossier voisin ou vide pris pour le dossier'
+        Assert-True ((Test-NotFoundHResult -2147024894) -and (Test-NotFoundHResult -2147024893)) 'introuvable non reconnu'
+        Assert-True (-not (Test-NotFoundHResult -2147024891) -and -not (Test-NotFoundHResult $null)) 'accès refusé ou code absent pris pour « introuvable »'
+        $claims = @('NVIDIA Corporation', 'Logitech Inc.', 'Mozilla Firefox (x64 fr)', 'Vulkan Run Time Libraries 1.4', 'Epic Games Launcher', 'Valve Corporation', 'Steam', 'AB')
+        $cases = @(@('NVIDIA Corporation', $true), @('Logitech', $true), @('Mozilla Firefox', $true), @('VulkanRT', $false),
+                   @('Epic Games', $true), @('Steam', $true), @('HP', $true), @('OldGame', $false), @('ABCD Tools', $false))
+        foreach ($c in $cases) {
+            Assert-True ((Test-NameClaimed $c[0] $claims) -eq $c[1]) ('dossier « {0} » : revendiqué = {1}' -f $c[0], (-not $c[1]))
+        }
+        Assert-True ((Get-NameKey 'NVIDIA Corporation') -eq 'nvidia' -and (Get-NameKey 'Logitech, Inc.') -eq 'logitech') 'forme juridique non retirée'
+        '{0}/{0} cas' -f (17 + $cases.Count + 1)
+    }
+    Test-Case 'Restes : démarrage vers un programme absent' {
+        # Entrées comme Get-StartupEntries les rend ; programme présent = cmd.exe de Windows, absent = nom tiré au hasard
+        $w = [Environment]::GetFolderPath('Windows')
+        $g = [guid]::NewGuid().ToString('N')
+        $run = 'Software\Microsoft\Windows\CurrentVersion\Run'
+        $mk = { param($n, $raw, $kind, $apr) [pscustomobject]@{ Name = $n; Approved = $apr; Source = 'Run'; Hive = 'HKCU'; SubKey = $run; Raw = $raw; RawKind = $kind; File = '' } }
+        $entries = @(
+            (& $mk 'Present' ('"' + $w + '\System32\cmd.exe" /c') 'String' 'ABSENT'),
+            (& $mk 'Absent' ('"' + $w + '\' + $g + '\x.exe" /min') 'String' 'ABSENT'),
+            (& $mk 'Coupe' ('%windir%\' + $g + '.exe') 'ExpandString' ([byte[]](3, 0, 0, 0))),
+            (& $mk 'Binaire' ('"' + $w + '\' + $g + '.exe"') 'Binary' 'ABSENT'),
+            [pscustomobject]@{ Name = 'Commune'; Approved = 'ABSENT'; Source = 'Run'; Hive = 'HKLM'; SubKey = $run; Raw = ('%LOCALAPPDATA%\' + $g + '\x.exe'); RawKind = 'ExpandString'; File = '' },
+            [pscustomobject]@{ Name = 'x.exe'; Approved = 'ABSENT'; Source = 'Folder'; Hive = 'HKCU'; SubKey = ''; Raw = ''; RawKind = ''; File = ($w + '\' + $g + '.exe') }
+        )
+        $r = @(Get-RemnantStartup $entries @{ windir = $w; LOCALAPPDATA = ($w + '\' + $g) } $null $w)
+        Assert-True ($r.Count -eq 2) ('restes : {0} au lieu de 2 ({1}) ; entrée commune par %LOCALAPPDATA% jugée ?' -f $r.Count, (@($r | ForEach-Object { [string]$_.Name }) -join ','))
+        Assert-True ($r[0].Name -eq 'Absent' -and $r[0].Active -and $r[0].Verdict -eq 'DEAD') 'entrée active absente mal lue'
+        Assert-True ($r[1].Name -eq 'Coupe' -and -not $r[1].Active) 'entrée désactivée absente mal lue'
+        Assert-True ($r[0].Hive -eq 'HKCU' -and $r[0].SubKey -eq $run -and $r[0].RawKind -eq 'String' -and $r[0].Raw -match 'x\.exe" /min$') 'origine de la valeur perdue (retrait impossible)'
+        Assert-True ($r[1].Target -eq ($w + '\' + $g + '.exe')) ('variable non remplacée dans la cible : ' + $r[1].Target)
+        Assert-True (@(Get-RemnantStartup @() @{} $null $w).Count -eq 0) 'aucune entrée : des restes quand même'
+        '6/6 cas'
+    }
+    Test-Case 'Restes : lignes de la section 13' {
+        $a = New-RemnantItem 'Startup' 'Foo' 'C:\Foo\foo.exe' 'DEAD' 'HKCU\Run'
+        $b = New-RemnantItem 'Startup' 'Bar' 'C:\Bar\bar.exe' 'DEAD' 'HKLM\Run'
+        $b.Active = $false
+        $c = New-RemnantItem 'Shortcut' 'Mod Organizer' 'C:\MO2\ModOrganizer.exe' 'DEAD' 'C:\P\Mod Organizer.lnk'
+        $d = New-RemnantItem 'Task' 'Maj' 'E:\Jeu\maj.exe' 'NODRIVE' '\Maj'
+        $e = New-RemnantItem 'Folder' 'VieuxJeu' '' 'LEFT' 'C:\Program Files\VieuxJeu'
+        $e.Bytes = [int64]3GB
+        Assert-True (@(Get-RemnantRows @()).Count -eq 0) 'rien trouvé : des lignes quand même'
+        $r = @(Get-RemnantRows @($b))
+        Assert-True ($r.Count -eq 1 -and $r[0].State -eq 'INFO' -and $r[0].Value -match 'dont 1 désactivée') ('démarrage désactivé : ' + $r[0].State + ' ' + $r[0].Value)
+        $r = @(Get-RemnantRows @($a, $b, $c, $d, $e, $null))
+        Assert-True ((@($r | ForEach-Object { $_.Key }) -join ',') -eq 'Startup,Shortcut,Folder,NoDrive') ('ordre ou rangement : ' + (@($r | ForEach-Object { $_.Key }) -join ','))
+        Assert-True ($r[0].State -eq 'WARN' -and $r[0].Value -match '^2 entrée') ('démarrage actif : ' + $r[0].State + ' ' + $r[0].Value)
+        Assert-True ($r[1].State -eq 'INFO' -and $r[2].State -eq 'INFO' -and $r[3].State -eq 'INFO') 'raccourci, dossier ou lecteur absent pas en INFO'
+        Assert-True ($r[2].Value -match '3[,.]0 Go') ('taille du dossier absente : ' + $r[2].Value)
+        Assert-True (@($r[3].Items)[0].Name -eq 'Maj') 'lecteur absent rangé ailleurs'
+        '7/7 cas'
+    }
+    Test-Case 'Liens morts : emplacements autorisés' {
+        $roots = @{ User = 'C:\Users\Marie\AppData\Roaming\Microsoft\Windows\Start Menu\Programs'; Common = 'C:\ProgramData\Microsoft\Windows\Start Menu\Programs' }
+        $run = 'Software\Microsoft\Windows\CurrentVersion\Run'
+        $mk = {
+            param($src, $loc, $hive, $sub, $kind, $verdict)
+            $i = New-RemnantItem $src 'Foo' 'C:\Foo\foo.exe' $verdict $loc
+            $i.Hive = $hive; $i.SubKey = $sub; $i.RawKind = $kind
+            $i
+        }
+        $cases = @(
+            @((& $mk 'Startup' 'HKCU\Run' 'HKCU' $run 'String' 'DEAD'), 'HKCU'),
+            @((& $mk 'Startup' 'HKLM\Run' 'HKLM' $run 'ExpandString' 'DEAD'), 'HKLM'),
+            @((& $mk 'Startup' 'HKLM\Run32' 'HKLM' 'Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run' 'String' 'DEAD'), 'HKLM'),
+            @((& $mk 'Startup' 'x' 'HKCU' 'Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run' 'String' 'DEAD'), ''),
+            @((& $mk 'Startup' 'x' 'HKCU' ($run + 'Once') 'String' 'DEAD'), ''),
+            @((& $mk 'Startup' 'x' 'HKLM' 'Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run' 'String' 'DEAD'), ''),
+            @((& $mk 'Startup' 'x' 'HKCU' $run 'Binary' 'DEAD'), ''),
+            @((& $mk 'Startup' 'x' 'HKCU' $run 'String' 'NODRIVE'), ''),
+            @((& $mk 'Startup' ($roots.User + '\Startup\Foo.lnk') '' '' '' 'DEAD'), 'USER'),
+            @((& $mk 'Shortcut' ($roots.Common + '\Mod Organizer\Mod Organizer.lnk') '' '' '' 'DEAD'), 'COMMON'),
+            @((& $mk 'Shortcut' 'C:\Users\Marie\Desktop\Foo.lnk' '' '' '' 'DEAD'), ''),
+            @((& $mk 'Shortcut' ($roots.Common + '\..\..\Foo.lnk') '' '' '' 'DEAD'), ''),
+            @((& $mk 'Shortcut' ($roots.Common + '\Foo.exe') '' '' '' 'DEAD'), ''),
+            @((& $mk 'Shortcut' ($roots.Common + 'X\Foo.lnk') '' '' '' 'DEAD'), ''),
+            @((& $mk 'Task' '\Mozilla\Firefox Default Browser Agent' '' '' '' 'DEAD'), 'TASK'),
+            @((& $mk 'Task' '\Foo' '' '' '' 'DEAD'), 'TASK'),
+            @((& $mk 'Task' '\Microsoft\Windows\Defrag\ScheduledDefrag' '' '' '' 'DEAD'), ''),
+            @((& $mk 'Task' '\microsoft\x' '' '' '' 'DEAD'), ''),
+            @((& $mk 'Task' '\Microsoft' '' '' '' 'DEAD'), ''),
+            @((& $mk 'Task' '\a\..\Microsoft\x' '' '' '' 'DEAD'), ''),
+            @((& $mk 'Service' 'Foo' '' '' '' 'DEAD'), ''),
+            @((& $mk 'Uninstall' 'HKLM\x' '' '' '' 'DEAD'), ''),
+            @((& $mk 'Folder' 'C:\Program Files\Foo' '' '' '' 'DEAD'), '')
+        )
+        foreach ($c in $cases) {
+            $got = Get-DeadLinkScope $c[0] $roots
+            Assert-True ($got -eq $c[1]) ('{0} {1} {2} : « {3} » au lieu de « {4} »' -f $c[0].Source, $c[0].Location, $c[0].SubKey, $got, $c[1])
+        }
+        Assert-True ((Get-DeadLinkScope $null $roots) -eq '') 'élément nul accepté'
+        $hk = $cases[1][0]; $us = $cases[8][0]; $tk = $cases[14][0]
+        Assert-True ((Test-DeadLinkRemovable $us $roots $false) -and (Test-DeadLinkRemovable $cases[0][0] $roots $false)) 'lien du compte refusé sans droits admin'
+        Assert-True (-not (Test-DeadLinkRemovable $hk $roots $false) -and -not (Test-DeadLinkRemovable $tk $roots $false)) 'lien de la machine accepté sans droits admin'
+        Assert-True ((Test-DeadLinkRemovable $hk $roots $true) -and (Test-DeadLinkRemovable $tk $roots $true)) 'lien de la machine refusé en admin'
+        '{0}/{0} cas' -f ($cases.Count + 4)
+    }
+    Test-Case 'Liens morts : fichier .reg de remise' {
+        $run = 'Software\Microsoft\Windows\CurrentVersion\Run'
+        $t = ConvertTo-RegFileText 'HKCU' $run 'Foo' '"C:\Program Files\Foo\foo.exe" /min' 'String'
+        Assert-True ($t.StartsWith("Windows Registry Editor Version 5.00`r`n`r`n[HKEY_CURRENT_USER\$run]`r`n")) 'en-tête ou clé fausse'
+        Assert-True ($t.Contains('"Foo"="\"C:\\Program Files\\Foo\\foo.exe\" /min"' + "`r`n")) ('valeur mal échappée : ' + $t)
+        $t = ConvertTo-RegFileText 'HKLM' 'Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run' 'Bar' '%windir%\x.exe' 'ExpandString'
+        Assert-True ($t.Contains('[HKEY_LOCAL_MACHINE\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run]')) 'clé 32 bits fausse'
+        Assert-True ($t.Contains('"Bar"=hex(2):25,00,77,00,69,00') -and $t.TrimEnd().EndsWith('65,00,00,00')) ('REG_EXPAND_SZ mal écrit : ' + $t)
+        $t = ConvertTo-RegFileText 'HKCU' $run 'a"b' ("x`ty") 'String'
+        Assert-True ($t.Contains('"a\"b"=hex(1):78,00,09,00,79,00,00,00')) ('caractère de contrôle ou nom mal écrit : ' + $t)
+        Assert-True ($null -eq (ConvertTo-RegFileText 'HKCR' $run 'Foo' 'x' 'String')) 'ruche non prévue acceptée'
+        Assert-True ($null -eq (ConvertTo-RegFileText 'HKCU' $run 'Foo' 'x' 'Binary')) 'type non prévu accepté'
+        Assert-True ($null -eq (ConvertTo-RegFileText 'HKCU' $run '' 'x' 'String')) 'nom vide accepté'
+        '8/8 cas'
+    }
+    Test-Case 'Liens morts : nom de sauvegarde et mode d''emploi' {
+        Assert-True ((Get-SafeFileName 'Foo:Bar/Baz') -eq 'Foo_Bar_Baz') ('caractères interdits : ' + (Get-SafeFileName 'Foo:Bar/Baz'))
+        Assert-True ((Get-SafeFileName 'Intel® Graphics Software') -eq 'Intel_ Graphics Software') 'symbole non remplacé'
+        Assert-True ((Get-SafeFileName '..') -eq 'element' -and (Get-SafeFileName '') -eq 'element') 'nom vide ou « .. » accepté'
+        Assert-True ((Get-SafeFileName ('x' * 90)).Length -eq 40) 'nom trop long'
+        $done = @([pscustomobject]@{ File = '01_demarrage_Foo.reg'; Kind = 'Run'; Name = 'Foo'; From = 'HKCU\Software\Microsoft\Windows\CurrentVersion\Run' },
+                  [pscustomobject]@{ File = '02_raccourci_Mod Organizer.lnk'; Kind = 'Shortcut'; Name = 'Mod Organizer'; From = 'C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Mod Organizer\Mod Organizer.lnk' },
+                  [pscustomobject]@{ File = '03_tache_Maj.xml'; Kind = 'Task'; Name = 'Maj'; From = '\Maj' })
+        $l = @(Get-DeadLinkReadme $done '27/11/2026 à 18 h 05')
+        $txt = $l -join "`n"
+        Assert-True ($txt -match '27/11/2026 à 18 h 05') 'date absente'
+        Assert-True ($txt.Contains('01_demarrage_Foo.reg') -and $txt.Contains('03_tache_Maj.xml')) 'fichier absent du mode d''emploi'
+        Assert-True ($txt.Contains('C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Mod Organizer sous le nom Mod Organizer.lnk')) 'dossier et nom du raccourci absents'
+        Assert-True ($txt -match 'double-clic' -and $txt -match 'Importer une tâche' -and $txt -match 'désinstalles') 'consigne de remise absente'
+        '8/8 cas'
     }
 }
 
@@ -10625,7 +11896,7 @@ if ($null -ne $diskV) {
     foreach ($dkD in @($diskV.Devices | Where-Object { $_.Kind -eq 'FIXED' })) { Write-Sub ("sur {0} : {1}" -f (Cut $dkD.Name 50), $dkD.Events) 'Yellow' }
     if (@($diskV.Devices | Where-Object { $_.Kind -eq 'FIXED' -or $_.Kind -eq 'UNKNOWN' }).Count -gt 0) {
         Write-Sub 'Par précaution, copie tes fichiers importants ailleurs (disque externe ou cloud).'
-        if ($script:DeepMode) { Write-Sub 'La section 13 vérifie ensuite le disque (CHKDSK).' }
+        if ($script:DeepMode) { Write-Sub 'La section 14 vérifie ensuite le disque (CHKDSK).' }
         else { Write-Sub 'Puis lance le scan complet (menu [2]) : il vérifie le disque (CHKDSK).' }
     }
     foreach ($dkD in @($diskV.Devices | Where-Object { $_.Kind -eq 'REMOVABLE' })) {
@@ -10902,10 +12173,131 @@ if ($bios -and $null -ne $bAge -and $bAge -gt 365) {
 }
 
 # ==================================================================
-# [13] INTÉGRITÉ WINDOWS (mode complet)
+# [13] RESTES DE PROGRAMMES (v3.30, lot 3 du plan « entretien »)
+# ==================================================================
+Write-Section '13' 'Restes de programmes'
+
+# Élevé sous un autre compte : la partie du compte (HKCU, menu Démarrer et dossier Démarrage du compte, %LOCALAPPDATA%)
+# serait celle de cet autre compte, elle n'est pas lue (même règle qu'en section 08)
+$rpSame = Test-SameAccount ([string](Get-CimInstance Win32_ComputerSystem).UserName) ([Environment]::UserName)
+$script:RemnantOtherUser = -not $rpSame
+$rpVars = Get-JarvisEnvTable $rpSame
+$rpShell = $null
+try { $rpShell = New-Object -ComObject WScript.Shell } catch { $rpShell = $null }
+$rpSid = ''; $rpFull = ''
+try { $rpMe = [Security.Principal.WindowsIdentity]::GetCurrent(); $rpSid = $rpMe.User.Value; $rpFull = $rpMe.Name } catch { $rpSid = '' }
+$rpUsersRoot = Split-Path -Parent ([Environment]::GetFolderPath('UserProfile'))
+$script:JarvisDriveKinds = @{}
+$rpPrograms = ''
+if ($rpSame) { $rpPrograms = [Environment]::GetFolderPath('Programs') }
+$script:RemnantRoots = @{ User = $rpPrograms; Common = [Environment]::GetFolderPath('CommonPrograms') }
+$rpItems = @()
+$rpUnread = @()
+$rpSeen = 0
+if (-not $rpSame) { $rpUnread += , @('Restes de ton compte', 'non lus : J.A.R.V.I.S. tourne sous un autre compte que le tien') }
+if ($null -eq $rpShell) { $rpUnread += , @('Raccourcis', 'lecture impossible') }
+elseif ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+    $rpUnread += , @('Raccourcis', 'non vérifiables dans une console 32 bits')
+}
+
+$rpStart = Get-StartupEntries -MachineOnly:(-not $rpSame)
+if ($null -eq $rpStart) { $rpUnread += , @('Démarrage', 'lecture impossible') }
+else {
+    $rpSeen += @($rpStart).Count
+    $rpItems += @(Get-RemnantStartup $rpStart $rpVars $rpShell $WinDir $rpUsersRoot)
+}
+$rpSkip = @([Environment]::GetFolderPath('Startup'), [Environment]::GetFolderPath('CommonStartup'))
+$rpSc = Get-RemnantShortcuts @($script:RemnantRoots['User'], $script:RemnantRoots['Common']) $rpSkip $rpShell $WinDir $script:RemnantRoots['Common'] $rpUsersRoot
+if (-not $rpSc.Read) { $rpUnread += , @('Menu Démarrer', 'en partie illisible') }
+$rpSeen += $rpSc.Seen
+$rpItems += @($rpSc.Items)
+$rpTk = Get-RemnantTasks $rpVars $rpFull $rpSid
+if (-not $rpTk.Read) { $rpUnread += , @('Tâches planifiées', 'lecture impossible') }
+elseif (-not $isAdmin) { $rpUnread += , @('Tâches planifiées', 'lues en partie : nécessite les droits admin') }
+elseif ($rpTk.Partial) { $rpUnread += , @('Tâches planifiées', 'en partie illisibles') }
+$rpSeen += $rpTk.Seen
+$rpItems += @($rpTk.Items)
+$rpUn = Get-RemnantUninstall $rpVars $rpSame
+if (-not $rpUn.Read) { $rpUnread += , @('Liste des applications', 'lecture impossible') }
+elseif ($rpUn.Partial) { $rpUnread += , @('Liste des applications', 'en partie illisible') }
+$rpSeen += $rpUn.Seen
+$rpItems += @($rpUn.Items)
+$rpSv = Get-RemnantServices $rpVars
+if (-not $rpSv.Read) { $rpUnread += , @('Services', 'lecture impossible') }
+elseif ($rpSv.Partial) { $rpUnread += , @('Services', 'en partie illisibles') }
+$rpSeen += $rpSv.Seen
+$rpItems += @($rpSv.Items)
+# Dossiers : seulement si la liste des applications a été lue (sans elle, impossible de savoir qui revendique un dossier)
+if ($rpUn.Read) {
+    $rpFo = Get-RemnantFolders @((Get-ProgramFilesDir), [Environment]::GetFolderPath('ProgramFilesX86')) $rpUn.Claims @($JarvisHome) 50MB
+    if (-not $rpFo.Read -or $rpFo.Partial) { $rpUnread += , @('Dossiers de Program Files', 'en partie non lus') }
+    $rpItems += @($rpFo.Items)
+} else {
+    $rpUnread += , @('Dossiers de Program Files', 'non lus (liste des applications illisible)')
+}
+
+# Liens morts retirables avec les droits actuels : proposés dans l'entretien de fin de scan
+$script:DeadLinks = @($rpItems | Where-Object { Test-DeadLinkRemovable $_ $script:RemnantRoots $isAdmin })
+$rpRows = @(Get-RemnantRows $rpItems)
+foreach ($row in $rpRows) {
+    Write-Status $row.Label $row.Value $row.State
+    $n = 0
+    foreach ($x in $row.Items) {
+        $off = ''
+        if (-not $x.Active -and $x.Source -eq 'Task') { $off = ' (désactivée)' }
+        elseif (-not $x.Active) { $off = ' (désactivé)' }
+        switch ($x.Source) {
+            'Uninstall' { $line = '« {0} » : dossier {1} disparu' -f (Cut $x.Name 40), (Cut $x.Target 60) }
+            'Folder' { $line = '{0}  ({1})' -f (Cut $x.Location 70), (Format-Bytes $x.Bytes) }
+            default { $line = '« {0} » : {1}{2}' -f (Cut $x.Name 40), (Cut $x.Target 70), $off }
+        }
+        if ($n -lt 5) { Write-Sub $line } else { $script:Report.Add('          > ' + (ConvertTo-DisplayText $line)) }
+        $n++
+    }
+    if ($n -gt 5) { Write-Sub ('... et {0} autre(s) : liste complète dans le rapport' -f ($n - 5)) }
+    $rem = @($row.Items | Where-Object { Test-DeadLinkRemovable $_ $script:RemnantRoots $isAdmin }).Count
+    switch ($row.Key) {
+        'Startup' { Write-Sub 'Windows essaie de les lancer à chaque ouverture de session, sans résultat.' }
+        'Shortcut' { Write-Sub 'Un clic dessus dans le menu Démarrer ne mène plus à rien.' }
+        'Task' { Write-Sub 'Windows lance la tâche à son heure, sans résultat.' }
+        'Uninstall' {
+            Write-Sub 'Programme parti, mais toujours dans la liste des applications. Pour l''en retirer : Windows + R,'
+            Write-Sub 'tape appwiz.cpl, double-clic sur l''entrée ; si Windows dit qu''elle est peut-être déjà désinstallée, réponds Oui.'
+        }
+        'Service' {
+            Write-Sub 'Un service dont le programme a disparu ne démarre plus : rien d''urgent, J.A.R.V.I.S. n''y touche pas.'
+            Write-Sub 'S''il vient d''un logiciel encore listé dans Paramètres > Applications, désinstalle ce logiciel.'
+        }
+        'Folder' {
+            Write-Sub 'Aucun programme dedans, et aucune application installée ne porte ce nom.'
+            Write-Sub 'Dans le doute, laisse-le : il peut contenir des réglages, des sauvegardes ou des licences. J.A.R.V.I.S. n''y touche pas.'
+        }
+        'NoDrive' {
+            Write-Sub 'Disque externe, clé USB ou lecteur réseau : J.A.R.V.I.S. ne juge pas ces liens et n''y touche pas.'
+            Write-Sub 'Rien à faire si tu branches ce lecteur de temps en temps.'
+        }
+    }
+    if (@('Startup', 'Shortcut', 'Task') -contains $row.Key) {
+        if ($rem -gt 0) { Write-Sub 'J.A.R.V.I.S. te propose de les retirer à la fin du scan (sauvegardés avant, remise possible).' }
+        if ($rem -lt @($row.Items).Count) {
+            if (-not $isAdmin) { Write-Sub 'Relance J.A.R.V.I.S. en administrateur : il te proposera de les retirer.' }
+            elseif ($row.Key -eq 'Startup') { Write-Sub 'Ctrl + Maj + Échap > Applications de démarrage : clic droit > Désactiver.' }
+            elseif ($row.Key -eq 'Task') { Write-Sub 'Démarrer > Planificateur de tâches : clic droit sur la tâche > Désactiver.' }
+            else { Write-Sub 'Clic droit sur le raccourci dans le menu Démarrer > Ouvrir l''emplacement du fichier, puis supprime-le.' }
+        }
+    }
+}
+foreach ($u in $rpUnread) { Write-Status $u[0] $u[1] 'INFO' }
+if ($rpRows.Count -eq 0) {
+    if ($rpUnread.Count -eq 0) { Write-Status 'Restes de programmes' ('aucun trouvé ({0:N0} éléments vérifiés)' -f $rpSeen) 'OK' }
+    else { Write-Status 'Restes de programmes' 'aucun trouvé dans ce qui a pu être lu' 'INFO' }
+}
+
+# ==================================================================
+# [14] INTÉGRITÉ WINDOWS (mode complet)
 # ==================================================================
 if ($script:DeepMode) {
-    Write-Section '13' 'Intégrité Windows (DISM / SFC / CHKDSK)'
+    Write-Section '14' 'Intégrité Windows (DISM / SFC / CHKDSK)'
     Write-Host '   Ces analyses sont longues. Ne ferme pas la fenêtre.' -ForegroundColor DarkGray
 
     # --- DISM : état du magasin de composants
